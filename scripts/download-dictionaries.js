@@ -5,10 +5,12 @@
  * Downloads dictionary data files from various sources:
  * - CC-CEDICT: Chinese-English dictionary
  * - MOE Dict: Taiwan Ministry of Education dictionary (via g0v)
- * - Kangxi: Kangxi dictionary text file
+ * - Word Frequencies: Character/word frequency data with HSK levels
+ * - HanDeDict: German-Chinese dictionary (English translation)
+ * - MakeMeaHanzi: Stroke order and character decomposition data
  *
  * Usage:
- *   node scripts/download-dictionaries.js [--all|--cedict|--moedict|--kangxi]
+ *   node scripts/download-dictionaries.js [--all|--cedict|--moedict|--wordfreq|--handedict|--strokes]
  *
  * Data is downloaded to: src-tauri/data/
  */
@@ -19,6 +21,7 @@ import fs from 'fs';
 import path from 'path';
 import zlib from 'zlib';
 import { fileURLToPath } from 'url';
+import { execSync } from 'child_process';
 
 // Get __dirname equivalent in ES modules
 const __filename = fileURLToPath(import.meta.url);
@@ -32,7 +35,7 @@ const SOURCES = {
     name: 'CC-CEDICT',
     url: 'https://www.mdbg.net/chinese/export/cedict/cedict_1_0_ts_utf-8_mdbg.txt.gz',
     filename: 'cedict.txt',
-    compressed: true,
+    compressed: 'gzip',
     description: 'Community-maintained Chinese-English dictionary (~160k entries)',
   },
   moedict: {
@@ -42,12 +45,29 @@ const SOURCES = {
     compressed: false,
     description: 'Taiwan Ministry of Education Revised Dictionary (~163k entries)',
   },
-  kangxi: {
-    name: 'Kangxi Dictionary',
-    url: 'https://raw.githubusercontent.com/7468696e6b/kangxiDictText/master/kangxiDictText_utf8.txt',
-    filename: 'kangxi.txt',
-    compressed: false,
-    description: 'Historical character dictionary',
+  wordfreq: {
+    name: 'Chinese Word Frequencies',
+    url: 'https://raw.githubusercontent.com/lxs602/Chinese-Mandarin-Dictionaries/master/Chinese%20Word%20Frequencies/Chinese%20Word%20Frequencies.tab.zip',
+    filename: 'wordfreq.tab',
+    compressed: 'zip',
+    zipEntry: 'Chinese Word Frequencies.tab',
+    description: 'Character/word frequency data from books, movies, internet + HSK levels',
+  },
+  handedict: {
+    name: 'HanDeDict (English)',
+    url: 'https://raw.githubusercontent.com/lxs602/Chinese-Mandarin-Dictionaries/master/HanDeDict%20(English%20machine%20translation)/handedict_en.tab.zip',
+    filename: 'handedict.tab',
+    compressed: 'zip',
+    zipEntry: 'handedict_en.tab',
+    description: 'German-Chinese dictionary with English translations (~83k entries)',
+  },
+  strokes: {
+    name: 'MakeMeaHanzi (Strokes)',
+    url: 'https://raw.githubusercontent.com/lxs602/Chinese-Mandarin-Dictionaries/master/MakeMeaHanzi%20(Stroke%20animations)/MakemeaHanzi.tab.zip',
+    filename: 'strokes.tab',
+    compressed: 'zip',
+    zipEntry: 'MakemeaHanzi.tab',
+    description: 'Stroke order and character decomposition data (~9k characters)',
   },
 };
 
@@ -62,9 +82,9 @@ function ensureDir(dir) {
 }
 
 /**
- * Download a file from URL
+ * Download a file from URL to a temporary or final path
  */
-function downloadFile(url, destPath, compressed = false) {
+function downloadToFile(url, destPath) {
   return new Promise((resolve, reject) => {
     console.log(`Downloading: ${url}`);
 
@@ -74,7 +94,7 @@ function downloadFile(url, destPath, compressed = false) {
       // Handle redirects
       if (response.statusCode === 301 || response.statusCode === 302) {
         console.log(`Redirecting to: ${response.headers.location}`);
-        downloadFile(response.headers.location, destPath, compressed)
+        downloadToFile(response.headers.location, destPath)
           .then(resolve)
           .catch(reject);
         return;
@@ -88,14 +108,7 @@ function downloadFile(url, destPath, compressed = false) {
       const totalSize = parseInt(response.headers['content-length'], 10);
       let downloadedSize = 0;
 
-      // Set up output stream
-      let outputStream;
-      if (compressed) {
-        outputStream = zlib.createGunzip();
-        outputStream.pipe(fs.createWriteStream(destPath));
-      } else {
-        outputStream = fs.createWriteStream(destPath);
-      }
+      const outputStream = fs.createWriteStream(destPath);
 
       response.on('data', (chunk) => {
         downloadedSize += chunk.length;
@@ -105,11 +118,7 @@ function downloadFile(url, destPath, compressed = false) {
         }
       });
 
-      if (compressed) {
-        response.pipe(outputStream);
-      } else {
-        response.pipe(outputStream);
-      }
+      response.pipe(outputStream);
 
       outputStream.on('finish', () => {
         console.log('\nDownload complete!');
@@ -121,11 +130,60 @@ function downloadFile(url, destPath, compressed = false) {
     });
 
     request.on('error', reject);
-    request.setTimeout(60000, () => {
+    request.setTimeout(120000, () => {
       request.destroy();
       reject(new Error('Request timeout'));
     });
   });
+}
+
+/**
+ * Download and decompress a file based on compression type
+ */
+async function downloadFile(url, destPath, compressed, zipEntry = null) {
+  if (compressed === 'zip') {
+    // Download zip to temp file, then extract
+    const tempZip = destPath + '.zip';
+    await downloadToFile(url, tempZip);
+
+    console.log(`Extracting: ${zipEntry || 'first file'}...`);
+    try {
+      // Extract specific file from zip
+      if (zipEntry) {
+        execSync(`unzip -p "${tempZip}" "${zipEntry}" > "${destPath}"`, { stdio: 'pipe' });
+      } else {
+        execSync(`unzip -p "${tempZip}" > "${destPath}"`, { stdio: 'pipe' });
+      }
+      fs.unlinkSync(tempZip);
+      console.log('Extraction complete!');
+    } catch (err) {
+      fs.unlinkSync(tempZip);
+      throw new Error(`Failed to extract zip: ${err.message}`);
+    }
+  } else if (compressed === 'gzip') {
+    // Stream decompress gzip
+    const tempGz = destPath + '.gz';
+    await downloadToFile(url, tempGz);
+
+    console.log('Decompressing...');
+    await new Promise((resolve, reject) => {
+      const gunzip = zlib.createGunzip();
+      const input = fs.createReadStream(tempGz);
+      const output = fs.createWriteStream(destPath);
+
+      input.pipe(gunzip).pipe(output);
+      output.on('finish', () => {
+        fs.unlinkSync(tempGz);
+        console.log('Decompression complete!');
+        resolve();
+      });
+      output.on('error', reject);
+      gunzip.on('error', reject);
+    });
+  } else {
+    // No compression, download directly
+    await downloadToFile(url, destPath);
+  }
 }
 
 /**
@@ -166,7 +224,7 @@ async function downloadSource(key, forceDownload = false) {
   }
 
   try {
-    await downloadFile(source.url, destPath, source.compressed);
+    await downloadFile(source.url, destPath, source.compressed, source.zipEntry);
 
     // Verify file exists and has content
     const stats = fs.statSync(destPath);
@@ -202,7 +260,7 @@ async function main() {
   }
 
   if (sourcesToDownload.length === 0) {
-    console.log('Usage: node download-dictionaries.js [--all|--cedict|--moedict|--kangxi]');
+    console.log('Usage: node download-dictionaries.js [--all|--cedict|--moedict|--wordfreq|--handedict|--strokes]');
     console.log('\nAvailable sources:');
     for (const [key, source] of Object.entries(SOURCES)) {
       console.log(`  --${key}: ${source.name} - ${source.description}`);
