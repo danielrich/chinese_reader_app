@@ -43,6 +43,19 @@ The app includes a comprehensive dictionary system with multiple sources:
 
 ## Development
 
+### Continuous Integration
+
+This project uses GitHub Actions to automatically run unit tests on all pull requests. The tests must pass before a PR can be merged.
+
+**To enable branch protection (requires repository admin access):**
+1. Go to repository Settings → Branches
+2. Click "Add branch protection rule"
+3. Set "Branch name pattern" to `main` (or `master`)
+4. Check "Require status checks to pass before merging"
+5. Select the "test" check from the list
+6. Check "Require branches to be up to date before merging" (optional)
+7. Click "Create" or "Save changes"
+
 ### Install dependencies
 
 ```bash
@@ -64,6 +77,14 @@ This downloads:
 
 ```bash
 npm run tauri:dev
+```
+
+### Run tests
+
+```bash
+# Run Rust unit tests
+cd src-tauri
+cargo test --lib
 ```
 
 ### Build for production
