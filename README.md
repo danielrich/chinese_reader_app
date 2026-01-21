@@ -19,9 +19,11 @@ The app includes a comprehensive dictionary system with multiple sources:
 
 | Source | Description | Entries |
 |--------|-------------|---------|
-| **CC-CEDICT** | Community Chinese-English dictionary | ~160,000 |
+| **CC-CEDICT** | Community Chinese-English dictionary | ~124,000 |
 | **MOE Dict** | Taiwan Ministry of Education dictionary (Traditional Chinese) | ~163,000 |
-| **Kangxi** | Historical character dictionary (康熙字典) | ~47,000 |
+| **Word Frequencies** | Character/word frequency data with HSK levels | - |
+| **HanDeDict** | German-Chinese dictionary (English translation) | ~84,000 |
+| **MakeMeaHanzi** | Stroke order animations and character decomposition | ~9,000 |
 | **User Dictionaries** | Custom dictionaries for book-specific terms | User-defined |
 
 ### Dictionary Features
@@ -69,9 +71,26 @@ node scripts/download-dictionaries.js --all
 ```
 
 This downloads:
-- CC-CEDICT from MDBG
-- MOE Dictionary from g0v/moedict-data
-- Kangxi Dictionary text
+- CC-CEDICT from MDBG (~9 MB)
+- MOE Dictionary from g0v/moedict-data (~72 MB)
+- Word Frequencies with HSK levels (~163 MB)
+- HanDeDict English translations (~66 MB)
+- MakeMeaHanzi stroke animations (~129 MB)
+
+Available options: `--cedict`, `--moedict`, `--wordfreq`, `--handedict`, `--strokes`, `--all`
+
+### Import dictionaries into database
+
+After downloading, import the dictionaries into the SQLite database:
+
+```bash
+cd src-tauri
+cargo run --bin import
+```
+
+This creates `src-tauri/data/dictionary.db` with all dictionary entries indexed for fast lookup.
+
+Available options: `--cedict`, `--moedict`, `--all` (default)
 
 ### Run in development mode
 
@@ -113,8 +132,9 @@ chinese-reader/
 │   │   │   ├── error.rs       # Error types
 │   │   │   └── sources/       # Dictionary parsers
 │   │   │       ├── cedict.rs  # CC-CEDICT parser
-│   │   │       ├── moedict.rs # MOE Dict parser
-│   │   │       └── kangxi.rs  # Kangxi parser
+│   │   │       └── moedict.rs # MOE Dict parser
+│   │   ├── bin/
+│   │   │   └── import.rs      # CLI import tool
 │   │   ├── commands.rs        # Tauri commands
 │   │   ├── lib.rs             # Library entry point
 │   │   └── main.rs            # Application entry point
