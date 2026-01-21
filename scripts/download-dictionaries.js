@@ -129,9 +129,21 @@ function downloadFile(url, destPath, compressed = false) {
 }
 
 /**
- * Download a specific dictionary source
+ * Check if a file exists and has content
  */
-async function downloadSource(key) {
+function fileExists(filePath) {
+  try {
+    const stats = fs.statSync(filePath);
+    return stats.size > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Download a specific dictionary source (skips if already exists)
+ */
+async function downloadSource(key, forceDownload = false) {
   const source = SOURCES[key];
   if (!source) {
     console.error(`Unknown source: ${key}`);
@@ -141,10 +153,17 @@ async function downloadSource(key) {
   const destPath = path.join(DATA_DIR, source.filename);
 
   console.log(`\n${'='.repeat(60)}`);
-  console.log(`Downloading: ${source.name}`);
+  console.log(`${source.name}`);
   console.log(`Description: ${source.description}`);
   console.log(`Destination: ${destPath}`);
   console.log('='.repeat(60));
+
+  // Check if file already exists
+  if (!forceDownload && fileExists(destPath)) {
+    const stats = fs.statSync(destPath);
+    console.log(`Already exists (${(stats.size / 1024 / 1024).toFixed(2)} MB) - skipping download`);
+    return true;
+  }
 
   try {
     await downloadFile(source.url, destPath, source.compressed);
