@@ -13,7 +13,7 @@ use std::path::PathBuf;
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    // Determine data directory (relative to src-tauri)
+    // Determine data directory (relative to src-tauri, where downloaded files are)
     let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("data");
 
     // Determine which dictionaries to import
@@ -29,9 +29,16 @@ fn main() {
     println!("Dictionary Import Tool");
     println!("======================\n");
 
-    // Initialize database
-    let db_path = data_dir.join("dictionary.db");
+    // Use the same database path as the app (in Application Support)
+    let db_path = match dictionary::get_default_db_path() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to determine database path: {}", e);
+            std::process::exit(1);
+        }
+    };
     println!("Database: {:?}", db_path);
+    println!("Data files: {:?}\n", data_dir);
 
     let mut conn = match dictionary::init_connection(&db_path) {
         Ok(c) => c,
@@ -121,6 +128,10 @@ fn import_moedict_file(
 }
 
 fn print_usage() {
+    let db_path = dictionary::get_default_db_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string());
+
     println!(
         r#"Dictionary Import Tool
 
@@ -132,11 +143,14 @@ Options:
     --moedict   Import MOE Dictionary only
     -h, --help  Show this help message
 
-The tool looks for dictionary files in src-tauri/data/:
+The tool reads dictionary files from src-tauri/data/:
     - cedict.txt   (CC-CEDICT)
     - moedict.json (MOE Dictionary)
 
+Database location: {}
+
 Run 'node scripts/download-dictionaries.js --all' first to download the files.
-"#
+"#,
+        db_path
     );
 }
