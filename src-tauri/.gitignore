@@ -2,3 +2,6 @@
 # will have compiled files and executables
 /target/
 /gen/schemas
+
+# Downloaded dictionary data (run scripts/download-dictionaries.js to fetch)
+/data/

@@ -13,11 +13,16 @@
  * Data is downloaded to: src-tauri/data/
  */
 
-const https = require('https');
-const http = require('http');
-const fs = require('fs');
-const path = require('path');
-const zlib = require('zlib');
+import https from 'https';
+import http from 'http';
+import fs from 'fs';
+import path from 'path';
+import zlib from 'zlib';
+import { fileURLToPath } from 'url';
+
+// Get __dirname equivalent in ES modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 // Configuration
 const DATA_DIR = path.join(__dirname, '..', 'src-tauri', 'data');

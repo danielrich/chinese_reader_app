@@ -5,10 +5,10 @@
 use crate::dictionary::{
     self,
     models::{
-        DictionarySource, DictionaryStats, LookupOptions, LookupResult, UserDictionary,
+        DictionarySource, LookupOptions, LookupResult, UserDictionary,
         UserDictionaryEntry,
     },
-    sources,
+    sources, DictionaryStats,
 };
 use rusqlite::Connection;
 use std::fs::File;

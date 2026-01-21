@@ -3,7 +3,7 @@
 //! CC-CEDICT format: Traditional Simplified [pin1yin1] /definition1/definition2/
 //! Example: 中文 中文 [Zhong1 wen2] /Chinese language/Chinese writing/
 
-use crate::dictionary::models::{Definition, DictionarySource};
+use crate::dictionary::models::DictionarySource;
 use rusqlite::{Connection, Result, Transaction};
 use std::io::{BufRead, BufReader, Read};
 
