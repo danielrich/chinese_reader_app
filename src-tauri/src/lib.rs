@@ -5,6 +5,7 @@
 
 pub mod commands;
 pub mod dictionary;
+pub mod library;
 
 use commands::AppState;
 use std::sync::Mutex;
@@ -13,6 +14,7 @@ use tauri::Manager;
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // Initialize logging in debug mode
             if cfg!(debug_assertions) {
@@ -60,6 +62,58 @@ pub fn run() {
             commands::update_user_dictionary_entry,
             commands::delete_user_dictionary_entry,
             commands::import_user_dictionary_entries,
+            // Library shelves
+            commands::create_shelf,
+            commands::list_root_shelves,
+            commands::get_shelf_tree,
+            commands::update_shelf,
+            commands::delete_shelf,
+            commands::move_shelf,
+            // Library texts
+            commands::create_text,
+            commands::get_text,
+            commands::list_texts_in_shelf,
+            commands::update_text,
+            commands::delete_text,
+            commands::import_text_file,
+            commands::migrate_large_texts,
+            // Library analysis
+            commands::get_text_analysis,
+            commands::get_analysis_report,
+            commands::reanalyze_text,
+            commands::get_shelf_analysis,
+            commands::segment_text,
+            // Known words
+            commands::add_known_word,
+            commands::update_word_status,
+            commands::remove_known_word,
+            commands::list_known_words,
+            commands::import_known_words,
+            // Speed tracking
+            commands::start_reading_session,
+            commands::finish_reading_session,
+            commands::discard_reading_session,
+            commands::delete_reading_session,
+            commands::update_session_auto_marked,
+            commands::get_active_reading_session,
+            commands::get_text_reading_history,
+            commands::get_speed_data,
+            commands::get_speed_stats,
+            // Settings
+            commands::get_setting,
+            commands::set_setting,
+            // Auto-mark
+            commands::auto_mark_text_as_known,
+            // Learning
+            commands::import_frequency_data,
+            commands::list_frequency_sources,
+            commands::get_learning_stats,
+            commands::get_percentile_coverage,
+            commands::get_vocabulary_progress,
+            commands::record_vocabulary_snapshot,
+            commands::get_shelf_frequency_analysis,
+            commands::get_study_priorities,
+            commands::clear_frequency_source,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

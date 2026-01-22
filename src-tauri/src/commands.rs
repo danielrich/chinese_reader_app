@@ -1,6 +1,6 @@
-//! Tauri commands for dictionary operations.
+//! Tauri commands for dictionary and library operations.
 //!
-//! These commands expose the dictionary functionality to the frontend.
+//! These commands expose the dictionary and library functionality to the frontend.
 
 use crate::dictionary::{
     self,
@@ -9,6 +9,16 @@ use crate::dictionary::{
         UserDictionaryEntry,
     },
     sources, DictionaryStats,
+};
+use crate::library::{
+    self,
+    models::{
+        AnalysisReport, FrequencyImportStats, FrequencySort, FrequencySource, ImportStats,
+        KnownWord, LearningStats, PercentileCoverage, Shelf, ShelfAnalysis,
+        ShelfFrequencyAnalysis, ShelfTree, TermFrequencyInfo, Text, TextAnalysis, TextSegment,
+        TextSummary, VocabularyProgress,
+    },
+    MigrateLargeTextsResult, ReadingSession, SpeedDataPoint, SpeedStats,
 };
 use rusqlite::Connection;
 use std::fs::File;
@@ -380,4 +390,725 @@ pub fn import_user_dictionary_entries(
         entries_added: stats.entries_added,
         errors: stats.errors,
     })
+}
+
+// =============================================================================
+// Library Shelf Commands
+// =============================================================================
+
+/// Create a new shelf
+#[tauri::command]
+pub fn create_shelf(
+    state: State<AppState>,
+    name: String,
+    description: Option<String>,
+    parent_id: Option<i64>,
+) -> CommandResult<Shelf> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::shelf::create_shelf(&conn, &name, description.as_deref(), parent_id)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// List root shelves
+#[tauri::command]
+pub fn list_root_shelves(state: State<AppState>) -> CommandResult<Vec<Shelf>> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::shelf::list_root_shelves(&conn).map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// Get the full shelf tree
+#[tauri::command]
+pub fn get_shelf_tree(state: State<AppState>) -> CommandResult<Vec<ShelfTree>> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::shelf::get_shelf_tree(&conn).map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// Update a shelf
+#[tauri::command]
+pub fn update_shelf(
+    state: State<AppState>,
+    id: i64,
+    name: Option<String>,
+    description: Option<String>,
+) -> CommandResult<()> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    // Handle the nested Option for description
+    let desc_opt = if description.is_some() {
+        Some(description.as_deref())
+    } else {
+        None
+    };
+
+    library::shelf::update_shelf(&conn, id, name.as_deref(), desc_opt)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// Delete a shelf
+#[tauri::command]
+pub fn delete_shelf(state: State<AppState>, id: i64) -> CommandResult<()> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::shelf::delete_shelf(&conn, id).map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// Move a shelf to a new parent
+#[tauri::command]
+pub fn move_shelf(
+    state: State<AppState>,
+    id: i64,
+    new_parent_id: Option<i64>,
+) -> CommandResult<()> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::shelf::move_shelf(&conn, id, new_parent_id)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+// =============================================================================
+// Library Text Commands
+// =============================================================================
+
+/// Result of creating a text (may be split into sections)
+#[derive(serde::Serialize)]
+pub struct CreateTextCommandResult {
+    pub text: Text,
+    pub section_shelf_id: Option<i64>,
+    pub section_count: usize,
+}
+
+/// Create a new text (auto-splits large texts into sections)
+#[tauri::command]
+pub fn create_text(
+    state: State<AppState>,
+    shelf_id: i64,
+    title: String,
+    content: String,
+    author: Option<String>,
+    source_type: String,
+    convert_to_traditional: Option<bool>,
+) -> CommandResult<CreateTextCommandResult> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    let result = library::text::create_text_with_splitting(
+        &conn,
+        shelf_id,
+        &title,
+        &content,
+        author.as_deref(),
+        &source_type,
+        convert_to_traditional.unwrap_or(false),
+    )
+    .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    Ok(CreateTextCommandResult {
+        text: result.text,
+        section_shelf_id: result.section_shelf_id,
+        section_count: result.section_count,
+    })
+}
+
+/// Get a text by ID
+#[tauri::command]
+pub fn get_text(state: State<AppState>, id: i64) -> CommandResult<Text> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::text::get_text(&conn, id)
+        .map_err(|e| CommandError::Database(e.to_string()))?
+        .ok_or_else(|| CommandError::NotFound(format!("Text with id {} not found", id)))
+}
+
+/// List texts in a shelf
+#[tauri::command]
+pub fn list_texts_in_shelf(state: State<AppState>, shelf_id: i64) -> CommandResult<Vec<TextSummary>> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::text::list_texts_in_shelf(&conn, shelf_id)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// Update a text
+#[tauri::command]
+pub fn update_text(
+    state: State<AppState>,
+    id: i64,
+    title: Option<String>,
+    author: Option<String>,
+) -> CommandResult<()> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    // Handle the nested Option for author
+    let author_opt = if author.is_some() {
+        Some(author.as_deref())
+    } else {
+        None
+    };
+
+    library::text::update_text(&conn, id, title.as_deref(), author_opt)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// Delete a text
+#[tauri::command]
+pub fn delete_text(state: State<AppState>, id: i64) -> CommandResult<()> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::text::delete_text(&conn, id).map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// Import a text from a file (auto-splits large texts)
+#[tauri::command]
+pub fn import_text_file(
+    state: State<AppState>,
+    shelf_id: i64,
+    file_path: String,
+    convert_to_traditional: Option<bool>,
+) -> CommandResult<Text> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::text::import_text_file_with_options(
+        &conn,
+        shelf_id,
+        &file_path,
+        convert_to_traditional.unwrap_or(false),
+    )
+    .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// Migrate large texts (>1500 chars) into shelves with sections
+/// If shelf_id is provided, only migrate texts in that shelf (and sub-shelves)
+#[tauri::command]
+pub fn migrate_large_texts(
+    state: State<AppState>,
+    shelf_id: Option<i64>,
+) -> CommandResult<MigrateLargeTextsResult> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::text::migrate_large_texts(&conn, shelf_id)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+// =============================================================================
+// Library Analysis Commands
+// =============================================================================
+
+/// Get text analysis (runs analysis if not cached)
+#[tauri::command]
+pub fn get_text_analysis(state: State<AppState>, text_id: i64) -> CommandResult<TextAnalysis> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    // Try to get cached analysis, run if not found
+    match library::analysis::get_text_analysis(&conn, text_id) {
+        Ok(analysis) => Ok(analysis),
+        Err(library::LibraryError::AnalysisNotFound(_)) => {
+            library::analysis::analyze_text(&conn, text_id)
+                .map_err(|e| CommandError::Database(e.to_string()))
+        }
+        Err(e) => Err(CommandError::Database(e.to_string())),
+    }
+}
+
+/// Get full analysis report
+#[tauri::command]
+pub fn get_analysis_report(
+    state: State<AppState>,
+    text_id: i64,
+    top_n: Option<usize>,
+    sort: Option<FrequencySort>,
+) -> CommandResult<AnalysisReport> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    let sort = sort.unwrap_or_default();
+    library::analysis::get_analysis_report(&conn, text_id, top_n, sort)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// Re-analyze a text
+#[tauri::command]
+pub fn reanalyze_text(state: State<AppState>, text_id: i64) -> CommandResult<TextAnalysis> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::analysis::reanalyze_text(&conn, text_id)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// Get aggregated analysis for a shelf
+#[tauri::command]
+pub fn get_shelf_analysis(state: State<AppState>, shelf_id: i64) -> CommandResult<ShelfAnalysis> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::analysis::get_shelf_analysis(&conn, shelf_id)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// Segment text content with known/unknown status
+#[tauri::command]
+pub fn segment_text(state: State<AppState>, content: String) -> CommandResult<Vec<TextSegment>> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::analysis::segment_text(&conn, &content)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+// =============================================================================
+// Known Words Commands
+// =============================================================================
+
+/// Add a known word
+#[tauri::command]
+pub fn add_known_word(
+    state: State<AppState>,
+    word: String,
+    word_type: String,
+    status: Option<String>,
+    proficiency: Option<i64>,
+) -> CommandResult<KnownWord> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::known_words::add_known_word(&conn, &word, &word_type, status.as_deref(), proficiency)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// Update the status of a known word
+#[tauri::command]
+pub fn update_word_status(
+    state: State<AppState>,
+    word: String,
+    status: String,
+) -> CommandResult<()> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::known_words::update_word_status(&conn, &word, &status)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// Remove a known word
+#[tauri::command]
+pub fn remove_known_word(state: State<AppState>, word: String) -> CommandResult<()> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::known_words::remove_known_word(&conn, &word)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// List known words
+#[tauri::command]
+pub fn list_known_words(
+    state: State<AppState>,
+    word_type: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+) -> CommandResult<Vec<KnownWord>> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::known_words::list_known_words(&conn, word_type.as_deref(), limit, offset)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// Import known words from content
+#[tauri::command]
+pub fn import_known_words(
+    state: State<AppState>,
+    content: String,
+    word_type: String,
+) -> CommandResult<ImportStats> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::known_words::import_known_words(&conn, &content, &word_type)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+// =============================================================================
+// Speed Tracking Commands
+// =============================================================================
+
+/// Start a new reading session for a text
+#[tauri::command]
+pub fn start_reading_session(state: State<AppState>, text_id: i64) -> CommandResult<ReadingSession> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::speed::start_reading_session(&conn, text_id)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// Finish an active reading session
+#[tauri::command]
+pub fn finish_reading_session(
+    state: State<AppState>,
+    session_id: i64,
+) -> CommandResult<ReadingSession> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::speed::finish_reading_session(&conn, session_id)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// Discard (delete) an incomplete reading session
+#[tauri::command]
+pub fn discard_reading_session(state: State<AppState>, session_id: i64) -> CommandResult<()> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::speed::discard_reading_session(&conn, session_id)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// Delete a reading session (any session)
+#[tauri::command]
+pub fn delete_reading_session(state: State<AppState>, session_id: i64) -> CommandResult<()> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::speed::delete_reading_session(&conn, session_id)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// Update auto-marked vocabulary counts for a session
+#[tauri::command]
+pub fn update_session_auto_marked(
+    state: State<AppState>,
+    session_id: i64,
+    auto_marked_characters: i64,
+    auto_marked_words: i64,
+) -> CommandResult<()> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::speed::update_session_auto_marked(&conn, session_id, auto_marked_characters, auto_marked_words)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// Get the active (incomplete) reading session for a text
+#[tauri::command]
+pub fn get_active_reading_session(
+    state: State<AppState>,
+    text_id: i64,
+) -> CommandResult<Option<ReadingSession>> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::speed::get_active_session(&conn, text_id)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// Get reading history for a text
+#[tauri::command]
+pub fn get_text_reading_history(
+    state: State<AppState>,
+    text_id: i64,
+) -> CommandResult<Vec<ReadingSession>> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::speed::get_text_reading_history(&conn, text_id)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// Get speed data points for graphing
+#[tauri::command]
+pub fn get_speed_data(
+    state: State<AppState>,
+    shelf_id: Option<i64>,
+    first_reads_only: Option<bool>,
+    limit: Option<usize>,
+) -> CommandResult<Vec<SpeedDataPoint>> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::speed::get_speed_data(&conn, shelf_id, first_reads_only.unwrap_or(true), limit)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// Get aggregated speed statistics
+#[tauri::command]
+pub fn get_speed_stats(state: State<AppState>, shelf_id: Option<i64>) -> CommandResult<SpeedStats> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::speed::get_speed_stats(&conn, shelf_id)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+// =============================================================================
+// Settings Commands
+// =============================================================================
+
+/// Get a user setting
+#[tauri::command]
+pub fn get_setting(state: State<AppState>, key: String) -> CommandResult<Option<String>> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::settings::get_setting(&conn, &key).map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// Set a user setting
+#[tauri::command]
+pub fn set_setting(state: State<AppState>, key: String, value: String) -> CommandResult<()> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::settings::set_setting(&conn, &key, &value)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+// =============================================================================
+// Auto-Mark Commands
+// =============================================================================
+
+/// Auto-mark statistics
+#[derive(serde::Serialize)]
+pub struct AutoMarkStats {
+    pub characters_marked: i64,
+    pub words_marked: i64,
+}
+
+/// Auto-mark all unknown characters and words from a text as known
+#[tauri::command]
+pub fn auto_mark_text_as_known(state: State<AppState>, text_id: i64) -> CommandResult<AutoMarkStats> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    let stats = library::analysis::auto_mark_text_as_known(&conn, text_id)
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    Ok(AutoMarkStats {
+        characters_marked: stats.characters_marked,
+        words_marked: stats.words_marked,
+    })
+}
+
+// =============================================================================
+// Learning Commands
+// =============================================================================
+
+/// Import frequency data from tab-separated content
+#[tauri::command]
+pub fn import_frequency_data(
+    state: State<AppState>,
+    content: String,
+    source: String,
+    term_type: String,
+) -> CommandResult<FrequencyImportStats> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::learning::import_frequency_data(&conn, &content, &source, &term_type)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// List available frequency sources
+#[tauri::command]
+pub fn list_frequency_sources(state: State<AppState>) -> CommandResult<Vec<FrequencySource>> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::learning::list_frequency_sources(&conn)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// Get learning statistics
+#[tauri::command]
+pub fn get_learning_stats(
+    state: State<AppState>,
+    frequency_source: Option<String>,
+) -> CommandResult<LearningStats> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::learning::get_learning_stats(&conn, frequency_source.as_deref())
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// Get percentile coverage for a source and term type
+#[tauri::command]
+pub fn get_percentile_coverage(
+    state: State<AppState>,
+    source: String,
+    term_type: String,
+    percentiles: Vec<i64>,
+) -> CommandResult<Vec<PercentileCoverage>> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::learning::get_percentile_coverage(&conn, &source, &term_type, &percentiles)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// Get vocabulary progress over time
+#[tauri::command]
+pub fn get_vocabulary_progress(
+    state: State<AppState>,
+    days: Option<i64>,
+) -> CommandResult<Vec<VocabularyProgress>> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::learning::get_vocabulary_progress(&conn, days)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// Record a vocabulary snapshot for today
+#[tauri::command]
+pub fn record_vocabulary_snapshot(state: State<AppState>) -> CommandResult<()> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::learning::record_vocabulary_snapshot(&conn)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// Get frequency analysis for a shelf
+#[tauri::command]
+pub fn get_shelf_frequency_analysis(
+    state: State<AppState>,
+    shelf_id: i64,
+    frequency_source: String,
+) -> CommandResult<ShelfFrequencyAnalysis> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::learning::get_shelf_frequency_analysis(&conn, shelf_id, &frequency_source)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// Get study priorities - unknown terms sorted by frequency
+#[tauri::command]
+pub fn get_study_priorities(
+    state: State<AppState>,
+    source: String,
+    term_type: Option<String>,
+    limit: Option<usize>,
+) -> CommandResult<Vec<TermFrequencyInfo>> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::learning::get_study_priorities(&conn, &source, term_type.as_deref(), limit)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// Clear frequency data for a source
+#[tauri::command]
+pub fn clear_frequency_source(state: State<AppState>, source: String) -> CommandResult<usize> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::learning::clear_frequency_source(&conn, &source)
+        .map_err(|e| CommandError::Database(e.to_string()))
 }

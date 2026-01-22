@@ -92,6 +92,55 @@ This creates `src-tauri/data/dictionary.db` with all dictionary entries indexed 
 
 Available options: `--cedict`, `--moedict`, `--all` (default)
 
+### Import PDFs into the library
+
+The `scripts/` directory contains a Python tool for importing PDFs with chapter structure into the library. It uses the PDF's table of contents to create a hierarchy of shelves and texts.
+
+```bash
+cd scripts
+
+# First, find the parent shelf ID where you want to import:
+sqlite3 ~/Library/Application\ Support/com.chinesereader.ChineseReader/dictionary.db "SELECT id, name FROM shelves;"
+
+# Preview what will be imported (dry run):
+uv run python import_pdf.py /path/to/book.pdf <parent_shelf_id> --dry-run
+
+# Import the PDF:
+uv run python import_pdf.py /path/to/book.pdf <parent_shelf_id>
+
+# Import without simplified-to-traditional conversion:
+uv run python import_pdf.py /path/to/book.pdf <parent_shelf_id> --no-convert
+```
+
+The importer:
+- Creates shelves based on the PDF's table of contents hierarchy
+- Extracts text for each chapter
+- Converts simplified Chinese to traditional (Taiwan style) by default
+- Skips metadata sections (character lists, glossaries, etc.)
+
+### Import Book of Mormon (Chinese)
+
+Import the Chinese Book of Mormon from churchofjesuschrist.org:
+
+```bash
+cd scripts
+
+# Find the parent shelf ID:
+sqlite3 ~/Library/Application\ Support/com.chinesereader.ChineseReader/dictionary.db "SELECT id, name FROM shelves;"
+
+# Import (takes ~6 minutes due to rate limiting):
+uv run python import_bofm.py <parent_shelf_id>
+
+# Dry run to preview:
+uv run python import_bofm.py <parent_shelf_id> --dry-run
+```
+
+The importer:
+- Fetches all 239 chapters from the 15 books
+- Creates a "摩爾門經" shelf with sub-shelves for each book
+- Maintains proper chapter ordering
+- Includes 1.5 second delay between requests to be gentle on the server
+
 ### Run in development mode
 
 ```bash
@@ -142,7 +191,9 @@ chinese-reader/
 │   ├── Cargo.toml             # Rust dependencies
 │   └── tauri.conf.json        # Tauri configuration
 ├── scripts/
-│   └── download-dictionaries.js  # Dictionary download script
+│   ├── download-dictionaries.js  # Dictionary download script
+│   ├── import_pdf.py             # PDF import tool (uv project)
+│   └── import_bofm.py            # Book of Mormon import tool
 ├── index.html                 # HTML entry point
 ├── package.json               # Node.js dependencies
 └── tsconfig.json              # TypeScript configuration
