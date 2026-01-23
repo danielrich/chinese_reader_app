@@ -87,14 +87,18 @@ export interface TextAnalysis {
   total_characters: number;
   /** Unique characters */
   unique_characters: number;
-  /** Known characters */
+  /** Unique known characters */
   known_characters: number;
+  /** Total occurrences of known characters */
+  known_character_occurrences: number;
   /** Total words (segmented) */
   total_words: number;
   /** Unique words */
   unique_words: number;
-  /** Known words */
+  /** Unique known words */
   known_words: number;
+  /** Total occurrences of known words */
+  known_word_occurrences: number;
   /** Analysis timestamp */
   analyzed_at: string;
 }
@@ -621,4 +625,88 @@ export interface AutoMarkStats {
  */
 export async function autoMarkTextAsKnown(textId: number): Promise<AutoMarkStats> {
   return invoke<AutoMarkStats>("auto_mark_text_as_known", { textId });
+}
+
+// =============================================================================
+// Custom Segmentation API
+// =============================================================================
+
+/** Result of adding a custom segmentation word */
+export interface AddCustomWordResult {
+  /** The word that was added */
+  word: string;
+  /** Whether the word was added to jieba segmentation */
+  added_to_segmentation: boolean;
+  /** The known word entry if added to vocabulary */
+  known_word: KnownWord | null;
+}
+
+/**
+ * Add a custom segmentation word.
+ * This adds the word to jieba's dictionary so it will be recognized during segmentation.
+ * Optionally also adds it to the known_words table.
+ *
+ * @param word The word to add to segmentation
+ * @param addToVocabulary Whether to also add this word to known_words
+ * @param status Optional status ("known" or "learning") if adding to vocabulary
+ */
+export async function addCustomSegmentationWord(
+  word: string,
+  addToVocabulary: boolean,
+  status?: string
+): Promise<AddCustomWordResult> {
+  return invoke<AddCustomWordResult>("add_custom_segmentation_word", {
+    word,
+    addToVocabulary,
+    status,
+  });
+}
+
+/** Result of defining a custom word with user dictionary entry */
+export interface DefineCustomWordResult {
+  /** The word that was defined */
+  word: string;
+  /** The user dictionary ID the entry was added to */
+  dictionary_id: number;
+  /** The user dictionary name */
+  dictionary_name: string;
+  /** The entry ID in the user dictionary */
+  entry_id: number;
+  /** Whether the word was added to jieba segmentation */
+  added_to_segmentation: boolean;
+  /** The known word entry if added to vocabulary */
+  known_word: KnownWord | null;
+}
+
+/**
+ * Define a custom word with a user-provided definition.
+ * Creates a user dictionary entry and adds the word to segmentation.
+ * If shelfId is provided, creates/uses a shelf-specific dictionary.
+ *
+ * @param word The word to define
+ * @param definition The user's definition for the word
+ * @param pinyin Optional pinyin for the word
+ * @param notes Optional notes about the word
+ * @param shelfId Optional shelf ID for shelf-specific dictionary
+ * @param addToVocabulary Whether to also add this word to known_words
+ * @param status Optional status ("known" or "learning") if adding to vocabulary
+ */
+export async function defineCustomWord(
+  word: string,
+  definition: string,
+  pinyin?: string,
+  notes?: string,
+  shelfId?: number,
+  addToVocabulary: boolean = true,
+  status?: string
+): Promise<DefineCustomWordResult> {
+  return invoke<DefineCustomWordResult>("define_custom_word", {
+    word,
+    definition,
+    pinyin,
+    notes,
+    shelfId,
+    addToVocabulary,
+    status,
+  });
 }

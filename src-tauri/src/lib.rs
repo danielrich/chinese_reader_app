@@ -34,6 +34,18 @@ pub fn run() {
             let conn = dictionary::init_connection(&db_path)
                 .expect("Failed to initialize database");
 
+            // Load user segmentation words into jieba
+            match library::analysis::load_user_segmentation_words(&conn) {
+                Ok(count) => {
+                    if count > 0 {
+                        log::info!("Loaded {} user segmentation words into jieba", count);
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Failed to load user segmentation words: {}", e);
+                }
+            }
+
             // Store connection in app state
             app.manage(AppState {
                 db: Mutex::new(conn),
@@ -114,6 +126,9 @@ pub fn run() {
             commands::get_shelf_frequency_analysis,
             commands::get_study_priorities,
             commands::clear_frequency_source,
+            // Custom segmentation
+            commands::add_custom_segmentation_word,
+            commands::define_custom_word,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -86,14 +86,18 @@ pub struct TextAnalysis {
     pub total_characters: i64,
     /// Number of unique characters
     pub unique_characters: i64,
-    /// Characters that are in the user's known vocabulary
+    /// Unique characters that are in the user's known vocabulary
     pub known_characters: i64,
+    /// Total occurrences of known characters in the text
+    pub known_character_occurrences: i64,
     /// Total words (jieba-segmented)
     pub total_words: i64,
     /// Number of unique words
     pub unique_words: i64,
-    /// Words that are in the user's known vocabulary
+    /// Unique words that are in the user's known vocabulary
     pub known_words: i64,
+    /// Total occurrences of known words in the text
+    pub known_word_occurrences: i64,
     /// When the analysis was performed
     pub analyzed_at: String,
 }

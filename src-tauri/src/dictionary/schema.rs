@@ -207,9 +207,11 @@ CREATE TABLE IF NOT EXISTS text_analyses (
     total_characters INTEGER NOT NULL DEFAULT 0,
     unique_characters INTEGER NOT NULL DEFAULT 0,
     known_characters INTEGER NOT NULL DEFAULT 0,
+    known_character_occurrences INTEGER NOT NULL DEFAULT 0,
     total_words INTEGER NOT NULL DEFAULT 0,
     unique_words INTEGER NOT NULL DEFAULT 0,
     known_words INTEGER NOT NULL DEFAULT 0,
+    known_word_occurrences INTEGER NOT NULL DEFAULT 0,
     analyzed_at TEXT DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (text_id) REFERENCES texts(id) ON DELETE CASCADE
 );
@@ -317,6 +319,16 @@ CREATE TABLE IF NOT EXISTS vocabulary_snapshots (
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(snapshot_date)
 );
+
+-- User-defined segmentation words (added to jieba at runtime)
+CREATE TABLE IF NOT EXISTS user_segmentation_words (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    word TEXT NOT NULL UNIQUE,
+    frequency INTEGER NOT NULL DEFAULT 10000,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_segmentation_words_word ON user_segmentation_words(word);
 "#;
 
 /// Initialize the database with the schema
@@ -377,6 +389,26 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         )?;
         conn.execute(
             "ALTER TABLE reading_sessions ADD COLUMN auto_marked_words INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+
+    // Migration: Add occurrence count columns to text_analyses table if they don't exist
+    let has_occurrence_columns: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('text_analyses') WHERE name = 'known_character_occurrences'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if !has_occurrence_columns {
+        conn.execute(
+            "ALTER TABLE text_analyses ADD COLUMN known_character_occurrences INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+        conn.execute(
+            "ALTER TABLE text_analyses ADD COLUMN known_word_occurrences INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
     }

@@ -10,6 +10,8 @@ let selectedShelfId: number | null = null;
 let shelfTree: library.ShelfTree[] = [];
 let activeSession: speed.ReadingSession | null = null;
 let sessionTimerInterval: number | null = null;
+let currentTextId: number | null = null;
+let currentShelfTexts: library.TextSummary[] = [];
 
 // Initialize the app
 async function initApp() {
@@ -393,6 +395,7 @@ async function loadTextsInShelf(shelfId: number) {
 
   try {
     const texts = await library.listTextsInShelf(shelfId);
+    currentShelfTexts = texts; // Store for section navigation
     const shelf = findShelfById(shelfTree, shelfId);
 
     // Get shelf analysis first - this includes sub-shelf texts
@@ -415,6 +418,7 @@ async function loadTextsInShelf(shelfId: number) {
               <button id="add-text-btn" class="btn-primary">Add Text</button>
               <button id="split-large-texts-btn" class="btn-secondary">Split Large Texts</button>
               <button id="edit-shelf-btn" class="btn-secondary">Edit</button>
+              <button id="move-shelf-btn" class="btn-secondary">Move</button>
               <button id="delete-shelf-btn" class="btn-danger">Delete</button>
             </div>
           </div>
@@ -422,11 +426,14 @@ async function loadTextsInShelf(shelfId: number) {
 
     // Add shelf analysis if there are texts (including sub-shelf texts)
     if (shelfAnalysis !== null && shelfAnalysis.text_count > 0) {
-        const knownCharRate = shelfAnalysis.unique_characters > 0
-          ? Math.round((shelfAnalysis.known_characters_count / shelfAnalysis.unique_characters) * 100)
+        // Calculate rates based on total occurrences, not unique counts
+        const knownCharOccurrences = shelfAnalysis.known_characters.reduce((sum, c) => sum + c.frequency, 0);
+        const knownWordOccurrences = shelfAnalysis.known_words.reduce((sum, w) => sum + w.frequency, 0);
+        const knownCharRate = shelfAnalysis.total_characters > 0
+          ? Math.round((knownCharOccurrences / shelfAnalysis.total_characters) * 100)
           : 100;
-        const knownWordRate = shelfAnalysis.unique_words > 0
-          ? Math.round((shelfAnalysis.known_words_count / shelfAnalysis.unique_words) * 100)
+        const knownWordRate = shelfAnalysis.total_words > 0
+          ? Math.round((knownWordOccurrences / shelfAnalysis.total_words) * 100)
           : 100;
 
         const formatShelfFreqItem = (item: library.CharacterFrequency | library.WordFrequency, type: "character" | "word") => {
@@ -566,6 +573,7 @@ async function loadTextsInShelf(shelfId: number) {
     document.getElementById("add-text-btn")?.addEventListener("click", () => showAddTextModal(shelfId));
     document.getElementById("split-large-texts-btn")?.addEventListener("click", () => splitLargeTextsInShelf(shelfId));
     document.getElementById("edit-shelf-btn")?.addEventListener("click", () => showEditShelfModal(shelfId));
+    document.getElementById("move-shelf-btn")?.addEventListener("click", () => showMoveShelfModal(shelfId));
     document.getElementById("delete-shelf-btn")?.addEventListener("click", () => confirmDeleteShelf(shelfId));
 
     // Text item clicks
@@ -653,10 +661,21 @@ async function loadTextView(textId: number) {
     // Check for active reading session
     activeSession = await speed.getActiveReadingSession(textId);
 
+    // Find current text index for section navigation
+    const currentTextIndex = currentShelfTexts.findIndex(t => t.id === textId);
+    const hasPrevSection = currentTextIndex > 0;
+    const hasNextSection = currentTextIndex >= 0 && currentTextIndex < currentShelfTexts.length - 1;
+    const prevTextId = hasPrevSection ? currentShelfTexts[currentTextIndex - 1].id : null;
+    const nextTextId = hasNextSection ? currentShelfTexts[currentTextIndex + 1].id : null;
+
     let html = `
       <div class="text-view">
         <div class="text-header">
           <button id="back-to-shelf-btn" class="btn-secondary" data-text-id="${textId}">Back</button>
+          <div class="section-nav">
+            <button id="prev-section-btn" class="btn-secondary" ${hasPrevSection ? `data-text-id="${prevTextId}"` : 'disabled'}>Previous</button>
+            <button id="next-section-btn" class="btn-secondary" ${hasNextSection ? `data-text-id="${nextTextId}"` : 'disabled'}>Next</button>
+          </div>
           <div class="text-title-group">
             <h2>${escapeHtml(text.title)}</h2>
             ${text.author ? `<p class="text-author">by ${escapeHtml(text.author)}</p>` : ""}
@@ -754,6 +773,35 @@ async function loadTextView(textId: number) {
         sessionTimerInterval = null;
       }
       if (selectedShelfId) loadTextsInShelf(selectedShelfId);
+    });
+
+    // Section navigation handlers
+    document.getElementById("prev-section-btn")?.addEventListener("click", (e) => {
+      const btn = e.target as HTMLButtonElement;
+      if (btn.disabled) return;
+      const prevId = parseInt(btn.dataset.textId || "0");
+      if (prevId) {
+        // Clear timer when navigating
+        if (sessionTimerInterval) {
+          clearInterval(sessionTimerInterval);
+          sessionTimerInterval = null;
+        }
+        loadTextView(prevId);
+      }
+    });
+
+    document.getElementById("next-section-btn")?.addEventListener("click", (e) => {
+      const btn = e.target as HTMLButtonElement;
+      if (btn.disabled) return;
+      const nextId = parseInt(btn.dataset.textId || "0");
+      if (nextId) {
+        // Clear timer when navigating
+        if (sessionTimerInterval) {
+          clearInterval(sessionTimerInterval);
+          sessionTimerInterval = null;
+        }
+        loadTextView(nextId);
+      }
     });
 
     document.getElementById("analyze-text-btn")?.addEventListener("click", async () => {
@@ -1038,9 +1086,12 @@ async function loadReadingHistory(textId: number) {
 }
 
 // Load interactive segmented text
-async function loadInteractiveText(content: string, _textId: number) {
+async function loadInteractiveText(content: string, textId: number) {
   const container = document.getElementById("text-content-interactive");
   if (!container) return;
+
+  // Store current text ID for refresh
+  currentTextId = textId;
 
   try {
     const segments = await library.segmentText(content);
@@ -1077,8 +1128,347 @@ async function loadInteractiveText(content: string, _textId: number) {
         lookupInSidebar(text, type === "character" ? "character" : "word");
       });
     });
+
+    // Add mouseup handler for text selection
+    container.addEventListener("mouseup", handleTextSelection);
   } catch (error) {
     container.innerHTML = `<p class="error">Failed to load text: ${error}</p>`;
+  }
+}
+
+// Check if a character is CJK
+function isCjkCharacter(char: string): boolean {
+  const code = char.charCodeAt(0);
+  return (code >= 0x4E00 && code <= 0x9FFF) || (code >= 0x3400 && code <= 0x4DBF);
+}
+
+// Handle text selection in the reading view
+function handleTextSelection() {
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed) return;
+
+  const selectedText = selection.toString().trim();
+  if (!selectedText) return;
+
+  // Check if selection contains at least one CJK character
+  const hasCjk = [...selectedText].some(isCjkCharacter);
+  if (!hasCjk) return;
+
+  // Only handle selections of pure CJK characters (for simplicity)
+  const isAllCjk = [...selectedText].every(c => isCjkCharacter(c) || c === ' ' || c === '\n');
+  if (!isAllCjk) return;
+
+  // Clean up the selection (remove whitespace)
+  const cleanedText = selectedText.replace(/\s+/g, '');
+  if (cleanedText.length === 0) return;
+
+  // Clear segment selection
+  document.querySelectorAll(".text-segment.selected").forEach(s => s.classList.remove("selected"));
+
+  // Look up the selected text in the sidebar
+  lookupSelectedText(cleanedText);
+}
+
+// Look up selected text and show with "Add as Word" option
+async function lookupSelectedText(selectedText: string) {
+  const sidebarContent = document.getElementById("dict-sidebar-content");
+  if (!sidebarContent) return;
+
+  sidebarContent.innerHTML = '<p class="loading">Looking up...</p>';
+
+  try {
+    const termType = selectedText.length === 1 ? "character" : "word";
+    const result = await dictionary.lookup(selectedText, {
+      includeExamples: true,
+      includeCharacterInfo: termType === "character",
+      includeUserDictionaries: true,
+    });
+
+    renderSidebarResultsForSelection(result, selectedText, termType);
+  } catch (error) {
+    sidebarContent.innerHTML = `<p class="error">Lookup failed: ${error}</p>`;
+  }
+}
+
+// Render sidebar results for a text selection with "Add as Word" button
+function renderSidebarResultsForSelection(
+  result: dictionary.LookupResult,
+  selectedText: string,
+  termType: "character" | "word"
+) {
+  const sidebarContent = document.getElementById("dict-sidebar-content");
+  if (!sidebarContent) return;
+
+  const hasEntries = result.entries.length > 0 || result.user_entries.length > 0;
+
+  // Selection header showing what was selected
+  let html = `
+    <div class="selection-header">
+      <span class="selected-text">${escapeHtml(selectedText)}</span>
+      <span class="selection-label">Selected text</span>
+    </div>
+  `;
+
+  // Action buttons - show "Add as Word" only if there are dictionary entries
+  html += `<div class="dict-sidebar-actions-top">`;
+
+  if (hasEntries) {
+    html += `
+      <button class="btn-primary btn-add-as-word" data-word="${escapeHtml(selectedText)}" data-type="${termType}">
+        Add as Word
+      </button>
+    `;
+  }
+
+  html += `
+    <button class="btn-secondary btn-mark-known-sidebar" data-word="${escapeHtml(selectedText)}" data-type="${termType}">
+      Mark Known
+    </button>
+    <button class="btn-secondary btn-mark-learning-sidebar" data-word="${escapeHtml(selectedText)}" data-type="${termType}">
+      Mark Learning
+    </button>
+  </div>
+  `;
+
+  if (!hasEntries) {
+    // Show a form to define the word
+    html += `
+      <p class="dict-sidebar-empty">No dictionary entries found for "${escapeHtml(selectedText)}"</p>
+      <div class="define-word-form">
+        <h4>Define this word</h4>
+        <form id="define-word-form">
+          <div class="form-group">
+            <label for="define-definition">Definition *</label>
+            <textarea id="define-definition" required rows="2" placeholder="Enter your definition..."></textarea>
+          </div>
+          <div class="form-group">
+            <label for="define-pinyin">Pinyin</label>
+            <input type="text" id="define-pinyin" placeholder="e.g., pīn yīn" />
+          </div>
+          <div class="form-group">
+            <label for="define-notes">Notes</label>
+            <input type="text" id="define-notes" placeholder="Optional notes..." />
+          </div>
+          <div class="form-group form-checkbox">
+            <label>
+              <input type="checkbox" id="define-shelf-specific" />
+              Shelf-specific
+            </label>
+          </div>
+          <div class="form-group shelf-selector" id="shelf-selector-group" style="display: none;">
+            <label for="define-shelf">Shelf</label>
+            <select id="define-shelf">
+              <option value="">Loading shelves...</option>
+            </select>
+          </div>
+          <div class="form-actions">
+            <button type="submit" class="btn-primary" data-word="${escapeHtml(selectedText)}" data-type="${termType}">
+              Define & Add
+            </button>
+          </div>
+        </form>
+      </div>
+    `;
+    sidebarContent.innerHTML = html;
+    setupSidebarMarkKnown();
+    setupDefineWordForm(selectedText, termType);
+    return;
+  }
+
+  // Character info (compact)
+  if (result.character_info) {
+    const char = result.character_info;
+    html += `
+      <div class="entry">
+        <div class="entry-header">
+          <span class="traditional" style="font-size: 2rem;">${char.character}</span>
+        </div>
+        <div style="font-size: 0.85rem; color: #888; margin-top: 0.5rem;">
+          ${char.radical ? `Radical: ${char.radical} (#${char.radical_number})` : ""}
+          ${char.total_strokes ? ` · ${char.total_strokes} strokes` : ""}
+        </div>
+      </div>
+    `;
+  }
+
+  // Dictionary entries (compact)
+  for (const entry of result.entries.slice(0, 5)) {
+    html += `
+      <div class="entry">
+        <div class="entry-header">
+          <span class="traditional">${entry.traditional}</span>
+          ${entry.simplified !== entry.traditional ? `<span class="simplified">(${entry.simplified})</span>` : ""}
+          <span class="pinyin">${dictionary.formatPinyin(entry)}</span>
+        </div>
+        <div class="definitions">
+          ${entry.definitions.slice(0, 3)
+            .map(def => `
+              <div class="definition">
+                ${def.part_of_speech ? `<span class="pos">${def.part_of_speech}</span>` : ""}
+                <span class="def-text">${def.text}</span>
+              </div>
+            `)
+            .join("")}
+        </div>
+      </div>
+    `;
+  }
+
+  // User entries
+  for (const entry of result.user_entries.slice(0, 3)) {
+    html += `
+      <div class="entry user-entry">
+        <div class="entry-header">
+          <span class="traditional">${entry.term}</span>
+          ${entry.pinyin ? `<span class="pinyin">${entry.pinyin}</span>` : ""}
+        </div>
+        <div class="definitions">
+          <div class="definition">
+            <span class="def-text">${entry.definition}</span>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  sidebarContent.innerHTML = html;
+  setupSidebarMarkKnown();
+  setupAddAsWordButton();
+}
+
+// Set up "Add as Word" button handler
+function setupAddAsWordButton() {
+  document.querySelectorAll(".btn-add-as-word").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const word = (btn as HTMLElement).dataset.word!;
+
+      // Optimistic UI update
+      (btn as HTMLButtonElement).textContent = "Adding...";
+      (btn as HTMLButtonElement).disabled = true;
+
+      try {
+        // Add the word to segmentation (and optionally to vocabulary)
+        await library.addCustomSegmentationWord(word, true, "known");
+
+        (btn as HTMLButtonElement).textContent = "Added!";
+
+        // Refresh the text to show new segmentation
+        await refreshCurrentText();
+      } catch (error) {
+        console.error("Failed to add word:", error);
+        (btn as HTMLButtonElement).textContent = "Add as Word";
+        (btn as HTMLButtonElement).disabled = false;
+        alert(`Failed to add word: ${error}`);
+      }
+    });
+  });
+}
+
+// Set up the "Define Word" form for undefined words
+function setupDefineWordForm(word: string, _termType: "character" | "word") {
+  const form = document.getElementById("define-word-form") as HTMLFormElement;
+  const shelfSpecificCheckbox = document.getElementById("define-shelf-specific") as HTMLInputElement;
+  const shelfSelectorGroup = document.getElementById("shelf-selector-group") as HTMLDivElement;
+  const shelfSelect = document.getElementById("define-shelf") as HTMLSelectElement;
+
+  if (!form) return;
+
+  // Load shelves for the dropdown
+  loadShelvesForDefineForm(shelfSelect);
+
+  // Toggle shelf selector visibility
+  shelfSpecificCheckbox?.addEventListener("change", () => {
+    if (shelfSelectorGroup) {
+      shelfSelectorGroup.style.display = shelfSpecificCheckbox.checked ? "block" : "none";
+    }
+  });
+
+  // Handle form submission
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+
+    const definition = (document.getElementById("define-definition") as HTMLTextAreaElement).value.trim();
+    const pinyin = (document.getElementById("define-pinyin") as HTMLInputElement).value.trim() || undefined;
+    const notes = (document.getElementById("define-notes") as HTMLInputElement).value.trim() || undefined;
+    const isShelfSpecific = shelfSpecificCheckbox?.checked || false;
+    const shelfId = isShelfSpecific && shelfSelect?.value ? parseInt(shelfSelect.value) : undefined;
+
+    if (!definition) {
+      alert("Definition is required");
+      return;
+    }
+
+    const submitBtn = form.querySelector('button[type="submit"]') as HTMLButtonElement;
+    submitBtn.textContent = "Adding...";
+    submitBtn.disabled = true;
+
+    try {
+      await library.defineCustomWord(word, definition, pinyin, notes, shelfId, true, "known");
+
+      submitBtn.textContent = "Added!";
+
+      // Refresh the text to show new segmentation
+      await refreshCurrentText();
+    } catch (error) {
+      console.error("Failed to define word:", error);
+      submitBtn.textContent = "Define & Add";
+      submitBtn.disabled = false;
+      alert(`Failed to define word: ${error}`);
+    }
+  });
+}
+
+// Load shelves into the define form dropdown
+async function loadShelvesForDefineForm(selectElement: HTMLSelectElement) {
+  if (!selectElement) return;
+
+  try {
+    const shelves = await library.getShelfTree();
+    const flatShelves = library.flattenShelfTree(shelves);
+
+    let optionsHtml = '<option value="">Select a shelf...</option>';
+    for (const node of flatShelves) {
+      // Calculate depth for indentation
+      const depth = getShelfDepth(shelves, node.shelf.id);
+      const indent = "—".repeat(depth);
+      optionsHtml += `<option value="${node.shelf.id}">${indent}${escapeHtml(node.shelf.name)}</option>`;
+    }
+
+    selectElement.innerHTML = optionsHtml;
+
+    // Pre-select current shelf if viewing a text
+    if (selectedShelfId) {
+      selectElement.value = selectedShelfId.toString();
+    }
+  } catch (error) {
+    console.error("Failed to load shelves:", error);
+    selectElement.innerHTML = '<option value="">Failed to load shelves</option>';
+  }
+}
+
+// Get the depth of a shelf in the tree
+function getShelfDepth(tree: library.ShelfTree[], shelfId: number, currentDepth: number = 0): number {
+  for (const node of tree) {
+    if (node.shelf.id === shelfId) {
+      return currentDepth;
+    }
+    const childDepth = getShelfDepth(node.children, shelfId, currentDepth + 1);
+    if (childDepth !== -1) {
+      return childDepth;
+    }
+  }
+  return -1;
+}
+
+// Refresh the current text view after adding a custom word
+async function refreshCurrentText() {
+  if (!currentTextId) return;
+
+  try {
+    const text = await library.getText(currentTextId);
+    await loadInteractiveText(text.content, currentTextId);
+  } catch (error) {
+    console.error("Failed to refresh text:", error);
   }
 }
 
@@ -1305,8 +1695,13 @@ async function loadAnalysis(textId: number, sort: library.FrequencySort = curren
   try {
     const report = await library.getAnalysisReport(textId, 20, sort);
 
-    const knownCharRate = library.calculateKnownCharacterRate(report.summary);
-    const knownWordRate = library.calculateKnownWordRate(report.summary);
+    // Use occurrence counts from the summary for accurate rates
+    const knownCharRate = report.summary.total_characters > 0
+      ? Math.round((report.summary.known_character_occurrences / report.summary.total_characters) * 100)
+      : 100;
+    const knownWordRate = report.summary.total_words > 0
+      ? Math.round((report.summary.known_word_occurrences / report.summary.total_words) * 100)
+      : 100;
 
     const formatFreqItem = (item: library.CharacterFrequency | library.WordFrequency, type: "character" | "word") => {
       const label = type === "character" ? (item as library.CharacterFrequency).character : (item as library.WordFrequency).word;
@@ -2273,6 +2668,105 @@ function showEditShelfModal(shelfId: number) {
       alert(`Failed to update shelf: ${error}`);
     }
   });
+}
+
+function showMoveShelfModal(shelfId: number) {
+  const shelfNode = findShelfById(shelfTree, shelfId);
+  if (!shelfNode) return;
+
+  const shelf = shelfNode.shelf;
+
+  // Build options excluding the shelf itself and its descendants
+  const excludeIds = getShelfAndDescendantIds(shelfTree, shelfId);
+  const shelfOptions = renderShelfOptionsExcluding(shelfTree, 0, excludeIds, shelf.parent_id);
+
+  const modal = createModal("Move Shelf", `
+    <form id="move-shelf-form">
+      <div class="form-group">
+        <p>Move <strong>${escapeHtml(shelf.name)}</strong> to:</p>
+      </div>
+      <div class="form-group">
+        <label for="new-parent-shelf">New Parent Shelf</label>
+        <select id="new-parent-shelf">
+          <option value="">None (root level)</option>
+          ${shelfOptions}
+        </select>
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn-secondary modal-cancel">Cancel</button>
+        <button type="submit" class="btn-primary">Move</button>
+      </div>
+    </form>
+  `);
+
+  const form = modal.querySelector("#move-shelf-form") as HTMLFormElement;
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+
+    const newParentIdStr = (document.getElementById("new-parent-shelf") as HTMLSelectElement).value;
+    const newParentId = newParentIdStr ? parseInt(newParentIdStr) : undefined;
+
+    // Don't move if the parent hasn't changed
+    if (newParentId === shelf.parent_id) {
+      closeModal();
+      return;
+    }
+
+    try {
+      await library.moveShelf(shelfId, newParentId);
+      closeModal();
+      await loadShelfTree();
+    } catch (error) {
+      alert(`Failed to move shelf: ${error}`);
+    }
+  });
+}
+
+// Get IDs of a shelf and all its descendants (to exclude from move target)
+function getShelfAndDescendantIds(tree: library.ShelfTree[], shelfId: number): Set<number> {
+  const ids = new Set<number>();
+
+  function collectIds(nodes: library.ShelfTree[]) {
+    for (const node of nodes) {
+      ids.add(node.shelf.id);
+      collectIds(node.children);
+    }
+  }
+
+  function findAndCollect(nodes: library.ShelfTree[]): boolean {
+    for (const node of nodes) {
+      if (node.shelf.id === shelfId) {
+        ids.add(node.shelf.id);
+        collectIds(node.children);
+        return true;
+      }
+      if (findAndCollect(node.children)) return true;
+    }
+    return false;
+  }
+
+  findAndCollect(tree);
+  return ids;
+}
+
+// Render shelf options excluding certain IDs
+function renderShelfOptionsExcluding(
+  nodes: library.ShelfTree[],
+  depth: number,
+  excludeIds: Set<number>,
+  currentParentId: number | null
+): string {
+  return nodes
+    .filter(node => !excludeIds.has(node.shelf.id))
+    .map((node) => {
+      const indent = "—".repeat(depth);
+      const selected = node.shelf.id === currentParentId ? "selected" : "";
+      return `
+        <option value="${node.shelf.id}" ${selected}>${indent}${escapeHtml(node.shelf.name)}</option>
+        ${renderShelfOptionsExcluding(node.children, depth + 1, excludeIds, currentParentId)}
+      `;
+    })
+    .join("");
 }
 
 function showAddTextModal(shelfId: number) {

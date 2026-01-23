@@ -6,7 +6,7 @@
 use jieba_rs::Jieba;
 use rusqlite::{params, Connection};
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use super::error::{LibraryError, Result};
 use super::known_words;
@@ -43,11 +43,39 @@ fn build_vocabulary_sets(conn: &Connection) -> Result<VocabularySets> {
     Ok(VocabularySets { known, learning })
 }
 
-// Global jieba instance (loaded lazily)
-static JIEBA: OnceLock<Jieba> = OnceLock::new();
+// Global jieba instance (loaded lazily, wrapped in Mutex for modification)
+static JIEBA: OnceLock<Mutex<Jieba>> = OnceLock::new();
 
-fn get_jieba() -> &'static Jieba {
-    JIEBA.get_or_init(Jieba::new)
+fn get_jieba() -> &'static Mutex<Jieba> {
+    JIEBA.get_or_init(|| Mutex::new(Jieba::new()))
+}
+
+/// Add a word to the jieba segmentation dictionary at runtime
+pub fn add_segmentation_word(word: &str, frequency: Option<i64>) {
+    let jieba = get_jieba();
+    let mut jieba = jieba.lock().unwrap();
+    // Use the provided frequency or default to a high frequency to ensure the word is recognized
+    let freq = frequency.unwrap_or(10000) as usize;
+    jieba.add_word(word, Some(freq), None);
+}
+
+/// Load all user segmentation words from the database into jieba
+pub fn load_user_segmentation_words(conn: &Connection) -> Result<usize> {
+    let mut stmt = conn.prepare("SELECT word, frequency FROM user_segmentation_words")?;
+    let words: Vec<(String, i64)> = stmt
+        .query_map([], |row| {
+            let word: String = row.get(0)?;
+            let frequency: i64 = row.get(1)?;
+            Ok((word, frequency))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let count = words.len();
+    for (word, frequency) in words {
+        add_segmentation_word(&word, Some(frequency));
+    }
+
+    Ok(count)
 }
 
 /// Check if a character is CJK
@@ -90,6 +118,7 @@ pub fn analyze_text(conn: &Connection, text_id: i64) -> Result<TextAnalysis> {
     let vocab = build_vocabulary_sets(conn)?;
 
     let jieba = get_jieba();
+    let jieba = jieba.lock().unwrap();
 
     // Count character frequencies (CJK only)
     let mut char_freq: HashMap<char, i64> = HashMap::new();
@@ -120,6 +149,19 @@ pub fn analyze_text(conn: &Connection, text_id: i64) -> Result<TextAnalysis> {
         .filter(|w| vocab.known.contains(*w))
         .count() as i64;
 
+    // Calculate total occurrences of known characters/words
+    let known_char_occurrences: i64 = char_freq
+        .iter()
+        .filter(|(c, _)| vocab.known.contains(&c.to_string()))
+        .map(|(_, freq)| freq)
+        .sum();
+
+    let known_word_occurrences: i64 = word_freq
+        .iter()
+        .filter(|(w, _)| vocab.known.contains(*w))
+        .map(|(_, freq)| freq)
+        .sum();
+
     let total_chars: i64 = char_freq.values().sum();
     let total_words: i64 = word_freq.values().sum();
 
@@ -134,16 +176,18 @@ pub fn analyze_text(conn: &Connection, text_id: i64) -> Result<TextAnalysis> {
     // Insert analysis summary
     conn.execute(
         "INSERT INTO text_analyses (text_id, total_characters, unique_characters, known_characters,
-         total_words, unique_words, known_words)
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+         known_character_occurrences, total_words, unique_words, known_words, known_word_occurrences)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         params![
             text_id,
             total_chars,
             char_freq.len() as i64,
             known_char_count,
+            known_char_occurrences,
             total_words,
             word_freq.len() as i64,
             known_word_count,
+            known_word_occurrences,
         ],
     )?;
 
@@ -170,7 +214,8 @@ pub fn analyze_text(conn: &Connection, text_id: i64) -> Result<TextAnalysis> {
 pub fn get_text_analysis(conn: &Connection, text_id: i64) -> Result<TextAnalysis> {
     let result = conn.query_row(
         "SELECT text_id, total_characters, unique_characters, known_characters,
-                total_words, unique_words, known_words, analyzed_at
+                known_character_occurrences, total_words, unique_words, known_words,
+                known_word_occurrences, analyzed_at
          FROM text_analyses WHERE text_id = ?",
         [text_id],
         |row| {
@@ -179,10 +224,12 @@ pub fn get_text_analysis(conn: &Connection, text_id: i64) -> Result<TextAnalysis
                 total_characters: row.get(1)?,
                 unique_characters: row.get(2)?,
                 known_characters: row.get(3)?,
-                total_words: row.get(4)?,
-                unique_words: row.get(5)?,
-                known_words: row.get(6)?,
-                analyzed_at: row.get(7)?,
+                known_character_occurrences: row.get(4)?,
+                total_words: row.get(5)?,
+                unique_words: row.get(6)?,
+                known_words: row.get(7)?,
+                known_word_occurrences: row.get(8)?,
+                analyzed_at: row.get(9)?,
             })
         },
     );
@@ -436,6 +483,7 @@ pub fn reanalyze_text(conn: &Connection, text_id: i64) -> Result<TextAnalysis> {
 /// Segment text content into words and characters with known/unknown/learning status
 pub fn segment_text(conn: &Connection, content: &str) -> Result<Vec<TextSegment>> {
     let jieba = get_jieba();
+    let jieba = jieba.lock().unwrap();
 
     // Get vocabulary sets
     let vocab = build_vocabulary_sets(conn)?;
@@ -673,6 +721,7 @@ pub fn auto_mark_text_as_known(conn: &Connection, text_id: i64) -> Result<AutoMa
     let vocab = build_vocabulary_sets(conn)?;
 
     let jieba = get_jieba();
+    let jieba = jieba.lock().unwrap();
 
     // Get unique CJK characters
     let unique_chars: HashSet<char> = text
