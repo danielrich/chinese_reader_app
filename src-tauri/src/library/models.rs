@@ -361,3 +361,59 @@ pub struct FrequencyImportStats {
     /// Number of errors
     pub errors: usize,
 }
+
+/// A character for pre-study with its frequency and cumulative contribution
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreStudyCharacter {
+    /// The character
+    pub character: String,
+    /// Occurrences in the shelf's texts
+    pub frequency: i64,
+    /// Percentage contribution to coverage if learned
+    pub coverage_contribution: f64,
+    /// Cumulative coverage after learning this and previous characters
+    pub cumulative_coverage: f64,
+    /// Whether this character is in "learning" status
+    pub is_learning: bool,
+}
+
+/// Result of pre-study analysis for a shelf
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreStudyResult {
+    /// Shelf ID analyzed
+    pub shelf_id: i64,
+    /// Current known character rate (0-100)
+    pub current_known_rate: f64,
+    /// Target known rate (e.g., 90)
+    pub target_rate: f64,
+    /// Whether pre-study is needed
+    pub needs_prestudy: bool,
+    /// Characters to study, ordered by priority (highest frequency first)
+    pub characters_to_study: Vec<PreStudyCharacter>,
+    /// Number of characters needed to reach target
+    pub characters_needed: i64,
+    /// Total characters in the shelf (by occurrence)
+    pub total_character_occurrences: i64,
+}
+
+/// A context snippet showing a character in use
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextSnippet {
+    /// The text ID this snippet is from
+    pub text_id: i64,
+    /// The text title
+    pub text_title: String,
+    /// The snippet content (character + surrounding context)
+    pub snippet: String,
+    /// Position of the target character in the snippet
+    pub character_position: usize,
+}
+
+/// Context snippets for a character from a shelf's texts
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CharacterContext {
+    /// The character being looked up
+    pub character: String,
+    /// Context snippets from various texts
+    pub snippets: Vec<ContextSnippet>,
+}

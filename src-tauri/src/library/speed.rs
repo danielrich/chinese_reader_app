@@ -5,7 +5,7 @@
 //! - Tracking reading speed over time
 //! - Correlating speed with vocabulary knowledge
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Local, NaiveDate, Utc};
 use rusqlite::{params, Connection, Row};
 use serde::{Deserialize, Serialize};
 
@@ -561,6 +561,170 @@ pub fn update_session_auto_marked(
         params![auto_marked_characters, auto_marked_words, session_id],
     )?;
     Ok(())
+}
+
+/// Daily reading volume data point
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DailyReadingVolume {
+    /// Date in YYYY-MM-DD format
+    pub date: String,
+    /// Total characters read on this day
+    pub characters_read: i64,
+    /// Total reading time in seconds
+    pub reading_seconds: i64,
+    /// Number of sessions completed
+    pub sessions_count: i64,
+}
+
+/// Reading streak information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadingStreak {
+    /// Current consecutive days with reading
+    pub current_streak: i64,
+    /// Longest streak ever
+    pub longest_streak: i64,
+    /// Whether the user has read today
+    pub read_today: bool,
+    /// Date of the last reading session (YYYY-MM-DD)
+    pub last_reading_date: Option<String>,
+}
+
+/// Get daily reading volume for the past N days
+pub fn get_daily_reading_volume(conn: &Connection, days: i64) -> Result<Vec<DailyReadingVolume>> {
+    let query = r#"
+        SELECT
+            date(finished_at, 'localtime') as reading_date,
+            SUM(character_count) as characters_read,
+            SUM(duration_seconds) as reading_seconds,
+            COUNT(*) as sessions_count
+        FROM reading_sessions
+        WHERE is_complete = 1
+          AND finished_at >= date('now', 'localtime', ? || ' days')
+        GROUP BY date(finished_at, 'localtime')
+        ORDER BY reading_date ASC
+    "#;
+
+    let days_param = format!("-{}", days);
+    let mut stmt = conn.prepare(query)?;
+    let volumes = stmt
+        .query_map([days_param], |row| {
+            Ok(DailyReadingVolume {
+                date: row.get("reading_date")?,
+                characters_read: row.get("characters_read")?,
+                reading_seconds: row.get::<_, Option<i64>>("reading_seconds")?.unwrap_or(0),
+                sessions_count: row.get("sessions_count")?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    Ok(volumes)
+}
+
+/// Calculate reading streak information
+pub fn get_reading_streak(conn: &Connection) -> Result<ReadingStreak> {
+    // Get all unique reading dates, ordered most recent first
+    let query = r#"
+        SELECT DISTINCT date(finished_at, 'localtime') as reading_date
+        FROM reading_sessions
+        WHERE is_complete = 1
+        ORDER BY reading_date DESC
+    "#;
+
+    let mut stmt = conn.prepare(query)?;
+    let dates: Vec<String> = stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    if dates.is_empty() {
+        return Ok(ReadingStreak {
+            current_streak: 0,
+            longest_streak: 0,
+            read_today: false,
+            last_reading_date: None,
+        });
+    }
+
+    let today = Local::now().format("%Y-%m-%d").to_string();
+    let yesterday = (Local::now() - Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
+
+    let last_reading_date = dates.first().cloned();
+    let read_today = last_reading_date.as_ref() == Some(&today);
+
+    // Calculate current streak
+    let mut current_streak = 0i64;
+    let mut check_date = if read_today {
+        Local::now().date_naive()
+    } else if last_reading_date.as_ref() == Some(&yesterday) {
+        // If they read yesterday but not today, streak is still active
+        (Local::now() - Duration::days(1)).date_naive()
+    } else {
+        // No recent reading, streak is broken
+        return Ok(ReadingStreak {
+            current_streak: 0,
+            longest_streak: calculate_longest_streak(&dates),
+            read_today: false,
+            last_reading_date,
+        });
+    };
+
+    for date_str in &dates {
+        let date = NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
+            .unwrap_or_else(|_| Local::now().date_naive());
+
+        if date == check_date {
+            current_streak += 1;
+            check_date -= Duration::days(1);
+        } else if date < check_date {
+            // Gap in dates, streak ends
+            break;
+        }
+        // If date > check_date, skip (shouldn't happen with DESC order)
+    }
+
+    let longest_streak = calculate_longest_streak(&dates).max(current_streak);
+
+    Ok(ReadingStreak {
+        current_streak,
+        longest_streak,
+        read_today,
+        last_reading_date,
+    })
+}
+
+/// Helper to calculate the longest streak from a list of dates
+fn calculate_longest_streak(dates: &[String]) -> i64 {
+    if dates.is_empty() {
+        return 0;
+    }
+
+    // Convert to NaiveDates and sort ascending
+    let mut parsed_dates: Vec<NaiveDate> = dates
+        .iter()
+        .filter_map(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+        .collect();
+    parsed_dates.sort();
+    parsed_dates.dedup();
+
+    if parsed_dates.is_empty() {
+        return 0;
+    }
+
+    let mut longest = 1i64;
+    let mut current = 1i64;
+
+    for window in parsed_dates.windows(2) {
+        let diff = (window[1] - window[0]).num_days();
+        if diff == 1 {
+            current += 1;
+            longest = longest.max(current);
+        } else {
+            current = 1;
+        }
+    }
+
+    longest
 }
 
 // =============================================================================

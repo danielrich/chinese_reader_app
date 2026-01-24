@@ -19,5 +19,5 @@ pub mod text;
 
 pub use error::{LibraryError, Result};
 pub use models::*;
-pub use speed::{ReadingSession, SpeedDataPoint, SpeedStats};
+pub use speed::{DailyReadingVolume, ReadingSession, ReadingStreak, SpeedDataPoint, SpeedStats};
 pub use text::{CreateTextResult, MigrateLargeTextsResult, MAX_SECTION_CHARS};

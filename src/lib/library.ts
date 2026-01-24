@@ -236,6 +236,58 @@ export interface TextSegment {
   segment_type: string;
 }
 
+/** A character for pre-study with frequency and coverage info */
+export interface PreStudyCharacter {
+  /** The character */
+  character: string;
+  /** Occurrences in the shelf's texts */
+  frequency: number;
+  /** Percentage contribution to coverage if learned */
+  coverage_contribution: number;
+  /** Cumulative coverage after learning this and previous characters */
+  cumulative_coverage: number;
+  /** Whether this character is in "learning" status */
+  is_learning: boolean;
+}
+
+/** Result of pre-study analysis for a shelf */
+export interface PreStudyResult {
+  /** Shelf ID analyzed */
+  shelf_id: number;
+  /** Current known character rate (0-100) */
+  current_known_rate: number;
+  /** Target known rate (e.g., 90) */
+  target_rate: number;
+  /** Whether pre-study is needed */
+  needs_prestudy: boolean;
+  /** Characters to study, ordered by priority */
+  characters_to_study: PreStudyCharacter[];
+  /** Number of characters needed to reach target */
+  characters_needed: number;
+  /** Total characters in the shelf (by occurrence) */
+  total_character_occurrences: number;
+}
+
+/** A context snippet showing a character in use */
+export interface ContextSnippet {
+  /** Text ID this snippet is from */
+  text_id: number;
+  /** Text title */
+  text_title: string;
+  /** The snippet content */
+  snippet: string;
+  /** Position of target character in snippet */
+  character_position: number;
+}
+
+/** Context snippets for a character from a shelf's texts */
+export interface CharacterContext {
+  /** The character being looked up */
+  character: string;
+  /** Context snippets */
+  snippets: ContextSnippet[];
+}
+
 // =============================================================================
 // Shelf API
 // =============================================================================
@@ -419,6 +471,27 @@ export async function getShelfAnalysis(shelfId: number): Promise<ShelfAnalysis> 
  */
 export async function segmentText(content: string): Promise<TextSegment[]> {
   return invoke<TextSegment[]>("segment_text", { content });
+}
+
+/**
+ * Get pre-study characters needed to reach target known rate
+ */
+export async function getPrestudy(
+  shelfId: number,
+  targetRate: number = 90
+): Promise<PreStudyResult> {
+  return invoke<PreStudyResult>("get_prestudy_characters", { shelfId, targetRate });
+}
+
+/**
+ * Get context snippets for a character from texts in a shelf
+ */
+export async function getCharacterContext(
+  shelfId: number,
+  character: string,
+  maxSnippets: number = 3
+): Promise<CharacterContext> {
+  return invoke<CharacterContext>("get_character_context", { shelfId, character, maxSnippets });
 }
 
 // =============================================================================

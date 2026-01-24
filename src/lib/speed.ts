@@ -95,6 +95,30 @@ export interface SpeedStats {
   estimated_completion_seconds: number | null;
 }
 
+/** Daily reading volume data point */
+export interface DailyReadingVolume {
+  /** Date in YYYY-MM-DD format */
+  date: string;
+  /** Total characters read on this day */
+  characters_read: number;
+  /** Total reading time in seconds */
+  reading_seconds: number;
+  /** Number of sessions completed */
+  sessions_count: number;
+}
+
+/** Reading streak information */
+export interface ReadingStreak {
+  /** Current consecutive days with reading */
+  current_streak: number;
+  /** Longest streak ever */
+  longest_streak: number;
+  /** Whether the user has read today */
+  read_today: boolean;
+  /** Date of the last reading session (YYYY-MM-DD) */
+  last_reading_date: string | null;
+}
+
 // =============================================================================
 // Session API
 // =============================================================================
@@ -180,6 +204,20 @@ export async function getSpeedData(
  */
 export async function getSpeedStats(shelfId?: number): Promise<SpeedStats> {
   return invoke<SpeedStats>("get_speed_stats", { shelfId });
+}
+
+/**
+ * Get daily reading volume for the past N days
+ */
+export async function getDailyReadingVolume(days: number): Promise<DailyReadingVolume[]> {
+  return invoke<DailyReadingVolume[]>("get_daily_reading_volume", { days });
+}
+
+/**
+ * Get reading streak information
+ */
+export async function getReadingStreak(): Promise<ReadingStreak> {
+  return invoke<ReadingStreak>("get_reading_streak");
 }
 
 // =============================================================================

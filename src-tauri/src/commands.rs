@@ -13,12 +13,12 @@ use crate::dictionary::{
 use crate::library::{
     self,
     models::{
-        AnalysisReport, FrequencyImportStats, FrequencySort, FrequencySource, ImportStats,
-        KnownWord, LearningStats, PercentileCoverage, Shelf, ShelfAnalysis,
-        ShelfFrequencyAnalysis, ShelfTree, TermFrequencyInfo, Text, TextAnalysis, TextSegment,
-        TextSummary, VocabularyProgress,
+        AnalysisReport, CharacterContext, FrequencyImportStats, FrequencySort, FrequencySource,
+        ImportStats, KnownWord, LearningStats, PercentileCoverage, PreStudyResult, Shelf,
+        ShelfAnalysis, ShelfFrequencyAnalysis, ShelfTree, TermFrequencyInfo, Text, TextAnalysis,
+        TextSegment, TextSummary, VocabularyProgress,
     },
-    MigrateLargeTextsResult, ReadingSession, SpeedDataPoint, SpeedStats,
+    DailyReadingVolume, MigrateLargeTextsResult, ReadingSession, ReadingStreak, SpeedDataPoint, SpeedStats,
 };
 use rusqlite::Connection;
 use std::fs::File;
@@ -707,6 +707,39 @@ pub fn segment_text(state: State<AppState>, content: String) -> CommandResult<Ve
         .map_err(|e| CommandError::Database(e.to_string()))
 }
 
+/// Get pre-study characters for a shelf to reach target known rate
+#[tauri::command]
+pub fn get_prestudy_characters(
+    state: State<AppState>,
+    shelf_id: i64,
+    target_rate: f64,
+) -> CommandResult<PreStudyResult> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::analysis::get_prestudy_characters(&conn, shelf_id, target_rate)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// Get context snippets for a character from texts in a shelf
+#[tauri::command]
+pub fn get_character_context(
+    state: State<AppState>,
+    shelf_id: i64,
+    character: String,
+    max_snippets: Option<usize>,
+) -> CommandResult<CharacterContext> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::analysis::get_character_context(&conn, shelf_id, &character, max_snippets.unwrap_or(3))
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
 // =============================================================================
 // Known Words Commands
 // =============================================================================
@@ -918,6 +951,30 @@ pub fn get_speed_stats(state: State<AppState>, shelf_id: Option<i64>) -> Command
         .map_err(|e| CommandError::Database(e.to_string()))?;
 
     library::speed::get_speed_stats(&conn, shelf_id)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// Get daily reading volume for the past N days
+#[tauri::command]
+pub fn get_daily_reading_volume(state: State<AppState>, days: i64) -> CommandResult<Vec<DailyReadingVolume>> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::speed::get_daily_reading_volume(&conn, days)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
+/// Get reading streak information
+#[tauri::command]
+pub fn get_reading_streak(state: State<AppState>) -> CommandResult<ReadingStreak> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::speed::get_reading_streak(&conn)
         .map_err(|e| CommandError::Database(e.to_string()))
 }
 

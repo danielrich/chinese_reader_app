@@ -11,8 +11,8 @@ use std::sync::{Mutex, OnceLock};
 use super::error::{LibraryError, Result};
 use super::known_words;
 use super::models::{
-    AnalysisReport, CharacterFrequency, FrequencySort, ShelfAnalysis, TextAnalysis, TextSegment,
-    WordFrequency,
+    AnalysisReport, CharacterContext, CharacterFrequency, ContextSnippet, FrequencySort,
+    PreStudyCharacter, PreStudyResult, ShelfAnalysis, TextAnalysis, TextSegment, WordFrequency,
 };
 use super::text;
 
@@ -769,6 +769,218 @@ pub fn auto_mark_text_as_known(conn: &Connection, text_id: i64) -> Result<AutoMa
     Ok(AutoMarkStats {
         characters_marked,
         words_marked,
+    })
+}
+
+/// Calculate pre-study characters needed to reach target known rate for a shelf
+pub fn get_prestudy_characters(
+    conn: &Connection,
+    shelf_id: i64,
+    target_rate: f64,
+) -> Result<PreStudyResult> {
+    // Get vocabulary sets - only status='known' counts as known
+    let vocab = build_vocabulary_sets(conn)?;
+
+    // Get all shelf IDs (this shelf + all descendants)
+    let all_shelf_ids = get_all_descendant_shelf_ids(conn, shelf_id)?;
+
+    // Get all text IDs in these shelves
+    let placeholders: String = all_shelf_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let query = format!("SELECT id FROM texts WHERE shelf_id IN ({})", placeholders);
+    let mut stmt = conn.prepare(&query)?;
+    let text_ids: Vec<i64> = stmt
+        .query_map(rusqlite::params_from_iter(&all_shelf_ids), |row| row.get(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    // Aggregate character frequencies across all texts
+    let mut char_freq: HashMap<String, i64> = HashMap::new();
+    let mut total_character_occurrences: i64 = 0;
+
+    for text_id in &text_ids {
+        // Ensure analysis exists
+        if get_text_analysis(conn, *text_id).is_err() {
+            analyze_text(conn, *text_id)?;
+        }
+
+        // Get character frequencies for this text
+        let mut char_stmt = conn.prepare(
+            "SELECT character, frequency FROM text_character_freq WHERE text_id = ?",
+        )?;
+        let char_rows = char_stmt.query_map([text_id], |row| {
+            let character: String = row.get(0)?;
+            let frequency: i64 = row.get(1)?;
+            Ok((character, frequency))
+        })?;
+
+        for row in char_rows {
+            let (character, frequency) = row?;
+            *char_freq.entry(character).or_insert(0) += frequency;
+            total_character_occurrences += frequency;
+        }
+    }
+
+    if total_character_occurrences == 0 {
+        return Ok(PreStudyResult {
+            shelf_id,
+            current_known_rate: 100.0,
+            target_rate,
+            needs_prestudy: false,
+            characters_to_study: vec![],
+            characters_needed: 0,
+            total_character_occurrences: 0,
+        });
+    }
+
+    // Calculate current known rate based on occurrences (known + learning both count)
+    let known_occurrences: i64 = char_freq
+        .iter()
+        .filter(|(c, _)| vocab.known.contains(*c))
+        .map(|(_, freq)| freq)
+        .sum();
+
+    let learning_occurrences: i64 = char_freq
+        .iter()
+        .filter(|(c, _)| vocab.learning.contains(*c))
+        .map(|(_, freq)| freq)
+        .sum();
+
+    // Both known and learning count toward the "familiar" rate
+    let familiar_occurrences = known_occurrences + learning_occurrences;
+    let current_known_rate = (familiar_occurrences as f64 / total_character_occurrences as f64) * 100.0;
+
+    // Check if already at target
+    if current_known_rate >= target_rate {
+        return Ok(PreStudyResult {
+            shelf_id,
+            current_known_rate,
+            target_rate,
+            needs_prestudy: false,
+            characters_to_study: vec![],
+            characters_needed: 0,
+            total_character_occurrences,
+        });
+    }
+
+    // Get characters that aren't fully known (includes learning and unknown), sorted by frequency
+    let mut chars_to_study: Vec<(String, i64, bool)> = char_freq
+        .into_iter()
+        .filter(|(c, _)| !vocab.known.contains(c))
+        .map(|(c, freq)| {
+            let is_learning = vocab.learning.contains(&c);
+            (c, freq, is_learning)
+        })
+        .collect();
+    chars_to_study.sort_by(|a, b| b.1.cmp(&a.1));
+
+    // Calculate how many characters needed to reach target
+    // Only count non-learning characters toward "characters needed"
+    let target_known_occurrences = (target_rate / 100.0 * total_character_occurrences as f64) as i64;
+    let occurrences_needed = target_known_occurrences - familiar_occurrences;
+
+    let mut cumulative_added: i64 = 0;
+    let mut characters_to_study: Vec<PreStudyCharacter> = vec![];
+    let mut characters_needed: i64 = 0;
+    let mut non_learning_count: i64 = 0;
+
+    for (character, frequency, is_learning) in chars_to_study {
+        // Learning characters don't add to cumulative (already counted in familiar_occurrences)
+        if !is_learning {
+            cumulative_added += frequency;
+            non_learning_count += 1;
+        }
+        let cumulative_known = familiar_occurrences + cumulative_added;
+        let cumulative_coverage = (cumulative_known as f64 / total_character_occurrences as f64) * 100.0;
+        let coverage_contribution = (frequency as f64 / total_character_occurrences as f64) * 100.0;
+
+        characters_to_study.push(PreStudyCharacter {
+            character,
+            frequency,
+            coverage_contribution,
+            cumulative_coverage,
+            is_learning,
+        });
+
+        // Only count non-learning characters toward the "needed" count
+        if !is_learning && cumulative_added >= occurrences_needed && characters_needed == 0 {
+            characters_needed = non_learning_count;
+        }
+    }
+
+    // If we didn't reach the target with all non-learning characters, set needed to total non-learning
+    if characters_needed == 0 {
+        characters_needed = non_learning_count;
+    }
+
+    Ok(PreStudyResult {
+        shelf_id,
+        current_known_rate,
+        target_rate,
+        needs_prestudy: true,
+        characters_to_study,
+        characters_needed,
+        total_character_occurrences,
+    })
+}
+
+/// Get context snippets for a character from texts in a shelf
+pub fn get_character_context(
+    conn: &Connection,
+    shelf_id: i64,
+    character: &str,
+    max_snippets: usize,
+) -> Result<CharacterContext> {
+    // Get all shelf IDs (this shelf + all descendants)
+    let all_shelf_ids = get_all_descendant_shelf_ids(conn, shelf_id)?;
+
+    // Get all texts in these shelves
+    let placeholders: String = all_shelf_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let query = format!(
+        "SELECT id, title, content FROM texts WHERE shelf_id IN ({}) ORDER BY title",
+        placeholders
+    );
+    let mut stmt = conn.prepare(&query)?;
+    let texts: Vec<(i64, String, String)> = stmt
+        .query_map(rusqlite::params_from_iter(&all_shelf_ids), |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let mut snippets: Vec<ContextSnippet> = vec![];
+    let context_chars = 10; // Characters before and after
+
+    for (text_id, text_title, content) in texts {
+        if snippets.len() >= max_snippets {
+            break;
+        }
+
+        // Find all occurrences of the character in this text
+        let chars: Vec<char> = content.chars().collect();
+        for (i, c) in chars.iter().enumerate() {
+            if snippets.len() >= max_snippets {
+                break;
+            }
+
+            if c.to_string() == character {
+                // Extract context around this occurrence
+                let start = i.saturating_sub(context_chars);
+                let end = (i + context_chars + 1).min(chars.len());
+
+                let snippet: String = chars[start..end].iter().collect();
+                let char_position = i - start;
+
+                snippets.push(ContextSnippet {
+                    text_id,
+                    text_title: text_title.clone(),
+                    snippet,
+                    character_position: char_position,
+                });
+            }
+        }
+    }
+
+    Ok(CharacterContext {
+        character: character.to_string(),
+        snippets,
     })
 }
 

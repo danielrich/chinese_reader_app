@@ -95,6 +95,8 @@ pub fn run() {
             commands::reanalyze_text,
             commands::get_shelf_analysis,
             commands::segment_text,
+            commands::get_prestudy_characters,
+            commands::get_character_context,
             // Known words
             commands::add_known_word,
             commands::update_word_status,
@@ -111,6 +113,8 @@ pub fn run() {
             commands::get_text_reading_history,
             commands::get_speed_data,
             commands::get_speed_stats,
+            commands::get_daily_reading_volume,
+            commands::get_reading_streak,
             // Settings
             commands::get_setting,
             commands::set_setting,

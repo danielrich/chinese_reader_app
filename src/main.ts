@@ -27,6 +27,8 @@ async function initApp() {
         <button class="nav-tab" data-view="library">Library</button>
         <button class="nav-tab" data-view="learning">Learning</button>
         <button class="nav-tab" data-view="speed">Speed</button>
+        <button class="nav-tab" data-view="stats">Stats</button>
+        <button class="nav-tab" data-view="prestudy">Pre-Study</button>
       </nav>
 
       <div id="dictionary-view" class="view active">
@@ -86,6 +88,14 @@ async function initApp() {
       <div id="speed-view" class="view">
         <div id="speed-main"></div>
       </div>
+
+      <div id="stats-view" class="view">
+        <div id="stats-main"></div>
+      </div>
+
+      <div id="prestudy-view" class="view">
+        <div id="prestudy-main"></div>
+      </div>
     </div>
   `;
 
@@ -107,7 +117,7 @@ function setupNavigation() {
 
   tabs.forEach((tab) => {
     tab.addEventListener("click", () => {
-      const view = (tab as HTMLElement).dataset.view as "dictionary" | "library" | "learning" | "speed";
+      const view = (tab as HTMLElement).dataset.view as "dictionary" | "library" | "learning" | "speed" | "stats" | "prestudy";
 
       // Update active tab
       tabs.forEach((t) => t.classList.remove("active"));
@@ -123,6 +133,10 @@ function setupNavigation() {
         loadLearningView();
       } else if (view === "speed") {
         loadSpeedView();
+      } else if (view === "stats") {
+        loadStatsView();
+      } else if (view === "prestudy") {
+        loadPrestudyView();
       }
     });
   });
@@ -2198,6 +2212,747 @@ function setupSpeedViewHandlers(data: speed.SpeedDataPoint[]) {
     const graphContainer = document.getElementById("speed-graph");
     if (graphContainer) {
       graphContainer.innerHTML = renderSpeedGraph(data, currentGraphType);
+    }
+  });
+}
+
+// =============================================================================
+// Stats View (Reading Volume & Streak)
+// =============================================================================
+
+let currentStatsPeriod: 30 | 90 | 365 = 30;
+
+async function loadStatsView() {
+  const container = document.getElementById("stats-main");
+  if (!container) return;
+
+  container.innerHTML = '<p class="loading">Loading stats...</p>';
+
+  try {
+    const [volumeData, streak] = await Promise.all([
+      speed.getDailyReadingVolume(currentStatsPeriod),
+      speed.getReadingStreak(),
+    ]);
+
+    // Calculate totals from the volume data
+    const totalChars = volumeData.reduce((sum, d) => sum + d.characters_read, 0);
+    const totalMinutes = Math.round(volumeData.reduce((sum, d) => sum + d.reading_seconds, 0) / 60);
+    const totalSessions = volumeData.reduce((sum, d) => sum + d.sessions_count, 0);
+    const daysWithReading = volumeData.length;
+
+    let html = `
+      <div class="stats-view">
+        <div class="stats-header">
+          <h2>Reading Stats</h2>
+          <div class="stats-period-filter">
+            <label for="stats-period">Period:</label>
+            <select id="stats-period">
+              <option value="30" ${currentStatsPeriod === 30 ? "selected" : ""}>Last 30 Days</option>
+              <option value="90" ${currentStatsPeriod === 90 ? "selected" : ""}>Last 90 Days</option>
+              <option value="365" ${currentStatsPeriod === 365 ? "selected" : ""}>Last Year</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="streak-banner ${streak.current_streak > 0 ? "active" : ""}">
+          <div class="streak-flame">${streak.current_streak > 0 ? "🔥" : "💤"}</div>
+          <div class="streak-info">
+            <span class="streak-count">${streak.current_streak}</span>
+            <span class="streak-label">Day${streak.current_streak !== 1 ? "s" : ""} Streak</span>
+          </div>
+          <div class="streak-details">
+            <span class="streak-detail">Longest: ${streak.longest_streak} day${streak.longest_streak !== 1 ? "s" : ""}</span>
+            <span class="streak-detail">${streak.read_today ? "Read today ✓" : "Not read today"}</span>
+          </div>
+        </div>
+
+        <div class="stats-summary">
+          <div class="stat-card">
+            <span class="stat-value">${library.formatCharacterCount(totalChars)}</span>
+            <span class="stat-label">Characters</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-value">${formatMinutes(totalMinutes)}</span>
+            <span class="stat-label">Reading Time</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-value">${totalSessions}</span>
+            <span class="stat-label">Sessions</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-value">${daysWithReading}</span>
+            <span class="stat-label">Days Active</span>
+          </div>
+        </div>
+
+        <div class="volume-chart-section">
+          <h3>Reading Volume Over Time</h3>
+          ${renderVolumeChart(volumeData, currentStatsPeriod)}
+        </div>
+
+        <div class="daily-breakdown-section">
+          <h3>Recent Activity</h3>
+          ${renderDailyBreakdown(volumeData)}
+        </div>
+      </div>
+    `;
+
+    container.innerHTML = html;
+    setupStatsViewHandlers();
+
+  } catch (error) {
+    container.innerHTML = `<p class="error">Failed to load stats: ${error}</p>`;
+  }
+}
+
+function formatMinutes(minutes: number): string {
+  if (minutes < 60) {
+    return `${minutes}m`;
+  }
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  if (remainingMinutes > 0) {
+    return `${hours}h ${remainingMinutes}m`;
+  }
+  return `${hours}h`;
+}
+
+function renderVolumeChart(data: speed.DailyReadingVolume[], periodDays: number): string {
+  if (data.length === 0) {
+    return '<p class="empty-message">No reading data yet. Start reading to track your progress!</p>';
+  }
+
+  // Create a map of date -> data for easy lookup
+  const dataMap = new Map(data.map(d => [d.date, d]));
+
+  // Generate all dates in the period
+  const dates: string[] = [];
+  const today = new Date();
+  for (let i = periodDays - 1; i >= 0; i--) {
+    const date = new Date(today);
+    date.setDate(date.getDate() - i);
+    dates.push(date.toISOString().split("T")[0]);
+  }
+
+  // Find max values for scaling
+  const maxChars = Math.max(...data.map(d => d.characters_read), 1);
+  const maxMinutes = Math.max(...data.map(d => Math.ceil(d.reading_seconds / 60)), 1);
+
+  // Determine bar width based on period
+  const barWidth = periodDays <= 30 ? "calc(100% / 30 - 2px)" :
+                   periodDays <= 90 ? "calc(100% / 90 - 1px)" :
+                   "calc(100% / 365)";
+
+  const barsHtml = dates.map(date => {
+    const dayData = dataMap.get(date);
+    const chars = dayData?.characters_read ?? 0;
+    const minutes = dayData ? Math.ceil(dayData.reading_seconds / 60) : 0;
+    const charHeight = (chars / maxChars) * 100;
+    const minuteHeight = (minutes / maxMinutes) * 100;
+
+    const dateObj = new Date(date + "T00:00:00");
+    const dayLabel = dateObj.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+
+    return `
+      <div class="volume-bar-group" style="width: ${barWidth};" title="${dayLabel}: ${library.formatCharacterCount(chars)} chars, ${minutes}min">
+        <div class="volume-bar chars-bar" style="height: ${charHeight}%;"></div>
+        <div class="volume-bar minutes-bar" style="height: ${minuteHeight}%;"></div>
+      </div>
+    `;
+  }).join("");
+
+  return `
+    <div class="volume-chart-container">
+      <div class="volume-chart-legend">
+        <span class="legend-item"><span class="legend-color chars-color"></span> Characters</span>
+        <span class="legend-item"><span class="legend-color minutes-color"></span> Minutes</span>
+      </div>
+      <div class="volume-chart">
+        <div class="volume-bars">
+          ${barsHtml}
+        </div>
+      </div>
+      <div class="volume-chart-labels">
+        <span>${dates[0]}</span>
+        <span>${dates[dates.length - 1]}</span>
+      </div>
+    </div>
+  `;
+}
+
+function renderDailyBreakdown(data: speed.DailyReadingVolume[]): string {
+  if (data.length === 0) {
+    return '<p class="empty-message">No reading sessions recorded yet.</p>';
+  }
+
+  // Show most recent days first
+  const recent = [...data].reverse().slice(0, 14);
+
+  let html = '<div class="daily-breakdown-list">';
+
+  for (const day of recent) {
+    const dateObj = new Date(day.date + "T00:00:00");
+    const dateLabel = dateObj.toLocaleDateString(undefined, {
+      weekday: "short",
+      month: "short",
+      day: "numeric",
+    });
+    const minutes = Math.round(day.reading_seconds / 60);
+
+    html += `
+      <div class="daily-breakdown-item">
+        <div class="daily-date">${dateLabel}</div>
+        <div class="daily-stats">
+          <span class="daily-chars">${library.formatCharacterCount(day.characters_read)} chars</span>
+          <span class="daily-time">${formatMinutes(minutes)}</span>
+          <span class="daily-sessions">${day.sessions_count} session${day.sessions_count !== 1 ? "s" : ""}</span>
+        </div>
+      </div>
+    `;
+  }
+
+  html += "</div>";
+  return html;
+}
+
+function setupStatsViewHandlers() {
+  document.getElementById("stats-period")?.addEventListener("change", async (e) => {
+    const value = parseInt((e.target as HTMLSelectElement).value);
+    currentStatsPeriod = value as 30 | 90 | 365;
+    await loadStatsView();
+  });
+}
+
+// =============================================================================
+// Pre-Study View
+// =============================================================================
+
+let currentPrestudyShelfId: number | null = null;
+let currentPrestudyResult: library.PreStudyResult | null = null;
+let selectedPrestudyCharacter: string | null = null;
+let hideLearningCharacters: boolean = true;
+let prestudyTargetRate: number = 90;
+
+async function loadPrestudyView() {
+  const container = document.getElementById("prestudy-main");
+  if (!container) return;
+
+  try {
+    const shelves = await library.getShelfTree();
+
+    const shelfOptions = renderPrestudyShelfOptions(shelves);
+
+    let html = `
+      <div class="prestudy-view">
+        <div class="prestudy-header">
+          <h2>Pre-Study Characters</h2>
+          <p class="prestudy-description">
+            Learn high-frequency characters before reading to improve comprehension.
+            Select a shelf, set your target known rate, and calculate which characters to study.
+          </p>
+        </div>
+
+        <div class="prestudy-controls">
+          <div class="prestudy-shelf-select">
+            <label for="prestudy-shelf">Select Shelf:</label>
+            <select id="prestudy-shelf">
+              <option value="">-- Choose a shelf --</option>
+              ${shelfOptions}
+            </select>
+          </div>
+          <div class="prestudy-target-rate">
+            <label for="prestudy-target">Target Rate:</label>
+            <input type="number" id="prestudy-target" min="50" max="100" step="1" value="${prestudyTargetRate}">
+            <span>%</span>
+          </div>
+          <button id="prestudy-calculate-btn" class="btn-primary" ${!currentPrestudyShelfId ? "disabled" : ""}>
+            Calculate Pre-Study Characters
+          </button>
+          <button id="prestudy-export-btn" class="btn-secondary" ${!currentPrestudyResult ? "disabled" : ""}>
+            Export to Anki
+          </button>
+        </div>
+
+        <div id="prestudy-results" class="prestudy-results">
+          ${currentPrestudyResult ? renderPrestudyResults(currentPrestudyResult) : '<p class="empty-message">Select a shelf and click Calculate to see pre-study characters.</p>'}
+        </div>
+      </div>
+    `;
+
+    container.innerHTML = html;
+    setupPrestudyViewHandlers();
+
+  } catch (error) {
+    container.innerHTML = `<p class="error">Failed to load pre-study view: ${error}</p>`;
+  }
+}
+
+function renderPrestudyShelfOptions(shelves: library.ShelfTree[], depth: number = 0): string {
+  return shelves
+    .map((node) => {
+      const indent = "—".repeat(depth);
+      const selected = node.shelf.id === currentPrestudyShelfId ? "selected" : "";
+      return `
+        <option value="${node.shelf.id}" ${selected}>${indent}${escapeHtml(node.shelf.name)}</option>
+        ${renderPrestudyShelfOptions(node.children, depth + 1)}
+      `;
+    })
+    .join("");
+}
+
+function renderPrestudyResults(result: library.PreStudyResult): string {
+  if (!result.needs_prestudy) {
+    return `
+      <div class="prestudy-success">
+        <div class="success-icon">✓</div>
+        <h3>No Pre-Study Needed!</h3>
+        <p>Your known character rate is already at <strong>${result.current_known_rate.toFixed(1)}%</strong>,
+           which meets or exceeds the 90% target.</p>
+        <p>You're ready to read this shelf!</p>
+      </div>
+    `;
+  }
+
+  // Count learning and non-learning characters
+  const learningCount = result.characters_to_study.filter(c => c.is_learning).length;
+  const unknownCount = result.characters_to_study.filter(c => !c.is_learning).length;
+
+  // Filter characters based on hideLearningCharacters setting
+  const filteredCharacters = hideLearningCharacters
+    ? result.characters_to_study.filter(c => !c.is_learning)
+    : result.characters_to_study;
+
+  // Track priority index separately for non-learning characters
+  let nonLearningIndex = 0;
+  const charactersToShow = filteredCharacters.slice(0, Math.max(result.characters_needed, 50));
+
+  return `
+    <div class="prestudy-content">
+      <div class="prestudy-summary">
+        <div class="stat-card">
+          <span class="stat-value">${result.current_known_rate.toFixed(1)}%</span>
+          <span class="stat-label">Current Rate</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-value">${result.target_rate}%</span>
+          <span class="stat-label">Target Rate</span>
+        </div>
+        <div class="stat-card highlight-important">
+          <span class="stat-value">${result.characters_needed}</span>
+          <span class="stat-label">Chars to Learn</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-value">${unknownCount}</span>
+          <span class="stat-label">Unknown</span>
+        </div>
+        ${learningCount > 0 ? `
+          <div class="stat-card">
+            <span class="stat-value">${learningCount}</span>
+            <span class="stat-label">Learning</span>
+          </div>
+        ` : ""}
+      </div>
+
+      <div class="prestudy-layout">
+        <div class="prestudy-list-section">
+          <div class="prestudy-list-header">
+            <h3>Characters to Study (by frequency)</h3>
+            ${learningCount > 0 ? `
+              <label class="prestudy-filter-toggle">
+                <input type="checkbox" id="hide-learning-toggle" ${hideLearningCharacters ? "checked" : ""}>
+                <span>Hide learning (${learningCount})</span>
+              </label>
+            ` : ""}
+          </div>
+          <p class="prestudy-hint">Click a character to see its definition and context from the texts.</p>
+          <div class="prestudy-char-list">
+            ${charactersToShow.map((char) => {
+              const isPriority = !char.is_learning && (nonLearningIndex < result.characters_needed);
+              if (!char.is_learning) nonLearningIndex++;
+              return `
+                <div class="prestudy-char-item ${isPriority ? "priority" : ""} ${char.is_learning ? "learning" : ""} ${char.character === selectedPrestudyCharacter ? "selected" : ""}"
+                     data-char="${escapeHtml(char.character)}">
+                  <span class="prestudy-char">${char.character}</span>
+                  <span class="prestudy-freq">${char.frequency}x</span>
+                  <span class="prestudy-coverage">${char.cumulative_coverage.toFixed(1)}%</span>
+                  ${isPriority ? '<span class="priority-marker">★</span>' : ""}
+                  ${char.is_learning ? '<span class="learning-marker">📖</span>' : ""}
+                </div>
+              `;
+            }).join("")}
+          </div>
+          ${filteredCharacters.length > charactersToShow.length ? `
+            <p class="prestudy-more">+ ${filteredCharacters.length - charactersToShow.length} more characters</p>
+          ` : ""}
+        </div>
+
+        <div class="prestudy-detail-section" id="prestudy-detail">
+          <div class="prestudy-detail-placeholder">
+            <p>Select a character to see its definition and context</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+async function loadCharacterDetail(character: string) {
+  const detailContainer = document.getElementById("prestudy-detail");
+  if (!detailContainer || !currentPrestudyShelfId) return;
+
+  detailContainer.innerHTML = '<p class="loading">Loading...</p>';
+
+  try {
+    const [lookupResult, contextResult] = await Promise.all([
+      dictionary.lookup(character, {
+        includeExamples: false,
+        includeCharacterInfo: true,
+        includeUserDictionaries: true,
+      }),
+      library.getCharacterContext(currentPrestudyShelfId, character, 3),
+    ]);
+
+    let html = `
+      <div class="prestudy-char-detail">
+        <div class="detail-header">
+          <span class="detail-char">${character}</span>
+          <div class="detail-actions">
+            <button class="btn-mark-learning-prestudy" data-word="${escapeHtml(character)}" data-type="character">
+              Mark as Learning
+            </button>
+            <button class="btn-mark-known-prestudy" data-word="${escapeHtml(character)}" data-type="character">
+              Mark as Known
+            </button>
+          </div>
+        </div>
+    `;
+
+    // Character info
+    if (lookupResult.character_info) {
+      const info = lookupResult.character_info;
+      html += `
+        <div class="detail-char-info">
+          ${info.radical ? `<span class="char-info-item">Radical: ${info.radical}</span>` : ""}
+          ${info.total_strokes ? `<span class="char-info-item">Strokes: ${info.total_strokes}</span>` : ""}
+        </div>
+      `;
+    }
+
+    // Context snippets (shown first, above definitions)
+    if (contextResult.snippets.length > 0) {
+      html += '<div class="detail-context"><h4>Context from Texts</h4>';
+      for (const snippet of contextResult.snippets) {
+        // Highlight the character in the snippet
+        const before = snippet.snippet.substring(0, snippet.character_position);
+        const char = snippet.snippet.substring(snippet.character_position, snippet.character_position + 1);
+        const after = snippet.snippet.substring(snippet.character_position + 1);
+
+        html += `
+          <div class="context-snippet">
+            <span class="context-text">${escapeHtml(before)}<mark>${escapeHtml(char)}</mark>${escapeHtml(after)}</span>
+            <span class="context-source">— ${escapeHtml(snippet.text_title)}</span>
+          </div>
+        `;
+      }
+      html += '</div>';
+    } else {
+      html += '<p class="empty-message">No context snippets found.</p>';
+    }
+
+    // Definitions
+    if (lookupResult.entries.length > 0) {
+      html += '<div class="detail-definitions"><h4>Definitions</h4>';
+      for (const entry of lookupResult.entries.slice(0, 3)) {
+        // Extract definition texts from Definition objects
+        const defTexts = entry.definitions.slice(0, 3).map(d => d.text).join("; ");
+        html += `
+          <div class="detail-entry">
+            ${entry.pinyin ? `<span class="detail-pinyin">${entry.pinyin}</span>` : ""}
+            <span class="detail-def">${escapeHtml(defTexts)}</span>
+          </div>
+        `;
+      }
+      html += '</div>';
+    }
+
+    html += '</div>';
+    detailContainer.innerHTML = html;
+
+    // Helper to handle marking a character and refreshing the list
+    async function markCharacterAndRefresh(btn: HTMLButtonElement, status: "known" | "learning") {
+      const word = btn.dataset.word!;
+      const type = btn.dataset.type!;
+
+      try {
+        // Find current character's index in the filtered list before marking
+        let nextCharacter: string | null = null;
+        if (currentPrestudyResult) {
+          const filteredList = hideLearningCharacters
+            ? currentPrestudyResult.characters_to_study.filter(c => !c.is_learning)
+            : currentPrestudyResult.characters_to_study;
+          const currentIndex = filteredList.findIndex(c => c.character === word);
+          if (currentIndex >= 0 && currentIndex < filteredList.length - 1) {
+            nextCharacter = filteredList[currentIndex + 1].character;
+          }
+        }
+
+        await library.addKnownWord(word, type, status);
+
+        // Disable both buttons and show feedback
+        const knownBtn = detailContainer?.querySelector(".btn-mark-known-prestudy") as HTMLButtonElement | null;
+        const learningBtn = detailContainer?.querySelector(".btn-mark-learning-prestudy") as HTMLButtonElement | null;
+
+        if (status === "known") {
+          btn.textContent = "Marked Known!";
+        } else {
+          btn.textContent = "Marked Learning!";
+        }
+
+        if (knownBtn) knownBtn.disabled = true;
+        if (learningBtn) learningBtn.disabled = true;
+
+        // Remove from list and recalculate
+        if (currentPrestudyShelfId) {
+          currentPrestudyResult = await library.getPrestudy(currentPrestudyShelfId, prestudyTargetRate);
+          const resultsContainer = document.getElementById("prestudy-results");
+          if (resultsContainer && currentPrestudyResult) {
+            resultsContainer.innerHTML = renderPrestudyResults(currentPrestudyResult);
+            setupPrestudyCharacterHandlers();
+
+            // Auto-advance to next character
+            if (nextCharacter) {
+              // Check if next character is still in the list
+              const newFilteredList = hideLearningCharacters
+                ? currentPrestudyResult.characters_to_study.filter(c => !c.is_learning)
+                : currentPrestudyResult.characters_to_study;
+              const stillExists = newFilteredList.some(c => c.character === nextCharacter);
+
+              if (stillExists) {
+                selectedPrestudyCharacter = nextCharacter;
+                // Update selection UI
+                document.querySelectorAll(".prestudy-char-item").forEach(el => {
+                  if ((el as HTMLElement).dataset.char === nextCharacter) {
+                    el.classList.add("selected");
+                  }
+                });
+                await loadCharacterDetail(nextCharacter);
+              } else if (newFilteredList.length > 0) {
+                // Next char was removed (e.g., it was learning and we're hiding learning), select first
+                const firstChar = newFilteredList[0].character;
+                selectedPrestudyCharacter = firstChar;
+                document.querySelector(".prestudy-char-item")?.classList.add("selected");
+                await loadCharacterDetail(firstChar);
+              } else {
+                selectedPrestudyCharacter = null;
+              }
+            } else {
+              // Was at end of list, clear selection
+              selectedPrestudyCharacter = null;
+            }
+          }
+        }
+      } catch (error) {
+        console.error(`Failed to mark as ${status}:`, error);
+      }
+    }
+
+    // Add mark known handler
+    detailContainer.querySelector(".btn-mark-known-prestudy")?.addEventListener("click", async (e) => {
+      await markCharacterAndRefresh(e.target as HTMLButtonElement, "known");
+    });
+
+    // Add mark learning handler
+    detailContainer.querySelector(".btn-mark-learning-prestudy")?.addEventListener("click", async (e) => {
+      await markCharacterAndRefresh(e.target as HTMLButtonElement, "learning");
+    });
+
+  } catch (error) {
+    detailContainer.innerHTML = `<p class="error">Failed to load character detail: ${error}</p>`;
+  }
+}
+
+function setupPrestudyViewHandlers() {
+  // Shelf selector
+  document.getElementById("prestudy-shelf")?.addEventListener("change", (e) => {
+    const value = (e.target as HTMLSelectElement).value;
+    currentPrestudyShelfId = value ? parseInt(value) : null;
+    currentPrestudyResult = null;
+    selectedPrestudyCharacter = null;
+
+    const btn = document.getElementById("prestudy-calculate-btn") as HTMLButtonElement;
+    if (btn) {
+      btn.disabled = !currentPrestudyShelfId;
+    }
+
+    const resultsContainer = document.getElementById("prestudy-results");
+    if (resultsContainer) {
+      resultsContainer.innerHTML = '<p class="empty-message">Select a shelf and click Calculate to see pre-study characters.</p>';
+    }
+  });
+
+  // Calculate button
+  document.getElementById("prestudy-calculate-btn")?.addEventListener("click", async () => {
+    if (!currentPrestudyShelfId) return;
+
+    const btn = document.getElementById("prestudy-calculate-btn") as HTMLButtonElement;
+    const resultsContainer = document.getElementById("prestudy-results");
+    const targetInput = document.getElementById("prestudy-target") as HTMLInputElement;
+
+    // Update target rate from input
+    if (targetInput) {
+      prestudyTargetRate = Math.min(100, Math.max(50, parseInt(targetInput.value) || 90));
+    }
+
+    if (btn) btn.disabled = true;
+    if (resultsContainer) resultsContainer.innerHTML = '<p class="loading">Calculating pre-study characters...</p>';
+
+    try {
+      currentPrestudyResult = await library.getPrestudy(currentPrestudyShelfId, prestudyTargetRate);
+      selectedPrestudyCharacter = null;
+
+      if (resultsContainer) {
+        resultsContainer.innerHTML = renderPrestudyResults(currentPrestudyResult);
+        setupPrestudyCharacterHandlers();
+      }
+
+      // Enable export button if we have characters
+      const exportBtn = document.getElementById("prestudy-export-btn") as HTMLButtonElement;
+      if (exportBtn) {
+        exportBtn.disabled = !currentPrestudyResult || currentPrestudyResult.characters_to_study.length === 0;
+      }
+    } catch (error) {
+      if (resultsContainer) {
+        resultsContainer.innerHTML = `<p class="error">Failed to calculate: ${error}</p>`;
+      }
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  });
+
+  // Export to Anki button
+  document.getElementById("prestudy-export-btn")?.addEventListener("click", async () => {
+    if (!currentPrestudyResult || !currentPrestudyShelfId) return;
+
+    const btn = document.getElementById("prestudy-export-btn") as HTMLButtonElement;
+    const originalText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "Exporting...";
+
+    try {
+      // Get only the characters needed to reach the target rate
+      const neededCount = currentPrestudyResult.characters_needed;
+      const neededCharacters = currentPrestudyResult.characters_to_study.slice(0, neededCount);
+
+      // Apply learning filter if enabled
+      const charactersToExport = hideLearningCharacters
+        ? neededCharacters.filter(c => !c.is_learning)
+        : neededCharacters;
+
+      if (charactersToExport.length === 0) {
+        alert("No characters to export.");
+        return;
+      }
+
+      // Fetch definitions and context for each character
+      const rows: string[] = [];
+
+      for (let i = 0; i < charactersToExport.length; i++) {
+        const char = charactersToExport[i].character;
+        btn.textContent = `Exporting ${i + 1}/${charactersToExport.length}...`;
+
+        try {
+          const [lookupResult, contextResult] = await Promise.all([
+            dictionary.lookup(char, {
+              includeExamples: false,
+              includeCharacterInfo: true,
+              includeUserDictionaries: true,
+            }),
+            library.getCharacterContext(currentPrestudyShelfId, char, 3),
+          ]);
+
+          // Build the back of the card
+          let back = "";
+
+          // Add pinyin and definitions
+          if (lookupResult.entries.length > 0) {
+            for (const entry of lookupResult.entries.slice(0, 3)) {
+              const pinyin = entry.pinyin || "";
+              const defTexts = entry.definitions.slice(0, 5).map(d => d.text).join("; ");
+              if (pinyin) {
+                back += `[${pinyin}] ${defTexts}<br>`;
+              } else {
+                back += `${defTexts}<br>`;
+              }
+            }
+          }
+
+          // Add context snippets
+          if (contextResult.snippets.length > 0) {
+            back += "<br><b>Context:</b><br>";
+            for (const snippet of contextResult.snippets) {
+              // Highlight the character in the snippet
+              const before = snippet.snippet.substring(0, snippet.character_position);
+              const charInContext = snippet.snippet.substring(snippet.character_position, snippet.character_position + 1);
+              const after = snippet.snippet.substring(snippet.character_position + 1);
+              back += `${before}<b>${charInContext}</b>${after} <i>(${snippet.text_title})</i><br>`;
+            }
+          }
+
+          // Escape tabs and newlines for TSV format
+          const escapedBack = back.replace(/\t/g, " ").replace(/\n/g, " ");
+          rows.push(`${char}\t${escapedBack}`);
+        } catch (error) {
+          console.error(`Failed to fetch data for ${char}:`, error);
+          rows.push(`${char}\t(Failed to load definitions)`);
+        }
+      }
+
+      // Create and download the TSV file
+      const tsvContent = rows.join("\n");
+      const blob = new Blob([tsvContent], { type: "text/tab-separated-values;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `prestudy-characters-${new Date().toISOString().split("T")[0]}.txt`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+
+    } catch (error) {
+      console.error("Export failed:", error);
+      alert(`Export failed: ${error}`);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = originalText;
+    }
+  });
+
+  // Character click handlers
+  setupPrestudyCharacterHandlers();
+}
+
+function setupPrestudyCharacterHandlers() {
+  document.querySelectorAll(".prestudy-char-item").forEach((item) => {
+    item.addEventListener("click", async () => {
+      const char = (item as HTMLElement).dataset.char!;
+      selectedPrestudyCharacter = char;
+
+      // Update selection UI
+      document.querySelectorAll(".prestudy-char-item").forEach(el => el.classList.remove("selected"));
+      item.classList.add("selected");
+
+      await loadCharacterDetail(char);
+    });
+  });
+
+  // Hide/show learning characters toggle
+  document.getElementById("hide-learning-toggle")?.addEventListener("change", (e) => {
+    hideLearningCharacters = (e.target as HTMLInputElement).checked;
+    const resultsContainer = document.getElementById("prestudy-results");
+    if (resultsContainer && currentPrestudyResult) {
+      resultsContainer.innerHTML = renderPrestudyResults(currentPrestudyResult);
+      setupPrestudyCharacterHandlers();
     }
   });
 }
