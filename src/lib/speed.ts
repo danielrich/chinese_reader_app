@@ -41,6 +41,8 @@ export interface ReadingSession {
   auto_marked_characters: number;
   /** Auto-marked words when session completed */
   auto_marked_words: number;
+  /** Percentage of known characters in this specific text at session start (0-100) */
+  text_known_char_percentage: number | null;
   /** Session creation timestamp */
   created_at: string;
 }
@@ -71,6 +73,8 @@ export interface SpeedDataPoint {
   auto_marked_characters: number;
   /** Auto-marked words when session completed */
   auto_marked_words: number;
+  /** Percentage of known characters in this specific text at session start (0-100) */
+  text_known_char_percentage: number | null;
 }
 
 /** Aggregated speed statistics */

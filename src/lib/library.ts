@@ -494,6 +494,16 @@ export async function getCharacterContext(
   return invoke<CharacterContext>("get_character_context", { shelfId, character, maxSnippets });
 }
 
+/**
+ * Get context snippets for a word/character from all texts in the library
+ */
+export async function getWordContextAll(
+  word: string,
+  maxSnippets: number = 5
+): Promise<CharacterContext> {
+  return invoke<CharacterContext>("get_word_context_all", { word, maxSnippets });
+}
+
 // =============================================================================
 // Known Words API
 // =============================================================================
@@ -540,11 +550,13 @@ export async function removeKnownWord(word: string): Promise<void> {
  */
 export async function listKnownWords(
   wordType?: string,
+  status?: string,
   limit?: number,
   offset?: number
 ): Promise<KnownWord[]> {
   return invoke<KnownWord[]>("list_known_words", {
     wordType,
+    status,
     limit,
     offset,
   });

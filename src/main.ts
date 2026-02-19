@@ -12,6 +12,7 @@ let activeSession: speed.ReadingSession | null = null;
 let sessionTimerInterval: number | null = null;
 let currentTextId: number | null = null;
 let currentShelfTexts: library.TextSummary[] = [];
+let currentTextSegments: library.TextSegment[] = [];
 
 // Initialize the app
 async function initApp() {
@@ -270,6 +271,7 @@ function displayDictionaryResults(result: dictionary.LookupResult) {
           <div class="entry-header">
             <span class="traditional">${entry.term}</span>
             ${entry.pinyin ? `<span class="pinyin">${entry.pinyin}</span>` : ""}
+            <button class="btn-edit-user-entry" data-entry-id="${entry.id}" data-term="${escapeHtml(entry.term)}" data-pinyin="${escapeHtml(entry.pinyin || "")}" data-definition="${escapeHtml(entry.definition)}">Edit</button>
           </div>
           <div class="definitions">
             <div class="definition">
@@ -286,6 +288,18 @@ function displayDictionaryResults(result: dictionary.LookupResult) {
   }
 
   resultsDiv.innerHTML = html;
+
+  // Attach edit button handlers for user entries
+  resultsDiv.querySelectorAll(".btn-edit-user-entry").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      const button = e.currentTarget as HTMLButtonElement;
+      const entryId = parseInt(button.dataset.entryId || "0", 10);
+      const term = button.dataset.term || "";
+      const pinyin = button.dataset.pinyin || "";
+      const definition = button.dataset.definition || "";
+      showEditUserEntryModal(entryId, term, pinyin, definition);
+    });
+  });
 }
 
 async function loadStats() {
@@ -713,6 +727,7 @@ async function loadTextView(textId: number) {
         <div class="text-tabs">
           <button class="text-tab active" data-tab="content">Content</button>
           <button class="text-tab" data-tab="analysis">Analysis</button>
+          <button class="text-tab" data-tab="learning">Learning</button>
           <button class="text-tab" data-tab="history">History</button>
         </div>
 
@@ -727,6 +742,12 @@ async function loadTextView(textId: number) {
             <div id="text-analysis-tab" class="text-tab-content">
               <div id="analysis-container">
                 <p class="loading">Loading analysis...</p>
+              </div>
+            </div>
+
+            <div id="text-learning-tab" class="text-tab-content">
+              <div id="learning-container">
+                <p class="loading">Loading learning items...</p>
               </div>
             </div>
 
@@ -773,6 +794,8 @@ async function loadTextView(textId: number) {
 
         if (tabName === "analysis") {
           loadAnalysis(textId);
+        } else if (tabName === "learning") {
+          loadLearningItems();
         } else if (tabName === "history") {
           loadReadingHistory(textId);
         }
@@ -1110,6 +1133,9 @@ async function loadInteractiveText(content: string, textId: number) {
   try {
     const segments = await library.segmentText(content);
 
+    // Store segments for use by Learning tab
+    currentTextSegments = segments;
+
     let html = "";
     for (const segment of segments) {
       if (segment.is_cjk) {
@@ -1198,14 +1224,14 @@ async function lookupSelectedText(selectedText: string) {
       includeUserDictionaries: true,
     });
 
-    renderSidebarResultsForSelection(result, selectedText, termType);
+    await renderSidebarResultsForSelection(result, selectedText, termType);
   } catch (error) {
     sidebarContent.innerHTML = `<p class="error">Lookup failed: ${error}</p>`;
   }
 }
 
 // Render sidebar results for a text selection with "Add as Word" button
-function renderSidebarResultsForSelection(
+async function renderSidebarResultsForSelection(
   result: dictionary.LookupResult,
   selectedText: string,
   termType: "character" | "word"
@@ -1245,9 +1271,28 @@ function renderSidebarResultsForSelection(
   `;
 
   if (!hasEntries) {
+    html += `<p class="dict-sidebar-empty">No dictionary entries found for "${escapeHtml(selectedText)}"</p>`;
+
+    // If multiple characters, show character breakdown
+    const characters = [...selectedText];
+    if (characters.length > 1) {
+      html += `<p class="dict-sidebar-char-breakdown-label">Character breakdown:</p>`;
+      for (const char of characters) {
+        try {
+          const charResult = await dictionary.lookup(char, {
+            includeExamples: false,
+            includeCharacterInfo: true,
+            includeUserDictionaries: true,
+          });
+          html += renderCharacterBreakdownEntry(char, charResult);
+        } catch {
+          html += `<div class="entry char-breakdown-entry"><span class="traditional" style="font-size: 1.5rem;">${escapeHtml(char)}</span> <span class="no-entry">(lookup failed)</span></div>`;
+        }
+      }
+    }
+
     // Show a form to define the word
     html += `
-      <p class="dict-sidebar-empty">No dictionary entries found for "${escapeHtml(selectedText)}"</p>
       <div class="define-word-form">
         <h4>Define this word</h4>
         <form id="define-word-form">
@@ -1500,7 +1545,7 @@ async function lookupInSidebar(term: string, termType: "character" | "word") {
       includeUserDictionaries: true,
     });
 
-    renderSidebarResults(result, termType, "dict-sidebar-content");
+    await renderSidebarResults(result, termType, "dict-sidebar-content");
   } catch (error) {
     sidebarContent.innerHTML = `<p class="error">Lookup failed: ${error}</p>`;
   }
@@ -1520,14 +1565,53 @@ async function lookupInShelfSidebar(term: string, termType: "character" | "word"
       includeUserDictionaries: true,
     });
 
-    renderSidebarResults(result, termType, "shelf-dict-sidebar-content");
+    await renderSidebarResults(result, termType, "shelf-dict-sidebar-content");
   } catch (error) {
     sidebarContent.innerHTML = `<p class="error">Lookup failed: ${error}</p>`;
   }
 }
 
+// Render a single character's lookup result for the character breakdown view
+function renderCharacterBreakdownEntry(char: string, charResult: dictionary.LookupResult): string {
+  let html = `<div class="entry char-breakdown-entry">`;
+  html += `<div class="entry-header">`;
+  html += `<span class="traditional" style="font-size: 1.5rem;">${escapeHtml(char)}</span>`;
+
+  // Show pinyin from first dictionary entry if available
+  if (charResult.entries.length > 0) {
+    const entry = charResult.entries[0];
+    html += ` <span class="pinyin">${dictionary.formatPinyin(entry)}</span>`;
+  }
+  html += `</div>`;
+
+  // Show character info (radical, strokes)
+  if (charResult.character_info) {
+    const info = charResult.character_info;
+    const parts = [];
+    if (info.radical) parts.push(`${info.radical} (#${info.radical_number})`);
+    if (info.total_strokes) parts.push(`${info.total_strokes} strokes`);
+    if (parts.length > 0) {
+      html += `<div style="font-size: 0.8rem; color: #888;">${parts.join(" · ")}</div>`;
+    }
+  }
+
+  // Show first definition if available
+  if (charResult.entries.length > 0 && charResult.entries[0].definitions.length > 0) {
+    const def = charResult.entries[0].definitions[0];
+    html += `<div class="definitions"><div class="definition">`;
+    if (def.part_of_speech) html += `<span class="pos">${def.part_of_speech}</span> `;
+    html += `<span class="def-text">${def.text}</span>`;
+    html += `</div></div>`;
+  } else if (charResult.entries.length === 0) {
+    html += `<div class="no-entry" style="font-size: 0.85rem; color: #888; font-style: italic;">No entry found</div>`;
+  }
+
+  html += `</div>`;
+  return html;
+}
+
 // Render dictionary results in the sidebar
-function renderSidebarResults(result: dictionary.LookupResult, termType: "character" | "word", containerId: string = "dict-sidebar-content") {
+async function renderSidebarResults(result: dictionary.LookupResult, termType: "character" | "word", containerId: string = "dict-sidebar-content") {
   const sidebarContent = document.getElementById(containerId);
   if (!sidebarContent) return;
 
@@ -1544,6 +1628,32 @@ function renderSidebarResults(result: dictionary.LookupResult, termType: "charac
   `;
 
   if (result.entries.length === 0 && result.user_entries.length === 0) {
+    // If no entries found and query is multiple characters, split and look up each character
+    const characters = [...result.query];
+    if (characters.length > 1) {
+      html += `<p class="dict-sidebar-empty">No dictionary entries found for "${result.query}"</p>`;
+      html += `<p class="dict-sidebar-char-breakdown-label">Character breakdown:</p>`;
+
+      // Look up each character
+      for (const char of characters) {
+        try {
+          const charResult = await dictionary.lookup(char, {
+            includeExamples: false,
+            includeCharacterInfo: true,
+            includeUserDictionaries: true,
+          });
+
+          html += renderCharacterBreakdownEntry(char, charResult);
+        } catch {
+          html += `<div class="entry char-breakdown-entry"><span class="traditional" style="font-size: 1.5rem;">${escapeHtml(char)}</span> <span class="no-entry">(lookup failed)</span></div>`;
+        }
+      }
+
+      sidebarContent.innerHTML = html;
+      setupSidebarMarkKnown();
+      return;
+    }
+
     html += `<p class="dict-sidebar-empty">No dictionary entries found for "${result.query}"</p>`;
     sidebarContent.innerHTML = html;
     setupSidebarMarkKnown();
@@ -1881,6 +1991,102 @@ async function loadAnalysis(textId: number, sort: library.FrequencySort = curren
   }
 }
 
+// Load learning items from current text segments
+function loadLearningItems() {
+  const container = document.getElementById("learning-container");
+  if (!container) return;
+
+  // Aggregate learning items from segments
+  const learningMap = new Map<string, { word: string; type: string; count: number }>();
+
+  for (const segment of currentTextSegments) {
+    if (segment.is_cjk && segment.is_learning) {
+      const key = `${segment.text}:${segment.segment_type}`;
+      const existing = learningMap.get(key);
+      if (existing) {
+        existing.count++;
+      } else {
+        learningMap.set(key, {
+          word: segment.text,
+          type: segment.segment_type,
+          count: 1,
+        });
+      }
+    }
+  }
+
+  // Convert to array and sort by frequency
+  const learningItems = Array.from(learningMap.values()).sort((a, b) => b.count - a.count);
+
+  if (learningItems.length === 0) {
+    container.innerHTML = '<p class="empty-message">No learning items in this text.</p>';
+    return;
+  }
+
+  const formatLearningItem = (item: { word: string; type: string; count: number }) => {
+    const typeLabel = item.type === "character" ? "char" : "word";
+    return `
+      <div class="freq-item learning" data-lookup="${escapeHtml(item.word)}" data-lookup-type="${item.type}">
+        <span class="freq-${typeLabel} freq-clickable">${item.word}</span>
+        <span class="freq-count">${item.count}x</span>
+        <span class="learning-badge">Learning</span>
+      </div>
+    `;
+  };
+
+  // Separate characters and words
+  const learningChars = learningItems.filter(i => i.type === "character");
+  const learningWords = learningItems.filter(i => i.type === "word");
+
+  let html = `
+    <div class="learning-summary">
+      <p>Words and characters you're currently learning that appear in this text.</p>
+    </div>
+
+    <div class="analysis-sections">
+  `;
+
+  if (learningChars.length > 0) {
+    html += `
+      <div class="analysis-section">
+        <h3>Learning Characters (${learningChars.length})</h3>
+        <div class="freq-list">
+          ${learningChars.map(formatLearningItem).join("")}
+        </div>
+      </div>
+    `;
+  }
+
+  if (learningWords.length > 0) {
+    html += `
+      <div class="analysis-section">
+        <h3>Learning Words (${learningWords.length})</h3>
+        <div class="freq-list">
+          ${learningWords.map(formatLearningItem).join("")}
+        </div>
+      </div>
+    `;
+  }
+
+  html += `</div>`;
+
+  container.innerHTML = html;
+
+  // Add click handlers for dictionary lookup
+  container.querySelectorAll(".freq-item[data-lookup]").forEach((item) => {
+    item.addEventListener("click", () => {
+      const term = (item as HTMLElement).dataset.lookup!;
+      const termType = (item as HTMLElement).dataset.lookupType as "character" | "word";
+
+      // Highlight selected item
+      container.querySelectorAll(".freq-item").forEach(el => el.classList.remove("selected"));
+      item.classList.add("selected");
+
+      lookupInSidebar(term, termType);
+    });
+  });
+}
+
 function renderLibraryWelcome() {
   const mainContainer = document.getElementById("library-main");
   if (!mainContainer) return;
@@ -1908,11 +2114,100 @@ function renderLibraryWelcome() {
 }
 
 // =============================================================================
+// Two-Level Shelf Selector Helpers
+// =============================================================================
+
+/** Flatten first two levels of shelf tree for the primary dropdown */
+function getTopTwoLevels(shelves: library.ShelfTree[]): { shelf: library.Shelf; depth: number }[] {
+  const result: { shelf: library.Shelf; depth: number }[] = [];
+  for (const node of shelves) {
+    result.push({ shelf: node.shelf, depth: 0 });
+    for (const child of node.children) {
+      result.push({ shelf: child.shelf, depth: 1 });
+    }
+  }
+  return result;
+}
+
+/** Find a shelf node in the tree by ID */
+function findShelfInTree(shelves: library.ShelfTree[], id: number): library.ShelfTree | null {
+  for (const node of shelves) {
+    if (node.shelf.id === id) return node;
+    const found = findShelfInTree(node.children, id);
+    if (found) return found;
+  }
+  return null;
+}
+
+/** Get all descendants of a shelf (for the secondary dropdown) */
+function getShelfDescendants(node: library.ShelfTree, depth: number = 0): { shelf: library.Shelf; depth: number }[] {
+  const result: { shelf: library.Shelf; depth: number }[] = [];
+  for (const child of node.children) {
+    result.push({ shelf: child.shelf, depth });
+    result.push(...getShelfDescendants(child, depth + 1));
+  }
+  return result;
+}
+
+/** Render a two-level shelf selector with primary and secondary dropdowns */
+function renderTwoLevelShelfSelector(
+  shelves: library.ShelfTree[],
+  prefix: string,
+  primaryShelfId: number | null,
+  finalShelfId: number | null
+): string {
+  const topLevels = getTopTwoLevels(shelves);
+
+  // Build primary dropdown options
+  const primaryOptions = topLevels.map(({ shelf, depth }) => {
+    const indent = depth > 0 ? "— " : "";
+    const selected = shelf.id === primaryShelfId ? "selected" : "";
+    return `<option value="${shelf.id}" ${selected}>${indent}${escapeHtml(shelf.name)}</option>`;
+  }).join("");
+
+  // Build secondary dropdown options if a primary shelf is selected
+  let secondaryOptions = "";
+  let hasSecondaryOptions = false;
+
+  if (primaryShelfId !== null) {
+    const primaryNode = findShelfInTree(shelves, primaryShelfId);
+    if (primaryNode && primaryNode.children.length > 0) {
+      hasSecondaryOptions = true;
+      const descendants = getShelfDescendants(primaryNode);
+      secondaryOptions = descendants.map(({ shelf, depth }) => {
+        const indent = "— ".repeat(depth);
+        const selected = shelf.id === finalShelfId ? "selected" : "";
+        return `<option value="${shelf.id}" ${selected}>${indent}${escapeHtml(shelf.name)}</option>`;
+      }).join("");
+    }
+  }
+
+  // Determine if the current final selection is "All" (same as primary) or a specific child
+  const isAllSelected = finalShelfId === null || finalShelfId === primaryShelfId;
+
+  return `
+    <select id="${prefix}-shelf-primary" class="shelf-select-primary">
+      <option value="">All Shelves</option>
+      ${primaryOptions}
+    </select>
+    ${hasSecondaryOptions ? `
+      <select id="${prefix}-shelf-secondary" class="shelf-select-secondary">
+        <option value="" ${isAllSelected ? "selected" : ""}>All in shelf</option>
+        ${secondaryOptions}
+      </select>
+    ` : primaryShelfId !== null ? `
+      <span class="shelf-no-children">(no sub-shelves)</span>
+    ` : ""}
+  `;
+}
+
+// =============================================================================
 // Speed View
 // =============================================================================
 
 let currentSpeedShelfId: number | null = null;
-let currentGraphType: "cumulative" | "known_chars" | "known_words" = "cumulative";
+let currentSpeedPrimaryShelfId: number | null = null; // For the first dropdown (top 2 levels)
+let currentGraphType: "cumulative" | "known_chars" | "known_words" | "known_char_pct" = "cumulative";
 let excludeHighAutoMarked: boolean = false;
 
 async function loadSpeedView() {
@@ -1929,18 +2224,13 @@ async function loadSpeedView() {
       library.isAutoMarkEnabled(),
     ]);
 
-    const shelfOptions = renderSpeedShelfOptions(shelves);
-
     let html = `
       <div class="speed-view">
         <div class="speed-header">
           <h2>Reading Speed</h2>
           <div class="speed-filter">
-            <label for="speed-shelf-filter">Scope:</label>
-            <select id="speed-shelf-filter">
-              <option value="">Global (All Shelves)</option>
-              ${shelfOptions}
-            </select>
+            <label>Scope:</label>
+            ${renderTwoLevelShelfSelector(shelves, "speed", currentSpeedPrimaryShelfId, currentSpeedShelfId)}
           </div>
         </div>
 
@@ -1987,6 +2277,9 @@ async function loadSpeedView() {
             <button class="graph-tab ${currentGraphType === "cumulative" ? "active" : ""}" data-graph="cumulative">
               Speed vs Experience
             </button>
+            <button class="graph-tab ${currentGraphType === "known_char_pct" ? "active" : ""}" data-graph="known_char_pct">
+              Speed vs Known %
+            </button>
             <button class="graph-tab ${currentGraphType === "known_chars" ? "active" : ""}" data-graph="known_chars">
               Speed vs Known Chars
             </button>
@@ -2017,30 +2310,74 @@ async function loadSpeedView() {
   }
 }
 
-function renderSpeedShelfOptions(shelves: library.ShelfTree[], depth: number = 0): string {
-  return shelves
-    .map((node) => {
-      const indent = "—".repeat(depth);
-      const selected = node.shelf.id === currentSpeedShelfId ? "selected" : "";
-      return `
-        <option value="${node.shelf.id}" ${selected}>${indent}${escapeHtml(node.shelf.name)}</option>
-        ${renderSpeedShelfOptions(node.children, depth + 1)}
-      `;
-    })
-    .join("");
+/** Calculate LOWESS (Locally Weighted Scatterplot Smoothing) for trend line */
+function calculateLowessSmoothing(
+  points: { x: number; y: number }[],
+  bandwidth: number = 0.3
+): { x: number; y: number }[] {
+  if (points.length < 3) return points;
+
+  // Sort by x for proper smoothing
+  const sorted = [...points].sort((a, b) => a.x - b.x);
+  const n = sorted.length;
+
+  // Determine number of neighbors based on bandwidth
+  const k = Math.max(3, Math.floor(n * bandwidth));
+
+  const smoothed: { x: number; y: number }[] = [];
+
+  for (const point of sorted) {
+    // Find k nearest neighbors by x distance
+    const distances = sorted.map((p, i) => ({
+      index: i,
+      dist: Math.abs(p.x - point.x),
+      p,
+    }));
+    distances.sort((a, b) => a.dist - b.dist);
+    const neighbors = distances.slice(0, k);
+
+    // Maximum distance in neighborhood
+    const maxDist = neighbors[neighbors.length - 1].dist || 1;
+
+    // Calculate tricube weights
+    let sumWeight = 0;
+    let sumWeightedY = 0;
+
+    for (const neighbor of neighbors) {
+      const u = neighbor.dist / (maxDist * 1.001); // Avoid division by zero
+      const weight = Math.pow(1 - Math.pow(u, 3), 3); // Tricube kernel
+      sumWeight += weight;
+      sumWeightedY += weight * neighbor.p.y;
+    }
+
+    smoothed.push({
+      x: point.x,
+      y: sumWeight > 0 ? sumWeightedY / sumWeight : point.y,
+    });
+  }
+
+  return smoothed;
 }
 
-function renderSpeedGraph(data: speed.SpeedDataPoint[], graphType: "cumulative" | "known_chars" | "known_words"): string {
+function renderSpeedGraph(data: speed.SpeedDataPoint[], graphType: "cumulative" | "known_chars" | "known_words" | "known_char_pct"): string {
   // For knowledge correlation graphs, optionally filter out high auto-marked sessions
   let filteredData = data;
-  if (excludeHighAutoMarked && (graphType === "known_chars" || graphType === "known_words")) {
+  if (excludeHighAutoMarked && (graphType === "known_chars" || graphType === "known_words" || graphType === "known_char_pct")) {
     filteredData = speed.filterHighAutoMarked(data);
   }
 
+  // For known_char_pct graph, filter out sessions without percentage data
+  if (graphType === "known_char_pct") {
+    filteredData = filteredData.filter(d => d.text_known_char_percentage !== null);
+  }
+
   if (filteredData.length === 0) {
-    const filterNote = excludeHighAutoMarked && data.length > 0
-      ? " (all sessions excluded due to high auto-mark filter)"
-      : "";
+    let filterNote = "";
+    if (excludeHighAutoMarked && data.length > 0) {
+      filterNote = " (all sessions excluded due to high auto-mark filter)";
+    } else if (graphType === "known_char_pct" && data.length > 0) {
+      filterNote = " (older sessions don't have this data - it will appear for future reading sessions)";
+    }
     return `<p class="empty-message graph-empty">No reading sessions yet${filterNote}. Start reading to see your progress!</p>`;
   }
 
@@ -2056,6 +2393,10 @@ function renderSpeedGraph(data: speed.SpeedDataPoint[], graphType: "cumulative" 
       case "cumulative":
         x = d.cumulative_characters_read;
         xLabel = `${library.formatCharacterCount(d.cumulative_characters_read)} chars read`;
+        break;
+      case "known_char_pct":
+        x = d.text_known_char_percentage!;
+        xLabel = `${d.text_known_char_percentage!.toFixed(1)}% known`;
         break;
       case "known_chars":
         x = d.known_characters_count;
@@ -2088,6 +2429,34 @@ function renderSpeedGraph(data: speed.SpeedDataPoint[], graphType: "cumulative" 
   const xRange = maxX - minX || 1;
   const yRange = maxY - minY || 1;
 
+  // Calculate smoothed trend line
+  const smoothedPoints = calculateLowessSmoothing(
+    points.map(p => ({ x: p.x, y: p.y })),
+    0.4 // Bandwidth - higher = smoother
+  );
+
+  // Generate SVG path for smoothed line
+  let trendLineHtml = "";
+  if (smoothedPoints.length >= 2) {
+    const pathPoints = smoothedPoints.map(p => {
+      const xPercent = ((p.x - minX) / xRange) * 90 + 5;
+      const yPercent = 100 - ((p.y - minY) / yRange) * 90 - 5;
+      return `${xPercent},${yPercent}`;
+    });
+
+    trendLineHtml = `
+      <svg class="graph-trend-line" viewBox="0 0 100 100" preserveAspectRatio="none">
+        <polyline
+          points="${pathPoints.join(" ")}"
+          fill="none"
+          stroke="rgba(100, 108, 255, 0.6)"
+          stroke-width="0.5"
+          vector-effect="non-scaling-stroke"
+        />
+      </svg>
+    `;
+  }
+
   // Generate scatter plot points
   const pointsHtml = points
     .map((p, i) => {
@@ -2111,11 +2480,32 @@ function renderSpeedGraph(data: speed.SpeedDataPoint[], graphType: "cumulative" 
     .join("");
 
   // X-axis labels
-  const xAxisLabel = graphType === "cumulative"
-    ? "Characters Read"
-    : graphType === "known_chars"
-      ? "Known Characters"
-      : "Known Words";
+  let xAxisLabel: string;
+  let xMinLabel: string;
+  let xMaxLabel: string;
+
+  switch (graphType) {
+    case "cumulative":
+      xAxisLabel = "Characters Read";
+      xMinLabel = library.formatCharacterCount(Math.round(minX));
+      xMaxLabel = library.formatCharacterCount(Math.round(maxX));
+      break;
+    case "known_char_pct":
+      xAxisLabel = "Known Character %";
+      xMinLabel = `${Math.round(minX)}%`;
+      xMaxLabel = `${Math.round(maxX)}%`;
+      break;
+    case "known_chars":
+      xAxisLabel = "Known Characters";
+      xMinLabel = library.formatCharacterCount(Math.round(minX));
+      xMaxLabel = library.formatCharacterCount(Math.round(maxX));
+      break;
+    case "known_words":
+      xAxisLabel = "Known Words";
+      xMinLabel = library.formatCharacterCount(Math.round(minX));
+      xMaxLabel = library.formatCharacterCount(Math.round(maxX));
+      break;
+  }
 
   return `
     <div class="graph-container" style="height: ${graphHeight}px;">
@@ -2125,14 +2515,15 @@ function renderSpeedGraph(data: speed.SpeedDataPoint[], graphType: "cumulative" 
         <span class="axis-label">${Math.round(minY)}</span>
       </div>
       <div class="graph-plot-area">
+        ${trendLineHtml}
         ${pointsHtml}
       </div>
       <div class="graph-y-label">chars/min</div>
     </div>
     <div class="graph-x-axis">
-      <span class="axis-label">${library.formatCharacterCount(Math.round(minX))}</span>
+      <span class="axis-label">${xMinLabel}</span>
       <span class="axis-label graph-x-label">${xAxisLabel}</span>
-      <span class="axis-label">${library.formatCharacterCount(Math.round(maxX))}</span>
+      <span class="axis-label">${xMaxLabel}</span>
     </div>
   `;
 }
@@ -2167,17 +2558,27 @@ function renderRecentSessions(data: speed.SpeedDataPoint[]): string {
 }
 
 function setupSpeedViewHandlers(data: speed.SpeedDataPoint[]) {
-  // Shelf filter
-  document.getElementById("speed-shelf-filter")?.addEventListener("change", async (e) => {
+  // Primary shelf filter
+  document.getElementById("speed-shelf-primary")?.addEventListener("change", async (e) => {
     const value = (e.target as HTMLSelectElement).value;
-    currentSpeedShelfId = value ? parseInt(value) : null;
+    currentSpeedPrimaryShelfId = value ? parseInt(value) : null;
+    // When primary changes, final selection becomes the primary (or null if "All Shelves")
+    currentSpeedShelfId = currentSpeedPrimaryShelfId;
+    await loadSpeedView();
+  });
+
+  // Secondary shelf filter
+  document.getElementById("speed-shelf-secondary")?.addEventListener("change", async (e) => {
+    const value = (e.target as HTMLSelectElement).value;
+    // If secondary is empty ("All in shelf"), use primary; otherwise use secondary
+    currentSpeedShelfId = value ? parseInt(value) : currentSpeedPrimaryShelfId;
     await loadSpeedView();
   });
 
   // Graph tabs
   document.querySelectorAll(".graph-tab").forEach((tab) => {
     tab.addEventListener("click", () => {
-      const graphType = (tab as HTMLElement).dataset.graph as "cumulative" | "known_chars" | "known_words";
+      const graphType = (tab as HTMLElement).dataset.graph as "cumulative" | "known_chars" | "known_words" | "known_char_pct";
       currentGraphType = graphType;
 
       // Update active tab
@@ -2428,6 +2829,7 @@ function setupStatsViewHandlers() {
 // =============================================================================
 
 let currentPrestudyShelfId: number | null = null;
+let currentPrestudyPrimaryShelfId: number | null = null; // For the first dropdown (top 2 levels)
 let currentPrestudyResult: library.PreStudyResult | null = null;
 let selectedPrestudyCharacter: string | null = null;
 let hideLearningCharacters: boolean = true;
@@ -2439,8 +2841,6 @@ async function loadPrestudyView() {
 
   try {
     const shelves = await library.getShelfTree();
-
-    const shelfOptions = renderPrestudyShelfOptions(shelves);
 
     let html = `
       <div class="prestudy-view">
@@ -2454,11 +2854,8 @@ async function loadPrestudyView() {
 
         <div class="prestudy-controls">
           <div class="prestudy-shelf-select">
-            <label for="prestudy-shelf">Select Shelf:</label>
-            <select id="prestudy-shelf">
-              <option value="">-- Choose a shelf --</option>
-              ${shelfOptions}
-            </select>
+            <label>Select Shelf:</label>
+            ${renderTwoLevelShelfSelector(shelves, "prestudy", currentPrestudyPrimaryShelfId, currentPrestudyShelfId)}
           </div>
           <div class="prestudy-target-rate">
             <label for="prestudy-target">Target Rate:</label>
@@ -2485,19 +2882,6 @@ async function loadPrestudyView() {
   } catch (error) {
     container.innerHTML = `<p class="error">Failed to load pre-study view: ${error}</p>`;
   }
-}
-
-function renderPrestudyShelfOptions(shelves: library.ShelfTree[], depth: number = 0): string {
-  return shelves
-    .map((node) => {
-      const indent = "—".repeat(depth);
-      const selected = node.shelf.id === currentPrestudyShelfId ? "selected" : "";
-      return `
-        <option value="${node.shelf.id}" ${selected}>${indent}${escapeHtml(node.shelf.name)}</option>
-        ${renderPrestudyShelfOptions(node.children, depth + 1)}
-      `;
-    })
-    .join("");
 }
 
 function renderPrestudyResults(result: library.PreStudyResult): string {
@@ -2772,10 +3156,8 @@ async function loadCharacterDetail(character: string) {
 }
 
 function setupPrestudyViewHandlers() {
-  // Shelf selector
-  document.getElementById("prestudy-shelf")?.addEventListener("change", (e) => {
-    const value = (e.target as HTMLSelectElement).value;
-    currentPrestudyShelfId = value ? parseInt(value) : null;
+  // Helper to update UI after shelf change
+  const onShelfChange = () => {
     currentPrestudyResult = null;
     selectedPrestudyCharacter = null;
 
@@ -2788,6 +3170,23 @@ function setupPrestudyViewHandlers() {
     if (resultsContainer) {
       resultsContainer.innerHTML = '<p class="empty-message">Select a shelf and click Calculate to see pre-study characters.</p>';
     }
+  };
+
+  // Primary shelf selector
+  document.getElementById("prestudy-shelf-primary")?.addEventListener("change", async (e) => {
+    const value = (e.target as HTMLSelectElement).value;
+    currentPrestudyPrimaryShelfId = value ? parseInt(value) : null;
+    currentPrestudyShelfId = currentPrestudyPrimaryShelfId;
+    onShelfChange();
+    // Reload to update secondary dropdown
+    await loadPrestudyView();
+  });
+
+  // Secondary shelf selector
+  document.getElementById("prestudy-shelf-secondary")?.addEventListener("change", (e) => {
+    const value = (e.target as HTMLSelectElement).value;
+    currentPrestudyShelfId = value ? parseInt(value) : currentPrestudyPrimaryShelfId;
+    onShelfChange();
   });
 
   // Calculate button
@@ -2963,6 +3362,7 @@ function setupPrestudyCharacterHandlers() {
 
 let currentLearningSource: string | null = null;
 let currentLearningTab: "characters" | "words" = "characters";
+let coverageViewMode: "cumulative" | "bucket" = "cumulative";
 
 async function loadLearningView() {
   const container = document.getElementById("learning-main");
@@ -3035,13 +3435,23 @@ async function loadLearningView() {
           <h3>Frequency Coverage</h3>
           <p class="section-description">How much of the most common vocabulary do you know?</p>
 
-          <div class="coverage-tabs">
-            <button class="coverage-tab ${currentLearningTab === "characters" ? "active" : ""}" data-tab="characters">
-              Characters
-            </button>
-            <button class="coverage-tab ${currentLearningTab === "words" ? "active" : ""}" data-tab="words">
-              Words
-            </button>
+          <div class="coverage-controls">
+            <div class="coverage-tabs">
+              <button class="coverage-tab ${currentLearningTab === "characters" ? "active" : ""}" data-tab="characters">
+                Characters
+              </button>
+              <button class="coverage-tab ${currentLearningTab === "words" ? "active" : ""}" data-tab="words">
+                Words
+              </button>
+            </div>
+            <div class="coverage-view-toggle">
+              <button class="view-toggle-btn ${coverageViewMode === "cumulative" ? "active" : ""}" data-view="cumulative">
+                Cumulative
+              </button>
+              <button class="view-toggle-btn ${coverageViewMode === "bucket" ? "active" : ""}" data-view="bucket">
+                By Range
+              </button>
+            </div>
           </div>
 
           <div class="coverage-content">
@@ -3087,6 +3497,34 @@ async function loadLearningView() {
       }
     }
 
+    // Learning vocabulary list
+    try {
+      const learningItems = await library.listKnownWords(undefined, "learning");
+      if (learningItems.length > 0) {
+        html += `
+          <div class="learning-vocabulary-section">
+            <h3>Learning Vocabulary</h3>
+            <p class="section-description">Words and characters you're currently studying</p>
+            <div class="learning-vocab-layout">
+              <div class="learning-vocab-list">
+                ${learningItems.map((item) => `
+                  <div class="learning-vocab-item" data-word="${escapeHtml(item.word)}" data-type="${item.word_type}">
+                    <span class="vocab-term">${escapeHtml(item.word)}</span>
+                    <span class="vocab-type">${item.word_type}</span>
+                  </div>
+                `).join("")}
+              </div>
+              <div class="learning-vocab-detail" id="learning-vocab-detail">
+                <p class="empty-message">Click on a word to see its definition and context</p>
+              </div>
+            </div>
+          </div>
+        `;
+      }
+    } catch {
+      // Ignore errors in learning vocabulary
+    }
+
     html += `</div>`;
 
     container.innerHTML = html;
@@ -3105,29 +3543,71 @@ function renderPercentileCoverage(coverage: learning.PercentileCoverage[]): stri
 
   let html = '<div class="coverage-bars">';
 
-  for (const item of coverage) {
-    const coverageClass = learning.getCoverageColorClass(item.coverage_percent);
+  if (coverageViewMode === "cumulative") {
+    // Cumulative view - show totals up to each percentile
+    for (const item of coverage) {
+      const coverageClass = learning.getCoverageColorClass(item.coverage_percent);
 
-    html += `
-      <div class="coverage-row">
-        <div class="coverage-label">
-          <span class="percentile-label">Top ${item.percentile}%</span>
-          <span class="terms-count">${item.total_terms.toLocaleString()} terms</span>
-        </div>
-        <div class="coverage-bar-container">
-          <div class="coverage-bar ${coverageClass}" style="width: ${item.coverage_percent}%">
-            <span class="coverage-known">${item.known_terms.toLocaleString()} known</span>
+      html += `
+        <div class="coverage-row">
+          <div class="coverage-label">
+            <span class="percentile-label">Top ${item.percentile}%</span>
+            <span class="terms-count">${item.total_terms.toLocaleString()} terms</span>
           </div>
-          ${item.learning_terms > 0 ? `
-            <div class="coverage-bar learning" style="width: ${(item.learning_terms / item.total_terms) * 100}%">
+          <div class="coverage-bar-container">
+            <div class="coverage-bar ${coverageClass}" style="width: ${item.coverage_percent}%">
+              <span class="coverage-known">${item.known_terms.toLocaleString()} known</span>
             </div>
-          ` : ""}
+            ${item.learning_terms > 0 ? `
+              <div class="coverage-bar learning" style="width: ${(item.learning_terms / item.total_terms) * 100}%">
+              </div>
+            ` : ""}
+          </div>
+          <div class="coverage-percent ${coverageClass}">
+            ${learning.formatCoveragePercent(item.coverage_percent)}
+          </div>
         </div>
-        <div class="coverage-percent ${coverageClass}">
-          ${learning.formatCoveragePercent(item.coverage_percent)}
+      `;
+    }
+  } else {
+    // Bucket view - show only terms in each range (not cumulative)
+    for (let i = 0; i < coverage.length; i++) {
+      const item = coverage[i];
+      const prev = i > 0 ? coverage[i - 1] : null;
+
+      // Calculate bucket values (terms in this range only)
+      const bucketTotal = prev ? item.total_terms - prev.total_terms : item.total_terms;
+      const bucketKnown = prev ? item.known_terms - prev.known_terms : item.known_terms;
+      const bucketLearning = prev ? item.learning_terms - prev.learning_terms : item.learning_terms;
+      const bucketPercent = bucketTotal > 0 ? (bucketKnown / bucketTotal) * 100 : 0;
+
+      // Create range label
+      const prevPercentile = prev ? prev.percentile : 0;
+      const rangeLabel = `${prevPercentile}-${item.percentile}%`;
+
+      const coverageClass = learning.getCoverageColorClass(bucketPercent);
+
+      html += `
+        <div class="coverage-row">
+          <div class="coverage-label">
+            <span class="percentile-label">${rangeLabel}</span>
+            <span class="terms-count">${bucketTotal.toLocaleString()} terms</span>
+          </div>
+          <div class="coverage-bar-container">
+            <div class="coverage-bar ${coverageClass}" style="width: ${bucketPercent}%">
+              <span class="coverage-known">${bucketKnown.toLocaleString()} known</span>
+            </div>
+            ${bucketLearning > 0 ? `
+              <div class="coverage-bar learning" style="width: ${(bucketLearning / bucketTotal) * 100}%">
+              </div>
+            ` : ""}
+          </div>
+          <div class="coverage-percent ${coverageClass}">
+            ${learning.formatCoveragePercent(bucketPercent)}
+          </div>
         </div>
-      </div>
-    `;
+      `;
+    }
   }
 
   html += '</div>';
@@ -3249,6 +3729,26 @@ function setupLearningViewHandlers(stats: learning.LearningStats) {
     });
   });
 
+  // View toggle (cumulative vs bucket)
+  document.querySelectorAll(".view-toggle-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      coverageViewMode = (btn as HTMLElement).dataset.view as "cumulative" | "bucket";
+
+      // Update active button
+      document.querySelectorAll(".view-toggle-btn").forEach((b) => b.classList.remove("active"));
+      btn.classList.add("active");
+
+      // Update coverage content
+      const contentDiv = document.querySelector(".coverage-content");
+      if (contentDiv) {
+        const coverage = currentLearningTab === "characters"
+          ? stats.character_coverage
+          : stats.word_coverage;
+        contentDiv.innerHTML = renderPercentileCoverage(coverage);
+      }
+    });
+  });
+
   // Import frequency button
   document.getElementById("import-frequency-btn")?.addEventListener("click", showImportFrequencyModal);
 
@@ -3291,6 +3791,141 @@ function setupLearningViewHandlers(stats: learning.LearningStats) {
       }
     });
   });
+
+  // Learning vocabulary item click
+  document.querySelectorAll(".learning-vocab-item").forEach((item) => {
+    item.addEventListener("click", async () => {
+      const word = (item as HTMLElement).dataset.word!;
+      const wordType = (item as HTMLElement).dataset.type!;
+
+      // Update selection UI
+      document.querySelectorAll(".learning-vocab-item").forEach((i) => i.classList.remove("selected"));
+      item.classList.add("selected");
+
+      // Show loading state
+      const detailDiv = document.getElementById("learning-vocab-detail");
+      if (!detailDiv) return;
+      detailDiv.innerHTML = '<p class="loading">Loading...</p>';
+
+      await loadLearningVocabDetail(word, wordType, detailDiv);
+    });
+  });
+}
+
+async function loadLearningVocabDetail(word: string, wordType: string, detailDiv: HTMLElement) {
+  try {
+    // Fetch dictionary lookup and context in parallel
+    const [lookupResult, contextResult] = await Promise.all([
+      dictionary.lookup(word, {
+        includeExamples: false,
+        includeCharacterInfo: wordType === "character",
+        includeUserDictionaries: true,
+      }),
+      library.getWordContextAll(word, 5),
+    ]);
+
+    let html = `
+      <div class="learning-vocab-detail-content">
+        <div class="detail-header">
+          <span class="detail-char">${escapeHtml(word)}</span>
+          <div class="detail-actions">
+            <button class="btn-mark-known-learning" data-word="${escapeHtml(word)}" data-type="${wordType}">
+              Mark as Known
+            </button>
+          </div>
+        </div>
+    `;
+
+    // Character info (if applicable)
+    if (lookupResult.character_info) {
+      const info = lookupResult.character_info;
+      html += `
+        <div class="detail-char-info">
+          ${info.radical ? `<span class="char-info-item">Radical: ${info.radical}</span>` : ""}
+          ${info.total_strokes ? `<span class="char-info-item">Strokes: ${info.total_strokes}</span>` : ""}
+        </div>
+      `;
+    }
+
+    // Full definitions (not limited)
+    if (lookupResult.entries.length > 0) {
+      html += '<div class="detail-definitions"><h4>Definitions</h4>';
+      for (const entry of lookupResult.entries) {
+        // Show ALL definitions, not just first 3
+        const defTexts = entry.definitions.map(d => d.text).join("; ");
+        html += `
+          <div class="detail-entry">
+            ${entry.pinyin ? `<span class="detail-pinyin">${entry.pinyin}</span>` : ""}
+            <span class="detail-def">${escapeHtml(defTexts)}</span>
+            <span class="detail-source">${dictionary.getSourceDisplayName(entry.source)}</span>
+          </div>
+        `;
+      }
+      html += '</div>';
+    }
+
+    // User dictionary entries (full definitions)
+    if (lookupResult.user_entries.length > 0) {
+      html += '<div class="detail-definitions"><h4>User Definitions</h4>';
+      for (const entry of lookupResult.user_entries) {
+        html += `
+          <div class="detail-entry user-entry">
+            ${entry.pinyin ? `<span class="detail-pinyin">${entry.pinyin}</span>` : ""}
+            <span class="detail-def">${escapeHtml(entry.definition)}</span>
+            ${entry.notes ? `<p class="detail-notes">${escapeHtml(entry.notes)}</p>` : ""}
+          </div>
+        `;
+      }
+      html += '</div>';
+    }
+
+    // Context snippets
+    if (contextResult.snippets.length > 0) {
+      html += '<div class="detail-context"><h4>Context from Texts</h4>';
+      for (const snippet of contextResult.snippets) {
+        // Highlight the word in the snippet
+        const before = snippet.snippet.substring(0, snippet.character_position);
+        const matched = snippet.snippet.substring(snippet.character_position, snippet.character_position + word.length);
+        const after = snippet.snippet.substring(snippet.character_position + word.length);
+
+        html += `
+          <div class="context-snippet">
+            <span class="context-text">${escapeHtml(before)}<mark>${escapeHtml(matched)}</mark>${escapeHtml(after)}</span>
+            <span class="context-source">— ${escapeHtml(snippet.text_title)}</span>
+          </div>
+        `;
+      }
+      html += '</div>';
+    } else {
+      html += '<div class="detail-context"><h4>Context from Texts</h4><p class="empty-message">No context found in your library.</p></div>';
+    }
+
+    html += '</div>';
+    detailDiv.innerHTML = html;
+
+    // Add handler for "Mark as Known" button
+    detailDiv.querySelector(".btn-mark-known-learning")?.addEventListener("click", async (e) => {
+      const btn = e.currentTarget as HTMLButtonElement;
+      const w = btn.dataset.word!;
+
+      btn.textContent = "Marking...";
+      btn.disabled = true;
+
+      try {
+        await library.updateWordStatus(w, "known");
+        // Remove from the list and show success
+        document.querySelector(`.learning-vocab-item[data-word="${CSS.escape(w)}"]`)?.remove();
+        detailDiv.innerHTML = '<p class="success-message">Marked as known!</p>';
+      } catch (error) {
+        console.error("Failed to mark as known:", error);
+        btn.textContent = "Mark as Known";
+        btn.disabled = false;
+      }
+    });
+  } catch (error) {
+    console.error("Failed to load vocab detail:", error);
+    detailDiv.innerHTML = `<p class="error">Failed to load details: ${error}</p>`;
+  }
 }
 
 function showImportFrequencyModal() {
@@ -3660,6 +4295,69 @@ function createModal(title: string, content: string): HTMLElement {
 
 function closeModal() {
   document.querySelector(".modal-overlay")?.remove();
+}
+
+function showEditUserEntryModal(
+  entryId: number,
+  term: string,
+  currentPinyin: string,
+  currentDefinition: string
+) {
+  const formContent = `
+    <form id="edit-user-entry-form">
+      <div class="form-group">
+        <label>Term</label>
+        <input type="text" value="${escapeHtml(term)}" disabled class="form-input" />
+      </div>
+      <div class="form-group">
+        <label for="edit-pinyin">Pinyin</label>
+        <input type="text" id="edit-pinyin" value="${escapeHtml(currentPinyin)}" class="form-input" placeholder="e.g., nǐ hǎo" />
+      </div>
+      <div class="form-group">
+        <label for="edit-definition">Definition</label>
+        <textarea id="edit-definition" class="form-input" rows="4" required>${escapeHtml(currentDefinition)}</textarea>
+      </div>
+      <div class="form-actions">
+        <button type="button" class="btn-secondary modal-cancel">Cancel</button>
+        <button type="submit" class="btn-primary">Save</button>
+      </div>
+    </form>
+  `;
+
+  const overlay = createModal(`Edit: ${term}`, formContent);
+
+  const form = overlay.querySelector("#edit-user-entry-form") as HTMLFormElement;
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+
+    const pinyinInput = overlay.querySelector("#edit-pinyin") as HTMLInputElement;
+    const definitionInput = overlay.querySelector("#edit-definition") as HTMLTextAreaElement;
+
+    const newPinyin = pinyinInput.value.trim();
+    const newDefinition = definitionInput.value.trim();
+
+    if (!newDefinition) {
+      alert("Definition is required.");
+      return;
+    }
+
+    try {
+      await dictionary.updateUserDictionaryEntry(entryId, {
+        pinyin: newPinyin || undefined,
+        definition: newDefinition,
+      });
+      closeModal();
+      // Re-run the current search to refresh results
+      const searchInput = document.getElementById("search-input") as HTMLInputElement;
+      if (searchInput.value) {
+        const searchBtn = document.getElementById("search-btn") as HTMLButtonElement;
+        searchBtn.click();
+      }
+    } catch (err) {
+      console.error("Failed to update entry:", err);
+      alert("Failed to update entry. Please try again.");
+    }
+  });
 }
 
 // =============================================================================

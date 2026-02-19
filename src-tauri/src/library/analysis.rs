@@ -931,16 +931,84 @@ pub fn get_character_context(
 ) -> Result<CharacterContext> {
     // Get all shelf IDs (this shelf + all descendants)
     let all_shelf_ids = get_all_descendant_shelf_ids(conn, shelf_id)?;
+    get_character_context_from_shelves(conn, &all_shelf_ids, character, max_snippets)
+}
 
+/// Get context snippets for a character/word from all texts in the library
+pub fn get_word_context_all(
+    conn: &Connection,
+    word: &str,
+    max_snippets: usize,
+) -> Result<CharacterContext> {
+    // Get all texts
+    let mut stmt = conn.prepare("SELECT id, title, content FROM texts ORDER BY title")?;
+    let texts: Vec<(i64, String, String)> = stmt
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let mut snippets: Vec<ContextSnippet> = vec![];
+    let context_chars = 15; // Characters before and after
+
+    for (text_id, text_title, content) in texts {
+        if snippets.len() >= max_snippets {
+            break;
+        }
+
+        // Find all occurrences of the word in this text
+        let chars: Vec<char> = content.chars().collect();
+        let word_chars: Vec<char> = word.chars().collect();
+        let word_len = word_chars.len();
+
+        for i in 0..chars.len() {
+            if snippets.len() >= max_snippets {
+                break;
+            }
+
+            // Check if word matches at this position
+            if i + word_len <= chars.len() {
+                let slice: String = chars[i..i + word_len].iter().collect();
+                if slice == word {
+                    // Extract context around this occurrence
+                    let start = i.saturating_sub(context_chars);
+                    let end = (i + word_len + context_chars).min(chars.len());
+
+                    let snippet: String = chars[start..end].iter().collect();
+                    let char_position = i - start;
+
+                    snippets.push(ContextSnippet {
+                        text_id,
+                        text_title: text_title.clone(),
+                        snippet,
+                        character_position: char_position,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(CharacterContext {
+        character: word.to_string(),
+        snippets,
+    })
+}
+
+fn get_character_context_from_shelves(
+    conn: &Connection,
+    shelf_ids: &[i64],
+    character: &str,
+    max_snippets: usize,
+) -> Result<CharacterContext> {
     // Get all texts in these shelves
-    let placeholders: String = all_shelf_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let placeholders: String = shelf_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let query = format!(
         "SELECT id, title, content FROM texts WHERE shelf_id IN ({}) ORDER BY title",
         placeholders
     );
     let mut stmt = conn.prepare(&query)?;
     let texts: Vec<(i64, String, String)> = stmt
-        .query_map(rusqlite::params_from_iter(&all_shelf_ids), |row| {
+        .query_map(rusqlite::params_from_iter(shelf_ids), |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;

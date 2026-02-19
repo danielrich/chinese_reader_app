@@ -740,6 +740,22 @@ pub fn get_character_context(
         .map_err(|e| CommandError::Database(e.to_string()))
 }
 
+/// Get context snippets for a word/character from all texts in the library
+#[tauri::command]
+pub fn get_word_context_all(
+    state: State<AppState>,
+    word: String,
+    max_snippets: Option<usize>,
+) -> CommandResult<CharacterContext> {
+    let conn = state
+        .db
+        .lock()
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    library::analysis::get_word_context_all(&conn, &word, max_snippets.unwrap_or(5))
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
+
 // =============================================================================
 // Known Words Commands
 // =============================================================================
@@ -795,6 +811,7 @@ pub fn remove_known_word(state: State<AppState>, word: String) -> CommandResult<
 pub fn list_known_words(
     state: State<AppState>,
     word_type: Option<String>,
+    status: Option<String>,
     limit: Option<usize>,
     offset: Option<usize>,
 ) -> CommandResult<Vec<KnownWord>> {
@@ -803,7 +820,7 @@ pub fn list_known_words(
         .lock()
         .map_err(|e| CommandError::Database(e.to_string()))?;
 
-    library::known_words::list_known_words(&conn, word_type.as_deref(), limit, offset)
+    library::known_words::list_known_words(&conn, word_type.as_deref(), status.as_deref(), limit, offset)
         .map_err(|e| CommandError::Database(e.to_string()))
 }
 

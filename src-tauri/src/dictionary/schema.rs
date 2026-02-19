@@ -413,6 +413,23 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // Migration: Add text_known_char_percentage column to reading_sessions table
+    // This tracks the percentage of known characters in the specific text at session start
+    let has_text_known_pct_column: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('reading_sessions') WHERE name = 'text_known_char_percentage'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if !has_text_known_pct_column {
+        conn.execute(
+            "ALTER TABLE reading_sessions ADD COLUMN text_known_char_percentage REAL",
+            [],
+        )?;
+    }
+
     Ok(())
 }
 

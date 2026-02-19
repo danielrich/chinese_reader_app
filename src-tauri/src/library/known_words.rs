@@ -89,52 +89,50 @@ pub fn remove_known_word(conn: &Connection, word: &str) -> Result<()> {
 pub fn list_known_words(
     conn: &Connection,
     word_type: Option<&str>,
+    status: Option<&str>,
     limit: Option<usize>,
     offset: Option<usize>,
 ) -> Result<Vec<KnownWord>> {
     let base_query = "SELECT id, word, word_type, status, proficiency, created_at FROM known_words";
 
-    let sql = match (word_type, limit, offset) {
-        (Some(_), Some(l), Some(o)) => {
-            format!(
-                "{} WHERE word_type = ? ORDER BY created_at DESC LIMIT {} OFFSET {}",
-                base_query, l, o
-            )
-        }
-        (Some(_), Some(l), None) => {
-            format!(
-                "{} WHERE word_type = ? ORDER BY created_at DESC LIMIT {}",
-                base_query, l
-            )
-        }
-        (Some(_), None, Some(o)) => {
-            format!(
-                "{} WHERE word_type = ? ORDER BY created_at DESC OFFSET {}",
-                base_query, o
-            )
-        }
-        (Some(_), None, None) => {
-            format!("{} WHERE word_type = ? ORDER BY created_at DESC", base_query)
-        }
-        (None, Some(l), Some(o)) => {
-            format!(
-                "{} ORDER BY created_at DESC LIMIT {} OFFSET {}",
-                base_query, l, o
-            )
-        }
-        (None, Some(l), None) => {
-            format!("{} ORDER BY created_at DESC LIMIT {}", base_query, l)
-        }
-        (None, None, Some(o)) => {
-            format!("{} ORDER BY created_at DESC OFFSET {}", base_query, o)
-        }
-        (None, None, None) => format!("{} ORDER BY created_at DESC", base_query),
+    // Build WHERE clause
+    let mut conditions: Vec<String> = Vec::new();
+    let mut params: Vec<String> = Vec::new();
+
+    if let Some(wt) = word_type {
+        conditions.push("word_type = ?".to_string());
+        params.push(wt.to_string());
+    }
+
+    if let Some(st) = status {
+        conditions.push("status = ?".to_string());
+        params.push(st.to_string());
+    }
+
+    let where_clause = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conditions.join(" AND "))
     };
+
+    let mut sql = format!("{}{} ORDER BY created_at DESC", base_query, where_clause);
+
+    if let Some(l) = limit {
+        sql.push_str(&format!(" LIMIT {}", l));
+    }
+    if let Some(o) = offset {
+        sql.push_str(&format!(" OFFSET {}", o));
+    }
 
     let mut stmt = conn.prepare(&sql)?;
 
-    let known_words = if let Some(wt) = word_type {
-        stmt.query_map([wt], |row| {
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params
+        .iter()
+        .map(|s| s as &dyn rusqlite::ToSql)
+        .collect();
+
+    let known_words = stmt
+        .query_map(param_refs.as_slice(), |row| {
             Ok(KnownWord {
                 id: row.get(0)?,
                 word: row.get(1)?,
@@ -144,27 +142,14 @@ pub fn list_known_words(
                 created_at: row.get(5)?,
             })
         })?
-        .collect::<std::result::Result<Vec<_>, _>>()?
-    } else {
-        stmt.query_map([], |row| {
-            Ok(KnownWord {
-                id: row.get(0)?,
-                word: row.get(1)?,
-                word_type: row.get(2)?,
-                status: row.get(3)?,
-                proficiency: row.get(4)?,
-                created_at: row.get(5)?,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?
-    };
+        .collect::<std::result::Result<Vec<_>, _>>()?;
 
     Ok(known_words)
 }
 
 /// List all known words (for analysis comparison)
 pub fn list_all_known_words(conn: &Connection) -> Result<Vec<KnownWord>> {
-    list_known_words(conn, None, None, None)
+    list_known_words(conn, None, None, None, None)
 }
 
 /// Update proficiency level for a known word

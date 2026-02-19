@@ -97,6 +97,7 @@ pub fn run() {
             commands::segment_text,
             commands::get_prestudy_characters,
             commands::get_character_context,
+            commands::get_word_context_all,
             // Known words
             commands::add_known_word,
             commands::update_word_status,

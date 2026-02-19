@@ -32,6 +32,8 @@ pub struct ReadingSession {
     pub characters_per_minute: Option<f64>,
     pub auto_marked_characters: i64,
     pub auto_marked_words: i64,
+    /// Percentage of known characters in this specific text at session start (0-100)
+    pub text_known_char_percentage: Option<f64>,
     pub created_at: String,
 }
 
@@ -52,6 +54,7 @@ impl ReadingSession {
             characters_per_minute: row.get("characters_per_minute")?,
             auto_marked_characters: row.get("auto_marked_characters")?,
             auto_marked_words: row.get("auto_marked_words")?,
+            text_known_char_percentage: row.get("text_known_char_percentage")?,
             created_at: row.get("created_at")?,
         })
     }
@@ -72,6 +75,8 @@ pub struct SpeedDataPoint {
     pub known_words_count: i64,
     pub auto_marked_characters: i64,
     pub auto_marked_words: i64,
+    /// Percentage of known characters in this specific text at session start (0-100)
+    pub text_known_char_percentage: Option<f64>,
 }
 
 /// Aggregated speed statistics
@@ -162,6 +167,25 @@ pub fn start_reading_session(conn: &Connection, text_id: i64) -> Result<ReadingS
         )
         .unwrap_or(0);
 
+    // Calculate known character percentage for this specific text
+    // This uses text_character_freq table which contains character frequencies for the text
+    let text_known_char_percentage: Option<f64> = conn
+        .query_row(
+            r#"
+            SELECT
+                CASE WHEN COALESCE(SUM(frequency), 0) = 0 THEN NULL
+                ELSE CAST(SUM(CASE WHEN kw.id IS NOT NULL AND kw.status = 'known' THEN frequency ELSE 0 END) AS REAL)
+                     / CAST(SUM(frequency) AS REAL) * 100.0
+                END
+            FROM text_character_freq tcf
+            LEFT JOIN known_words kw ON kw.word = tcf.character AND kw.word_type = 'character'
+            WHERE tcf.text_id = ?
+            "#,
+            [text_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(None);
+
     // Insert the session
     let started_at = Utc::now().to_rfc3339();
 
@@ -169,8 +193,9 @@ pub fn start_reading_session(conn: &Connection, text_id: i64) -> Result<ReadingS
         r#"
         INSERT INTO reading_sessions (
             text_id, started_at, character_count, is_first_read,
-            known_characters_count, known_words_count, cumulative_characters_read
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            known_characters_count, known_words_count, cumulative_characters_read,
+            text_known_char_percentage
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         "#,
         params![
             text_id,
@@ -180,6 +205,7 @@ pub fn start_reading_session(conn: &Connection, text_id: i64) -> Result<ReadingS
             known_characters_count,
             known_words_count,
             cumulative_characters_read,
+            text_known_char_percentage,
         ],
     )?;
 
@@ -269,7 +295,8 @@ pub fn get_active_session(conn: &Connection, text_id: i64) -> Result<Option<Read
                is_first_read, is_complete, known_characters_count,
                known_words_count, cumulative_characters_read,
                duration_seconds, characters_per_minute,
-               auto_marked_characters, auto_marked_words, created_at
+               auto_marked_characters, auto_marked_words,
+               text_known_char_percentage, created_at
         FROM reading_sessions
         WHERE text_id = ? AND is_complete = 0
         ORDER BY started_at DESC
@@ -294,7 +321,8 @@ pub fn get_text_reading_history(conn: &Connection, text_id: i64) -> Result<Vec<R
                is_first_read, is_complete, known_characters_count,
                known_words_count, cumulative_characters_read,
                duration_seconds, characters_per_minute,
-               auto_marked_characters, auto_marked_words, created_at
+               auto_marked_characters, auto_marked_words,
+               text_known_char_percentage, created_at
         FROM reading_sessions
         WHERE text_id = ?
         ORDER BY started_at DESC
@@ -329,7 +357,8 @@ pub fn get_speed_data(
                t.shelf_id, rs.finished_at, rs.characters_per_minute,
                rs.character_count, rs.cumulative_characters_read,
                rs.known_characters_count, rs.known_words_count,
-               rs.auto_marked_characters, rs.auto_marked_words
+               rs.auto_marked_characters, rs.auto_marked_words,
+               rs.text_known_char_percentage
         FROM reading_sessions rs
         JOIN texts t ON rs.text_id = t.id
         WHERE rs.is_complete = 1
@@ -375,6 +404,7 @@ pub fn get_speed_data(
                 known_words_count: row.get("known_words_count")?,
                 auto_marked_characters: row.get("auto_marked_characters")?,
                 auto_marked_words: row.get("auto_marked_words")?,
+                text_known_char_percentage: row.get("text_known_char_percentage")?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -539,7 +569,8 @@ fn get_session_by_id(conn: &Connection, session_id: i64) -> Result<ReadingSessio
                is_first_read, is_complete, known_characters_count,
                known_words_count, cumulative_characters_read,
                duration_seconds, characters_per_minute,
-               auto_marked_characters, auto_marked_words, created_at
+               auto_marked_characters, auto_marked_words,
+               text_known_char_percentage, created_at
         FROM reading_sessions
         WHERE id = ?
         "#,
