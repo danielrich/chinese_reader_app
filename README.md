@@ -141,6 +141,36 @@ The importer:
 - Maintains proper chapter ordering
 - Includes 1.5 second delay between requests to be gentle on the server
 
+### Import EPUB/AZW3 into the library
+
+The `scripts/` directory contains a Python tool for importing EPUB or AZW3 ebooks into the library. It uses the ebook's table of contents to create a hierarchy of shelves and texts (one per chapter).
+
+For AZW3 files, [Calibre](https://calibre-ebook.com/) must be installed so the script can convert them to EPUB first.
+
+```bash
+cd scripts
+
+# First, find the parent shelf ID where you want to import:
+sqlite3 ~/Library/Application\ Support/com.chinesereader.ChineseReader/dictionary.db "SELECT id, name FROM shelves;"
+
+# Preview what will be imported (dry run):
+uv run python import_ebook.py /path/to/book.epub <parent_shelf_id> --dry-run
+
+# Import the ebook:
+uv run python import_ebook.py /path/to/book.epub <parent_shelf_id>
+
+# Convert simplified Chinese to traditional (Taiwan style) during import:
+uv run python import_ebook.py /path/to/book.epub <parent_shelf_id> --convert-traditional
+# or use the short form:
+uv run python import_ebook.py /path/to/book.epub <parent_shelf_id> -t
+```
+
+The importer:
+- Creates shelves and texts based on the ebook's table of contents (one text per chapter)
+- Supports both EPUB and AZW3 (AZW3 is converted to EPUB via Calibre's `ebook-convert`)
+- Optionally converts simplified Chinese to traditional using OpenCC (`--convert-traditional` / `-t`)
+- Uses the same database as the app (path varies by OS; the example above is for macOS)
+
 ### Run in development mode
 
 ```bash
@@ -193,7 +223,8 @@ chinese-reader/
 ├── scripts/
 │   ├── download-dictionaries.js  # Dictionary download script
 │   ├── import_pdf.py             # PDF import tool (uv project)
-│   └── import_bofm.py            # Book of Mormon import tool
+│   ├── import_bofm.py            # Book of Mormon import tool
+│   └── import_ebook.py           # EPUB/AZW3 import tool (uv project)
 ├── index.html                 # HTML entry point
 ├── package.json               # Node.js dependencies
 └── tsconfig.json              # TypeScript configuration
