@@ -5,6 +5,90 @@ import * as speed from "./lib/speed";
 import * as learning from "./lib/learning";
 import { confirm } from "@tauri-apps/plugin-dialog";
 
+// Global Error Handler
+function showError(message: string): void {
+  // Create or get error notification container
+  let container = document.getElementById("error-notification-container");
+  if (!container) {
+    container = document.createElement("div");
+    container.id = "error-notification-container";
+    container.style.cssText = `
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      z-index: 10000;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      pointer-events: none;
+    `;
+    document.body.appendChild(container);
+  }
+
+  // Create error notification div
+  const notification = document.createElement("div");
+  notification.style.cssText = `
+    background-color: #ff6b6b;
+    color: white;
+    padding: 16px 20px;
+    border-radius: 6px;
+    margin-bottom: 10px;
+    font-size: 14px;
+    line-height: 1.5;
+    max-width: 400px;
+    word-wrap: break-word;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    pointer-events: auto;
+    animation: slideIn 0.3s ease-out;
+  `;
+  notification.textContent = message;
+  container.appendChild(notification);
+
+  // Add animation keyframes if not present
+  if (!document.getElementById("error-animation-styles")) {
+    const style = document.createElement("style");
+    style.id = "error-animation-styles";
+    style.textContent = `
+      @keyframes slideIn {
+        from {
+          transform: translateX(400px);
+          opacity: 0;
+        }
+        to {
+          transform: translateX(0);
+          opacity: 1;
+        }
+      }
+    `;
+    document.head.appendChild(style);
+  }
+
+  // Auto-dismiss after 5 seconds
+  setTimeout(() => {
+    notification.style.opacity = "0";
+    notification.style.transition = "opacity 0.3s ease-out";
+    setTimeout(() => {
+      notification.remove();
+    }, 300);
+  }, 5000);
+}
+
+// Handle unhandled promise rejections
+window.addEventListener("unhandledrejection", (event) => {
+  const reason = event.reason;
+  const message =
+    reason instanceof Error ? reason.message : String(reason) || "Unknown error";
+  showError(`Promise rejected: ${message}`);
+  // Prevent default handling to avoid console errors
+  event.preventDefault();
+});
+
+// Handle uncaught errors
+window.addEventListener("error", (event) => {
+  const message = event.message || "Unknown error occurred";
+  showError(`Error: ${message}`);
+  // Return true to prevent default handling
+  return true;
+});
+
 // State
 let selectedShelfId: number | null = null;
 let shelfTree: library.ShelfTree[] = [];
