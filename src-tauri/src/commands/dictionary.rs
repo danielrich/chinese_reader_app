@@ -1,6 +1,6 @@
 //! Dictionary lookup and import commands.
 
-use crate::commands::{AppState, CommandError, CommandResult};
+use crate::commands::{AppState, CommandError, CommandResult, ImportResult};
 use crate::dictionary::{
     self,
     models::{DictionarySource, LookupOptions, LookupResult},
@@ -164,11 +164,4 @@ pub fn import_kangxi(state: State<AppState>, file_path: String) -> CommandResult
         entries_added: stats.entries_added,
         errors: stats.errors,
     })
-}
-
-#[derive(serde::Serialize)]
-pub struct ImportResult {
-    pub source: String,
-    pub entries_added: usize,
-    pub errors: usize,
 }

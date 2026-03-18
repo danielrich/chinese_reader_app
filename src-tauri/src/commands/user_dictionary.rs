@@ -1,7 +1,6 @@
 //! User dictionary management commands.
 
-use crate::commands::{AppState, CommandError, CommandResult};
-use crate::commands::dictionary::ImportResult;
+use crate::commands::{AppState, CommandError, CommandResult, ImportResult};
 use crate::dictionary::{
     self,
     models::{UserDictionary, UserDictionaryEntry},

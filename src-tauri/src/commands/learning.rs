@@ -9,6 +9,7 @@ use crate::library::{
         ShelfFrequencyAnalysis, TermFrequencyInfo, VocabularyProgress,
     },
 };
+use rusqlite::{params, Connection};
 use tauri::State;
 
 /// Import frequency data from tab-separated content
@@ -173,7 +174,7 @@ pub fn add_custom_segmentation_word(
     // Insert into user_segmentation_words table (ignore if already exists)
     conn.execute(
         "INSERT OR IGNORE INTO user_segmentation_words (word, frequency) VALUES (?, ?)",
-        rusqlite::params![&word, frequency],
+        params![&word, frequency],
     )
     .map_err(|e| CommandError::Database(e.to_string()))?;
 
@@ -258,7 +259,7 @@ pub fn define_custom_word(
     let frequency: i64 = 10000;
     conn.execute(
         "INSERT OR IGNORE INTO user_segmentation_words (word, frequency) VALUES (?, ?)",
-        rusqlite::params![&word, frequency],
+        params![&word, frequency],
     )
     .map_err(|e| CommandError::Database(e.to_string()))?;
 
@@ -291,7 +292,7 @@ pub fn define_custom_word(
 }
 
 /// Find or create a shelf-specific user dictionary
-fn find_or_create_shelf_dictionary(conn: &rusqlite::Connection, shelf_id: i64) -> CommandResult<(i64, String)> {
+fn find_or_create_shelf_dictionary(conn: &Connection, shelf_id: i64) -> CommandResult<(i64, String)> {
     let domain = format!("shelf:{}", shelf_id);
 
     // Try to find existing dictionary for this shelf
@@ -331,7 +332,7 @@ fn find_or_create_shelf_dictionary(conn: &rusqlite::Connection, shelf_id: i64) -
 }
 
 /// Find or create the global custom words dictionary
-fn find_or_create_global_dictionary(conn: &rusqlite::Connection) -> CommandResult<(i64, String)> {
+fn find_or_create_global_dictionary(conn: &Connection) -> CommandResult<(i64, String)> {
     let domain = "global:custom_words";
 
     // Try to find existing global dictionary
