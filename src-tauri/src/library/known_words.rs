@@ -328,13 +328,13 @@ mod tests {
         add_known_word(&conn, "文", "character", None, None).unwrap();
         add_known_word(&conn, "学习", "word", None, None).unwrap();
 
-        let all = list_known_words(&conn, None, None, None).unwrap();
+        let all = list_known_words(&conn, None, None, None, None).unwrap();
         assert_eq!(all.len(), 3);
 
-        let chars = list_known_words(&conn, Some("character"), None, None).unwrap();
+        let chars = list_known_words(&conn, Some("character"), None, None, None).unwrap();
         assert_eq!(chars.len(), 2);
 
-        let words = list_known_words(&conn, Some("word"), None, None).unwrap();
+        let words = list_known_words(&conn, Some("word"), None, None, None).unwrap();
         assert_eq!(words.len(), 1);
     }
 
