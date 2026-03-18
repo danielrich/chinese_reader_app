@@ -20,7 +20,8 @@ function showError(message: string): void {
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       pointer-events: none;
     `;
-    document.body.appendChild(container);
+    const target = document.body ?? document.documentElement;
+    target.appendChild(container);
   }
 
   // Create error notification div
@@ -40,9 +41,8 @@ function showError(message: string): void {
     animation: slideIn 0.3s ease-out;
   `;
   notification.textContent = message;
-  container.appendChild(notification);
 
-  // Add animation keyframes if not present
+  // Add animation keyframes if not present (before appending notification)
   if (!document.getElementById("error-animation-styles")) {
     const style = document.createElement("style");
     style.id = "error-animation-styles";
@@ -61,6 +61,8 @@ function showError(message: string): void {
     document.head.appendChild(style);
   }
 
+  container.appendChild(notification);
+
   // Auto-dismiss after 5 seconds
   setTimeout(() => {
     notification.style.opacity = "0";
@@ -74,19 +76,20 @@ function showError(message: string): void {
 // Handle unhandled promise rejections
 window.addEventListener("unhandledrejection", (event) => {
   const reason = event.reason;
-  const message =
-    reason instanceof Error ? reason.message : String(reason) || "Unknown error";
+  const message = reason instanceof Error
+    ? reason.message || "Unknown error"
+    : String(reason) || "Unknown error";
   showError(`Promise rejected: ${message}`);
-  // Prevent default handling to avoid console errors
-  event.preventDefault();
+  // Log the error and prevent default handling
+  console.error('Unhandled rejection:', reason);
 });
 
 // Handle uncaught errors
 window.addEventListener("error", (event) => {
   const message = event.message || "Unknown error occurred";
   showError(`Error: ${message}`);
-  // Return true to prevent default handling
-  return true;
+  console.error('Uncaught error:', event.error);
+  event.preventDefault();
 });
 
 // State
