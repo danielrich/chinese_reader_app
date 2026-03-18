@@ -26,23 +26,17 @@ pub fn run() {
             }
 
             // Initialize database
-            let db_path = match dictionary::get_default_db_path() {
-                Ok(path) => path,
-                Err(e) => {
-                    log::error!("Failed to determine database path: {}", e);
-                    return Err(e.into());
-                }
-            };
+            let db_path = dictionary::get_default_db_path().map_err(|e| {
+                log::error!("Failed to determine database path: {}", e);
+                e
+            })?;
 
             log::info!("Database path: {:?}", db_path);
 
-            let conn = match dictionary::init_connection(&db_path) {
-                Ok(connection) => connection,
-                Err(e) => {
-                    log::error!("Failed to initialize database: {}", e);
-                    return Err(e.into());
-                }
-            };
+            let conn = dictionary::init_connection(&db_path).map_err(|e| {
+                log::error!("Failed to initialize database: {}", e);
+                e
+            })?;
 
             // Load user segmentation words into jieba
             match library::analysis::load_user_segmentation_words(&conn) {
