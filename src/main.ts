@@ -188,6 +188,22 @@ async function initApp() {
   // Set up library view
   setupLibraryView();
 
+  // Handle cross-view navigation from learning view to dictionary search
+  window.addEventListener("navigate-to-dictionary-search", (e) => {
+    const term = (e as CustomEvent<{ term: string }>).detail.term;
+    // Switch to dictionary view
+    document.querySelectorAll(".nav-tab").forEach(t => t.classList.remove("active"));
+    document.querySelectorAll(".view").forEach(v => v.classList.remove("active"));
+    document.querySelector('[data-view="dictionary"]')?.classList.add("active");
+    document.getElementById("dictionary-view")?.classList.add("active");
+    // Trigger search
+    const searchInput = document.getElementById("search-input") as HTMLInputElement;
+    if (searchInput) {
+      searchInput.value = term;
+      document.getElementById("search-btn")?.click();
+    }
+  });
+
   // Load initial data
   await loadStats();
 }
@@ -222,10 +238,9 @@ function setupNavigation() {
   });
 }
 
-// Initialize on DOM ready
-document.addEventListener("DOMContentLoaded", initApp);
-
-// Also try to init immediately if DOM is already ready
-if (document.readyState !== "loading") {
+// Initialize on DOM ready — fires exactly once in all cases
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", initApp);
+} else {
   initApp();
 }

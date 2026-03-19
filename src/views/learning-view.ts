@@ -402,12 +402,7 @@ function setupLearningViewHandlers(stats: learning.LearningStats) {
       if ((e.target as HTMLElement).closest(".btn-mark-known-priority")) return;
 
       const term = (item as HTMLElement).dataset.term!;
-      const searchInput = document.getElementById("search-input") as HTMLInputElement;
-      if (searchInput) {
-        searchInput.value = term;
-        document.querySelector('[data-view="dictionary"]')?.dispatchEvent(new Event("click"));
-        document.getElementById("search-btn")?.click();
-      }
+      window.dispatchEvent(new CustomEvent("navigate-to-dictionary-search", { detail: { term } }));
     });
   });
 

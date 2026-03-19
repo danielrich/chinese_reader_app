@@ -1213,7 +1213,7 @@ async function renderSidebarResults(result: dictionary.LookupResult, termType: "
   if (result.entries.length === 0 && result.user_entries.length === 0) {
     const characters = [...result.query];
     if (characters.length > 1) {
-      html += `<p class="dict-sidebar-empty">No dictionary entries found for "${result.query}"</p>`;
+      html += `<p class="dict-sidebar-empty">No dictionary entries found for "${escapeHtml(result.query)}"</p>`;
       html += `<p class="dict-sidebar-char-breakdown-label">Character breakdown:</p>`;
 
       for (const char of characters) {
@@ -1235,7 +1235,7 @@ async function renderSidebarResults(result: dictionary.LookupResult, termType: "
       return;
     }
 
-    html += `<p class="dict-sidebar-empty">No dictionary entries found for "${result.query}"</p>`;
+    html += `<p class="dict-sidebar-empty">No dictionary entries found for "${escapeHtml(result.query)}"</p>`;
     sidebarContent.innerHTML = html;
     setupSidebarMarkKnown();
     return;

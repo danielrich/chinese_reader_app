@@ -41,11 +41,11 @@ function displayDictionaryResults(result: dictionary.LookupResult) {
   const resultsDiv = document.getElementById("results") as HTMLDivElement;
 
   if (result.entries.length === 0 && result.user_entries.length === 0) {
-    resultsDiv.innerHTML = `<p class="no-results">No results found for "${result.query}"</p>`;
+    resultsDiv.innerHTML = `<p class="no-results">No results found for "${escapeHtml(result.query)}"</p>`;
     return;
   }
 
-  let html = `<h2>Results for "${result.query}"</h2>`;
+  let html = `<h2>Results for "${escapeHtml(result.query)}"</h2>`;
 
   // Character info
   if (result.character_info) {

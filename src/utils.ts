@@ -127,16 +127,6 @@ export function getTopTwoLevels(shelves: library.ShelfTree[]): { shelf: library.
   return result;
 }
 
-/** Find a shelf node in the tree by ID */
-export function findShelfInTree(shelves: library.ShelfTree[], id: number): library.ShelfTree | null {
-  for (const node of shelves) {
-    if (node.shelf.id === id) return node;
-    const found = findShelfInTree(node.children, id);
-    if (found) return found;
-  }
-  return null;
-}
-
 /** Get all descendants of a shelf (for the secondary dropdown) */
 export function getShelfDescendants(node: library.ShelfTree, depth: number = 0): { shelf: library.Shelf; depth: number }[] {
   const result: { shelf: library.Shelf; depth: number }[] = [];
@@ -166,7 +156,7 @@ export function renderTwoLevelShelfSelector(
   let hasSecondaryOptions = false;
 
   if (primaryShelfId !== null) {
-    const primaryNode = findShelfInTree(shelves, primaryShelfId);
+    const primaryNode = findShelfById(shelves, primaryShelfId);
     if (primaryNode && primaryNode.children.length > 0) {
       hasSecondaryOptions = true;
       const descendants = getShelfDescendants(primaryNode);
