@@ -55,8 +55,13 @@ pub fn reanalyze_text(state: State<AppState>, text_id: i64) -> CommandResult<Tex
         .lock()
         .map_err(|e| CommandError::Database(e.to_string()))?;
 
-    library::analysis::reanalyze_text(&conn, text_id)
-        .map_err(|e| CommandError::Database(e.to_string()))
+    let result = library::analysis::reanalyze_text(&conn, text_id)
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    // Invalidate all shelf analysis caches since text analysis was updated
+    let _ = library::analysis::invalidate_shelf_analysis_cache(&conn);
+
+    Ok(result)
 }
 
 /// Get aggregated analysis for a shelf

@@ -7,6 +7,7 @@ use jieba_rs::Jieba;
 use rusqlite::{params, Connection};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
+use serde_json;
 
 use super::error::{LibraryError, Result};
 use super::known_words;
@@ -534,6 +535,18 @@ pub fn segment_text(conn: &Connection, content: &str) -> Result<Vec<TextSegment>
     Ok(segments)
 }
 
+/// Invalidate all shelf analysis caches (call after vocabulary changes)
+pub fn invalidate_shelf_analysis_cache(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM shelf_analyses_cache", [])?;
+    Ok(())
+}
+
+/// Invalidate the cache for a specific shelf (call when a text in that shelf changes)
+pub fn invalidate_shelf_analysis_cache_for_shelf(conn: &Connection, shelf_id: i64) -> Result<()> {
+    conn.execute("DELETE FROM shelf_analyses_cache WHERE shelf_id = ?", [shelf_id])?;
+    Ok(())
+}
+
 /// Recursively get all shelf IDs including the given shelf and all descendants
 fn get_all_descendant_shelf_ids(conn: &Connection, shelf_id: i64) -> Result<Vec<i64>> {
     let mut all_ids = vec![shelf_id];
@@ -556,6 +569,29 @@ fn get_all_descendant_shelf_ids(conn: &Connection, shelf_id: i64) -> Result<Vec<
 
 /// Get aggregated analysis for all texts in a shelf and its sub-shelves
 pub fn get_shelf_analysis(conn: &Connection, shelf_id: i64) -> Result<ShelfAnalysis> {
+    // Check cache first
+    let cached: std::result::Result<Option<ShelfAnalysis>, _> = {
+        let result = conn.query_row(
+            "SELECT data FROM shelf_analyses_cache WHERE shelf_id = ?",
+            [shelf_id],
+            |row| row.get::<_, String>(0),
+        );
+        match result {
+            Ok(data) => {
+                let parsed = serde_json::from_str(&data);
+                if parsed.is_err() {
+                    log::warn!("shelf_analyses_cache: failed to deserialize cached entry for shelf {shelf_id}, recomputing");
+                }
+                Ok(parsed.ok())
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    };
+    if let Ok(Some(analysis)) = cached {
+        return Ok(analysis);
+    }
+
     // Get vocabulary sets - only status='known' counts as known
     let vocab = build_vocabulary_sets(conn)?;
 
@@ -680,7 +716,7 @@ pub fn get_shelf_analysis(conn: &Connection, shelf_id: i64) -> Result<ShelfAnaly
         .cloned()
         .collect();
 
-    Ok(ShelfAnalysis {
+    let analysis = ShelfAnalysis {
         shelf_id,
         text_count: text_ids.len() as i64,
         total_characters,
@@ -693,7 +729,17 @@ pub fn get_shelf_analysis(conn: &Connection, shelf_id: i64) -> Result<ShelfAnaly
         known_characters,
         unknown_words,
         known_words: known_words_list,
-    })
+    };
+
+    // Cache the result
+    if let Ok(json) = serde_json::to_string(&analysis) {
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO shelf_analyses_cache (shelf_id, data, cached_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+            params![shelf_id, json],
+        );
+    }
+
+    Ok(analysis)
 }
 
 /// Statistics about auto-marking unknown words
@@ -764,6 +810,7 @@ pub fn auto_mark_text_as_known(conn: &Connection, text_id: i64) -> Result<AutoMa
     // Invalidate the analysis cache since vocabulary changed
     if characters_marked > 0 || words_marked > 0 {
         conn.execute("DELETE FROM text_analyses WHERE text_id = ?", [text_id])?;
+        invalidate_shelf_analysis_cache(conn)?;
     }
 
     Ok(AutoMarkStats {
@@ -1114,5 +1161,39 @@ mod tests {
 
         assert!(report.summary.total_characters > 0);
         assert!(!report.top_characters.is_empty());
+    }
+
+    #[test]
+    fn test_shelf_analysis_cache() {
+        let conn = setup_test_db();
+        let shelf = create_shelf(&conn, "Test", None, None).unwrap();
+        create_text(&conn, shelf.id, "Text1", "我喜欢学习中文", None, "paste").unwrap();
+        create_text(&conn, shelf.id, "Text2", "今天天气很好", None, "paste").unwrap();
+
+        // First call - computes and caches
+        let result1 = get_shelf_analysis(&conn, shelf.id).unwrap();
+        assert!(result1.text_count == 2);
+
+        // Second call - should hit cache (same result)
+        let result2 = get_shelf_analysis(&conn, shelf.id).unwrap();
+        assert_eq!(result1.text_count, result2.text_count);
+        assert_eq!(result1.total_characters, result2.total_characters);
+
+        // Verify cache entry exists in DB
+        let cache_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM shelf_analyses_cache WHERE shelf_id = ?",
+            [shelf.id],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(cache_count, 1);
+
+        // Invalidate and verify cache is cleared
+        invalidate_shelf_analysis_cache(&conn).unwrap();
+        let cache_count_after: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM shelf_analyses_cache WHERE shelf_id = ?",
+            [shelf.id],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(cache_count_after, 0);
     }
 }

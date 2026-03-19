@@ -21,8 +21,13 @@ pub fn add_known_word(
         .lock()
         .map_err(|e| CommandError::Database(e.to_string()))?;
 
-    library::known_words::add_known_word(&conn, &word, &word_type, status.as_deref(), proficiency)
-        .map_err(|e| CommandError::Database(e.to_string()))
+    let result = library::known_words::add_known_word(&conn, &word, &word_type, status.as_deref(), proficiency)
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    // Invalidate shelf analysis cache since vocabulary changed
+    let _ = library::analysis::invalidate_shelf_analysis_cache(&conn);
+
+    Ok(result)
 }
 
 /// Update the status of a known word
@@ -38,7 +43,12 @@ pub fn update_word_status(
         .map_err(|e| CommandError::Database(e.to_string()))?;
 
     library::known_words::update_word_status(&conn, &word, &status)
-        .map_err(|e| CommandError::Database(e.to_string()))
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    // Invalidate shelf analysis cache since vocabulary changed
+    let _ = library::analysis::invalidate_shelf_analysis_cache(&conn);
+
+    Ok(())
 }
 
 /// Remove a known word
@@ -50,7 +60,12 @@ pub fn remove_known_word(state: State<AppState>, word: String) -> CommandResult<
         .map_err(|e| CommandError::Database(e.to_string()))?;
 
     library::known_words::remove_known_word(&conn, &word)
-        .map_err(|e| CommandError::Database(e.to_string()))
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    // Invalidate shelf analysis cache since vocabulary changed
+    let _ = library::analysis::invalidate_shelf_analysis_cache(&conn);
+
+    Ok(())
 }
 
 /// List known words
@@ -83,6 +98,11 @@ pub fn import_known_words(
         .lock()
         .map_err(|e| CommandError::Database(e.to_string()))?;
 
-    library::known_words::import_known_words(&conn, &content, &word_type)
-        .map_err(|e| CommandError::Database(e.to_string()))
+    let result = library::known_words::import_known_words(&conn, &content, &word_type)
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    // Invalidate shelf analysis cache since vocabulary changed
+    let _ = library::analysis::invalidate_shelf_analysis_cache(&conn);
+
+    Ok(result)
 }

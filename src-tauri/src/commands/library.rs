@@ -95,7 +95,12 @@ pub fn move_shelf(
         .map_err(|e| CommandError::Database(e.to_string()))?;
 
     library::shelf::move_shelf(&conn, id, new_parent_id)
-        .map_err(|e| CommandError::Database(e.to_string()))
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    // Invalidate all shelf caches since hierarchy changed (affects ancestor counts)
+    let _ = library::analysis::invalidate_shelf_analysis_cache(&conn);
+
+    Ok(())
 }
 
 /// Result of creating a text (may be split into sections)
@@ -132,6 +137,9 @@ pub fn create_text(
         convert_to_traditional.unwrap_or(false),
     )
     .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    // Invalidate all shelf caches since ancestor shelves also include this text in their aggregates
+    let _ = library::analysis::invalidate_shelf_analysis_cache(&conn);
 
     Ok(CreateTextCommandResult {
         text: result.text,
@@ -197,7 +205,12 @@ pub fn delete_text(state: State<AppState>, id: i64) -> CommandResult<()> {
         .lock()
         .map_err(|e| CommandError::Database(e.to_string()))?;
 
-    library::text::delete_text(&conn, id).map_err(|e| CommandError::Database(e.to_string()))
+    library::text::delete_text(&conn, id).map_err(|e| CommandError::Database(e.to_string()))?;
+
+    // Invalidate all shelf analysis caches since a text was removed
+    let _ = library::analysis::invalidate_shelf_analysis_cache(&conn);
+
+    Ok(())
 }
 
 /// Import a text from a file (auto-splits large texts)
@@ -213,13 +226,18 @@ pub fn import_text_file(
         .lock()
         .map_err(|e| CommandError::Database(e.to_string()))?;
 
-    library::text::import_text_file_with_options(
+    let result = library::text::import_text_file_with_options(
         &conn,
         shelf_id,
         &file_path,
         convert_to_traditional.unwrap_or(false),
     )
-    .map_err(|e| CommandError::Database(e.to_string()))
+    .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    // Invalidate all shelf caches since ancestor shelves also include this text in their aggregates
+    let _ = library::analysis::invalidate_shelf_analysis_cache(&conn);
+
+    Ok(result)
 }
 
 /// Migrate large texts (>1500 chars) into shelves with sections
@@ -234,8 +252,13 @@ pub fn migrate_large_texts(
         .lock()
         .map_err(|e| CommandError::Database(e.to_string()))?;
 
-    library::text::migrate_large_texts(&conn, shelf_id)
-        .map_err(|e| CommandError::Database(e.to_string()))
+    let result = library::text::migrate_large_texts(&conn, shelf_id)
+        .map_err(|e| CommandError::Database(e.to_string()))?;
+
+    // Invalidate all shelf caches since texts were reorganized across shelves
+    let _ = library::analysis::invalidate_shelf_analysis_cache(&conn);
+
+    Ok(result)
 }
 
 /// Auto-mark statistics

@@ -329,6 +329,14 @@ CREATE TABLE IF NOT EXISTS user_segmentation_words (
 );
 
 CREATE INDEX IF NOT EXISTS idx_user_segmentation_words_word ON user_segmentation_words(word);
+
+-- Cached shelf analysis results (invalidated on vocabulary/text changes)
+CREATE TABLE IF NOT EXISTS shelf_analyses_cache (
+    shelf_id INTEGER PRIMARY KEY,
+    data TEXT NOT NULL,
+    cached_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (shelf_id) REFERENCES shelves(id) ON DELETE CASCADE
+);
 "#;
 
 /// Initialize the database with the schema
