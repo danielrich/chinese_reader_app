@@ -121,6 +121,7 @@ pub fn run() {
             commands::get_speed_stats,
             commands::get_daily_reading_volume,
             commands::get_reading_streak,
+            commands::log_offline_read,
             // Settings
             commands::get_setting,
             commands::set_setting,

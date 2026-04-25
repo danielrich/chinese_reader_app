@@ -156,3 +156,14 @@ pub fn get_reading_streak(state: State<AppState>) -> CommandResult<ReadingStreak
     library::speed::get_reading_streak(&conn)
         .map_err(|e| CommandError::Database(e.to_string()))
 }
+
+/// Log an offline reading session manually
+#[tauri::command]
+pub fn log_offline_read(
+    state: State<AppState>,
+    input: library::ManualLogInput,
+) -> CommandResult<Vec<library::ReadingSession>> {
+    let conn = state.db.lock().map_err(|e| CommandError::Database(e.to_string()))?;
+    library::speed::log_offline_read(&conn, input)
+        .map_err(|e| CommandError::Database(e.to_string()))
+}
