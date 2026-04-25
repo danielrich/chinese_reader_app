@@ -387,7 +387,8 @@ async function loadTextView(textId: number) {
                 <button id="finish-reading-btn" class="btn-primary">Finish Reading</button>
                 <button id="discard-reading-btn" class="btn-secondary">Discard</button>
               `
-              : `<button id="start-reading-btn" class="btn-primary">Start Reading</button>`
+              : `<button id="start-reading-btn" class="btn-primary">Start Reading</button>
+                <button id="log-offline-btn" class="btn-secondary">Log offline read</button>`
             }
           </div>
           <div class="text-actions">
@@ -587,6 +588,10 @@ function setupReadingControls(textId: number) {
     }
   });
 
+  document.getElementById("log-offline-btn")?.addEventListener("click", () => {
+    showOfflineLogModal();
+  });
+
   document.getElementById("finish-reading-btn")?.addEventListener("click", finishCurrentReadingSession);
 
   document.getElementById("discard-reading-btn")?.addEventListener("click", async () => {
@@ -639,7 +644,8 @@ function updateReadingControlsUI() {
       }
     });
   } else {
-    container.innerHTML = `<button id="start-reading-btn" class="btn-primary">Start Reading</button>`;
+    container.innerHTML = `<button id="start-reading-btn" class="btn-primary">Start Reading</button>
+<button id="log-offline-btn" class="btn-secondary">Log offline read</button>`;
 
     document.getElementById("start-reading-btn")?.addEventListener("click", async () => {
       const backBtn = document.getElementById("back-to-shelf-btn");
@@ -654,6 +660,10 @@ function updateReadingControlsUI() {
         console.error("Failed to start reading session:", error);
         alert(`Failed to start reading: ${error}`);
       }
+    });
+
+    document.getElementById("log-offline-btn")?.addEventListener("click", () => {
+      showOfflineLogModal();
     });
   }
 }
@@ -1664,6 +1674,202 @@ function renderLibraryWelcome() {
 // =============================================================================
 // Modals
 // =============================================================================
+
+async function showOfflineLogModal() {
+  const selectedTexts: Map<number, { id: number; title: string; character_count: number }> = new Map();
+  let selectedSource: string | null = null;
+
+  // Default finished_at to now (datetime-local format)
+  const now = new Date();
+  const localIso = new Date(now.getTime() - now.getTimezoneOffset() * 60000)
+    .toISOString()
+    .slice(0, 16);
+
+  const modalContent = `
+    <div class="offline-log-form">
+      <div>
+        <label class="form-label">Texts you read</label>
+        <div id="chip-list" class="text-chip-list"></div>
+        <input
+          type="text"
+          id="text-search"
+          class="text-search-input"
+          placeholder="🔍 Search texts to add…"
+          autocomplete="off"
+        />
+        <div id="text-search-results" class="text-search-results"></div>
+      </div>
+
+      <div>
+        <label class="form-label">When did you finish?</label>
+        <input type="datetime-local" id="finished-at" value="${localIso}" />
+      </div>
+
+      <div>
+        <label class="form-label">Total reading time</label>
+        <div class="duration-row">
+          <div>
+            <input type="number" id="duration-hours" min="0" max="23" value="0" placeholder="hrs" />
+          </div>
+          <div>
+            <input type="number" id="duration-minutes" min="0" max="59" value="30" placeholder="min" />
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <label class="form-label">Where did you read?</label>
+        <div class="source-chips">
+          <button class="source-chip" data-source="physical_book">Physical book</button>
+          <button class="source-chip" data-source="other_site">Other site</button>
+          <button class="source-chip" data-source="phone">Phone (no app)</button>
+          <button class="source-chip" data-source="other">Other</button>
+        </div>
+      </div>
+
+      <div class="form-actions">
+        <button type="button" class="btn-secondary modal-cancel">Cancel</button>
+        <button type="button" id="offline-save-btn" class="btn-primary" disabled>Save 0 sessions</button>
+      </div>
+    </div>
+  `;
+
+  const modal = createModal("Log offline reading", modalContent);
+
+  function refreshChips() {
+    const chipList = modal.querySelector("#chip-list")!;
+    chipList.innerHTML = [...selectedTexts.values()]
+      .map(
+        (t) => `
+        <div class="text-chip" data-chip-id="${t.id}">
+          <span class="text-chip-name">${escapeHtml(t.title)}</span>
+          <button class="text-chip-remove" data-remove-id="${t.id}">×</button>
+        </div>
+      `
+      )
+      .join("");
+    chipList.querySelectorAll(".text-chip-remove").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        selectedTexts.delete(parseInt((btn as HTMLElement).dataset.removeId!));
+        refreshChips();
+        updateSaveLabel();
+      });
+    });
+  }
+
+  function updateSaveLabel() {
+    const saveBtn = modal.querySelector("#offline-save-btn") as HTMLButtonElement | null;
+    if (saveBtn) {
+      const n = selectedTexts.size;
+      saveBtn.textContent = `Save ${n} session${n !== 1 ? "s" : ""}`;
+      saveBtn.disabled = n === 0;
+    }
+  }
+
+  modal.querySelectorAll(".source-chip").forEach((chip) => {
+    chip.addEventListener("click", () => {
+      modal.querySelectorAll(".source-chip").forEach((c) => c.classList.remove("active"));
+      chip.classList.add("active");
+      selectedSource = (chip as HTMLElement).dataset.source || null;
+    });
+  });
+
+  let searchTimer: ReturnType<typeof setTimeout> | null = null;
+  const searchInput = modal.querySelector("#text-search") as HTMLInputElement;
+  const resultsEl = modal.querySelector("#text-search-results") as HTMLElement;
+
+  searchInput.addEventListener("input", () => {
+    if (searchTimer) clearTimeout(searchTimer);
+    searchTimer = setTimeout(async () => {
+      const q = searchInput.value.trim();
+      if (q.length < 1) { resultsEl.classList.remove("open"); return; }
+      const results = await library.searchTexts(q);
+      resultsEl.innerHTML = results
+        .filter((r) => !selectedTexts.has(r.id))
+        .map(
+          (r) =>
+            `<div class="text-search-result-item" data-id="${r.id}" data-title="${escapeHtml(r.title)}" data-chars="${r.character_count}">
+              ${escapeHtml(r.title)}
+            </div>`
+        )
+        .join("") || `<div class="text-search-result-item" style="color:#666">No results</div>`;
+      resultsEl.classList.add("open");
+    }, 250);
+  });
+
+  resultsEl.addEventListener("click", (e) => {
+    const item = (e.target as HTMLElement).closest(".text-search-result-item") as HTMLElement | null;
+    if (!item || !item.dataset.id) return;
+    const id = parseInt(item.dataset.id);
+    selectedTexts.set(id, {
+      id,
+      title: item.dataset.title || "",
+      character_count: parseInt(item.dataset.chars || "0"),
+    });
+    searchInput.value = "";
+    resultsEl.classList.remove("open");
+    refreshChips();
+    updateSaveLabel();
+  });
+
+  document.addEventListener(
+    "click",
+    (e) => {
+      if (!searchInput.contains(e.target as Node) && !resultsEl.contains(e.target as Node)) {
+        resultsEl.classList.remove("open");
+      }
+    },
+    { once: false }
+  );
+
+  const saveBtn = modal.querySelector("#offline-save-btn") as HTMLButtonElement;
+  saveBtn.addEventListener("click", async () => {
+    await saveOfflineLog(modal, selectedTexts, selectedSource);
+  });
+
+  updateSaveLabel();
+}
+
+async function saveOfflineLog(
+  modal: HTMLElement,
+  selectedTexts: Map<number, { id: number; title: string; character_count: number }>,
+  source: string | null
+) {
+  const finishedAtInput = modal.querySelector("#finished-at") as HTMLInputElement;
+  const hoursInput = modal.querySelector("#duration-hours") as HTMLInputElement;
+  const minutesInput = modal.querySelector("#duration-minutes") as HTMLInputElement;
+
+  const hours = parseInt(hoursInput.value) || 0;
+  const minutes = parseInt(minutesInput.value) || 0;
+  const totalSeconds = hours * 3600 + minutes * 60;
+
+  if (totalSeconds <= 0) {
+    alert("Please enter a reading duration.");
+    return;
+  }
+  if (selectedTexts.size === 0) {
+    alert("Please add at least one text.");
+    return;
+  }
+
+  const localDt = new Date(finishedAtInput.value);
+  const finishedAt = localDt.toISOString();
+
+  try {
+    await speed.logOfflineRead({
+      text_ids: [...selectedTexts.keys()],
+      finished_at: finishedAt,
+      total_duration_seconds: totalSeconds,
+      source,
+    });
+    closeModal();
+    if (currentTextId) await loadReadingHistory(currentTextId);
+    await loadShelfTree();
+  } catch (err) {
+    console.error("Failed to log offline read:", err);
+    alert("Failed to save. Please try again.");
+  }
+}
 
 function showAddShelfModal() {
   const modal = createModal("Add Shelf", `
