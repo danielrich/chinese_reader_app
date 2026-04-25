@@ -35,6 +35,8 @@ pub struct ReadingSession {
     /// Percentage of known characters in this specific text at session start (0-100)
     pub text_known_char_percentage: Option<f64>,
     pub created_at: String,
+    pub is_manual_log: bool,
+    pub source: Option<String>,
 }
 
 impl ReadingSession {
@@ -56,8 +58,19 @@ impl ReadingSession {
             auto_marked_words: row.get("auto_marked_words")?,
             text_known_char_percentage: row.get("text_known_char_percentage")?,
             created_at: row.get("created_at")?,
+            is_manual_log: row.get::<_, i64>("is_manual_log")? == 1,
+            source: row.get("source")?,
         })
     }
+}
+
+/// Input for logging offline reading sessions
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManualLogInput {
+    pub text_ids: Vec<i64>,
+    pub finished_at: String,         // ISO 8601 datetime chosen by user
+    pub total_duration_seconds: i64, // total reading time for all texts
+    pub source: Option<String>,      // "physical_book" | "other_site" | "phone" | null
 }
 
 /// A data point for speed graphs
@@ -296,7 +309,8 @@ pub fn get_active_session(conn: &Connection, text_id: i64) -> Result<Option<Read
                known_words_count, cumulative_characters_read,
                duration_seconds, characters_per_minute,
                auto_marked_characters, auto_marked_words,
-               text_known_char_percentage, created_at
+               text_known_char_percentage, created_at,
+               is_manual_log, source
         FROM reading_sessions
         WHERE text_id = ? AND is_complete = 0
         ORDER BY started_at DESC
@@ -322,7 +336,8 @@ pub fn get_text_reading_history(conn: &Connection, text_id: i64) -> Result<Vec<R
                known_words_count, cumulative_characters_read,
                duration_seconds, characters_per_minute,
                auto_marked_characters, auto_marked_words,
-               text_known_char_percentage, created_at
+               text_known_char_percentage, created_at,
+               is_manual_log, source
         FROM reading_sessions
         WHERE text_id = ?
         ORDER BY started_at DESC
@@ -558,6 +573,134 @@ pub fn get_speed_stats(conn: &Connection, shelf_id: Option<i64>) -> Result<Speed
     })
 }
 
+/// Create completed reading sessions for texts read offline.
+/// Duration is split proportionally by character count so all texts get the same CPM.
+pub fn log_offline_read(conn: &Connection, input: ManualLogInput) -> Result<Vec<ReadingSession>> {
+    if input.text_ids.is_empty() {
+        return Err(LibraryError::InvalidInput("No texts specified".into()));
+    }
+    if input.total_duration_seconds <= 0 {
+        return Err(LibraryError::InvalidInput("Duration must be positive".into()));
+    }
+
+    let finished_at = DateTime::parse_from_rfc3339(&input.finished_at)
+        .map_err(|e| LibraryError::InvalidInput(format!("Invalid datetime: {}", e)))?;
+
+    // Fetch character counts for all text IDs
+    let placeholders = input
+        .text_ids
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT id, character_count FROM texts WHERE id IN ({})",
+        placeholders
+    );
+    let params: Vec<&dyn rusqlite::ToSql> = input
+        .text_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::ToSql)
+        .collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let char_counts: std::collections::HashMap<i64, i64> = stmt
+        .query_map(params.as_slice(), |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let total_chars: i64 = char_counts.values().sum();
+    if total_chars == 0 {
+        return Err(LibraryError::InvalidInput(
+            "Selected texts have no characters".into(),
+        ));
+    }
+
+    // Snapshot current vocabulary counts (same for all sessions in this batch)
+    let known_characters_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM known_words WHERE word_type = 'character'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let known_words_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM known_words WHERE word_type = 'word'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    let mut session_ids = Vec::new();
+
+    for &text_id in &input.text_ids {
+        let char_count = *char_counts
+            .get(&text_id)
+            .ok_or_else(|| LibraryError::TextNotFound(text_id))?;
+
+        // Proportional duration
+        let duration_secs = (input.total_duration_seconds as f64
+            * (char_count as f64 / total_chars as f64))
+            .round() as i64;
+        let duration_secs = duration_secs.max(1); // at least 1 second
+
+        let started_at = finished_at - chrono::Duration::seconds(duration_secs);
+
+        let characters_per_minute = char_count as f64 / (duration_secs as f64 / 60.0);
+
+        // Is this the first completed read of this text?
+        let prior_complete: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM reading_sessions WHERE text_id = ? AND is_complete = 1",
+                [text_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        let is_first_read = prior_complete == 0;
+
+        // Cumulative chars read before this session
+        let cumulative: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(character_count), 0) FROM reading_sessions WHERE text_id = ? AND is_complete = 1",
+                [text_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        conn.execute(
+            "INSERT INTO reading_sessions (
+                text_id, started_at, finished_at, character_count,
+                is_first_read, is_complete,
+                known_characters_count, known_words_count,
+                cumulative_characters_read,
+                duration_seconds, characters_per_minute,
+                auto_marked_characters, auto_marked_words,
+                is_manual_log, source
+            ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, 0, 0, 1, ?)",
+            rusqlite::params![
+                text_id,
+                started_at.to_rfc3339(),
+                finished_at.to_rfc3339(),
+                char_count,
+                is_first_read as i64,
+                known_characters_count,
+                known_words_count,
+                cumulative,
+                duration_secs,
+                characters_per_minute,
+                input.source,
+            ],
+        )?;
+
+        session_ids.push(conn.last_insert_rowid());
+    }
+
+    // Return all created sessions
+    session_ids
+        .iter()
+        .map(|&id| get_session_by_id(conn, id))
+        .collect()
+}
+
 // =============================================================================
 // Helper Functions
 // =============================================================================
@@ -570,7 +713,8 @@ fn get_session_by_id(conn: &Connection, session_id: i64) -> Result<ReadingSessio
                known_words_count, cumulative_characters_read,
                duration_seconds, characters_per_minute,
                auto_marked_characters, auto_marked_words,
-               text_known_char_percentage, created_at
+               text_known_char_percentage, created_at,
+               is_manual_log, source
         FROM reading_sessions
         WHERE id = ?
         "#,
@@ -879,5 +1023,68 @@ mod tests {
 
         assert_eq!(stats.total_sessions, 0);
         assert_eq!(stats.total_characters_read, 0);
+    }
+
+    #[test]
+    fn test_log_offline_read_proportional_duration() {
+        use crate::dictionary::schema::init_database;
+        let conn = Connection::open_in_memory().unwrap();
+        init_database(&conn).unwrap();
+
+        conn.execute("INSERT INTO shelves (id, name, sort_order) VALUES (1, 'S', 0)", []).unwrap();
+        // Text A: 1000 chars, Text B: 2000 chars → total 3000
+        conn.execute("INSERT INTO texts (id, shelf_id, title, content, character_count) VALUES (1, 1, 'A', 'x', 1000)", []).unwrap();
+        conn.execute("INSERT INTO texts (id, shelf_id, title, content, character_count) VALUES (2, 1, 'B', 'x', 2000)", []).unwrap();
+
+        let finished_at = "2026-04-25T21:00:00Z".to_string();
+        let input = ManualLogInput {
+            text_ids: vec![1, 2],
+            finished_at: finished_at.clone(),
+            total_duration_seconds: 3000, // 50 minutes
+            source: Some("physical_book".to_string()),
+        };
+
+        let sessions = log_offline_read(&conn, input).unwrap();
+        assert_eq!(sessions.len(), 2);
+
+        // Text A (1000 chars / 3000 total) → 1000s duration
+        let a = sessions.iter().find(|s| s.text_id == 1).unwrap();
+        assert_eq!(a.duration_seconds, Some(1000));
+        assert!(a.characters_per_minute.is_some());
+        // 1000 chars / (1000s / 60) = 60 cpm
+        assert!((a.characters_per_minute.unwrap() - 60.0).abs() < 0.1);
+        assert_eq!(a.is_manual_log, true);
+        assert_eq!(a.is_complete, true);
+        assert_eq!(a.source, Some("physical_book".to_string()));
+
+        // Text B (2000 chars / 3000 total) → 2000s duration
+        let b = sessions.iter().find(|s| s.text_id == 2).unwrap();
+        assert_eq!(b.duration_seconds, Some(2000));
+    }
+
+    #[test]
+    fn test_log_offline_read_sets_is_first_read() {
+        use crate::dictionary::schema::init_database;
+        let conn = Connection::open_in_memory().unwrap();
+        init_database(&conn).unwrap();
+
+        conn.execute("INSERT INTO shelves (id, name, sort_order) VALUES (1, 'S', 0)", []).unwrap();
+        conn.execute("INSERT INTO texts (id, shelf_id, title, content, character_count) VALUES (1, 1, 'A', 'x', 500)", []).unwrap();
+        // Pre-existing completed session on text 1
+        conn.execute(
+            "INSERT INTO reading_sessions (text_id, started_at, character_count, is_complete)
+             VALUES (1, '2026-01-01T00:00:00Z', 500, 1)",
+            [],
+        ).unwrap();
+
+        let input = ManualLogInput {
+            text_ids: vec![1],
+            finished_at: "2026-04-25T21:00:00Z".to_string(),
+            total_duration_seconds: 600,
+            source: None,
+        };
+        let sessions = log_offline_read(&conn, input).unwrap();
+        // Not first read because prior completed session exists
+        assert_eq!(sessions[0].is_first_read, false);
     }
 }
