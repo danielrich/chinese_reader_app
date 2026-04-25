@@ -701,16 +701,22 @@ async function loadReadingHistory(textId: number) {
     `;
 
     for (const session of history) {
-      const statusClass = session.is_complete ? "complete" : "in-progress";
-      const statusText = session.is_complete ? "Completed" : "In Progress";
+      const isManual = session.is_manual_log;
+      const statusClass = isManual ? "manual" : session.is_complete ? "complete" : "in-progress";
+      const statusText = isManual ? "Logged" : session.is_complete ? "Completed" : "In Progress";
       const firstReadBadge = session.is_first_read ? '<span class="first-read-badge">First Read</span>' : '';
+      const sourceBadge =
+        isManual && session.source
+          ? `<span class="source-badge">${escapeHtml(session.source.replace(/_/g, " "))}</span>`
+          : "";
 
       html += `
         <div class="history-item ${statusClass}" data-session-id="${session.id}">
           <div class="history-item-header">
             <span class="history-date">${speed.formatSessionDate(session.started_at)}</span>
-            <span class="history-status">${statusText}</span>
+            <span class="history-status ${statusClass}">${statusText}</span>
             ${firstReadBadge}
+            ${sourceBadge}
             <button class="btn-delete-session" data-session-id="${session.id}" title="Delete session">×</button>
           </div>
           <div class="history-item-stats">

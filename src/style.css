@@ -1685,6 +1685,23 @@ h3 {
   color: #ffc107;
 }
 
+.history-status.manual {
+  background: rgba(100, 108, 255, 0.15);
+  color: #646cff;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 0.75rem;
+}
+
+.source-badge {
+  font-size: 0.7rem;
+  color: #888;
+  background: #2a2a2a;
+  padding: 2px 6px;
+  border-radius: 4px;
+  text-transform: capitalize;
+}
+
 .history-item-stats {
   display: flex;
   gap: 1.5rem;
