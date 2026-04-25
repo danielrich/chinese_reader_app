@@ -443,11 +443,11 @@ fn run_migrations(conn: &Connection) -> Result<()> {
     // Migration: add is_manual_log to reading_sessions
     let has_manual_log: bool = conn
         .query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('reading_sessions') WHERE name = 'is_manual_log'",
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('reading_sessions') WHERE name = 'is_manual_log'",
             [],
-            |row| row.get::<_, i64>(0),
+            |row| row.get(0),
         )
-        .unwrap_or(0) > 0;
+        .unwrap_or(false);
 
     if !has_manual_log {
         conn.execute_batch(
@@ -458,11 +458,11 @@ fn run_migrations(conn: &Connection) -> Result<()> {
     // Migration: add source to reading_sessions
     let has_source: bool = conn
         .query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('reading_sessions') WHERE name = 'source'",
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('reading_sessions') WHERE name = 'source'",
             [],
-            |row| row.get::<_, i64>(0),
+            |row| row.get(0),
         )
-        .unwrap_or(0) > 0;
+        .unwrap_or(false);
 
     if !has_source {
         conn.execute_batch(
