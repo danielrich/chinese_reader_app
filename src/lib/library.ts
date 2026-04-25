@@ -432,6 +432,13 @@ export async function migrateLargeTexts(shelfId?: number): Promise<MigrateLargeT
   return invoke<MigrateLargeTextsResult>("migrate_large_texts", { shelfId });
 }
 
+/**
+ * Search texts by query string (title, author, or content)
+ */
+export async function searchTexts(query: string): Promise<TextSummary[]> {
+  return invoke<TextSummary[]>("search_texts", { query });
+}
+
 // =============================================================================
 // Analysis API
 // =============================================================================

@@ -45,6 +45,10 @@ export interface ReadingSession {
   text_known_char_percentage: number | null;
   /** Session creation timestamp */
   created_at: string;
+  /** Whether this session was manually logged (offline) */
+  is_manual_log: boolean;
+  /** Source identifier for manually logged sessions */
+  source: string | null;
 }
 
 /** A data point for speed correlation graphs */
@@ -121,6 +125,18 @@ export interface ReadingStreak {
   read_today: boolean;
   /** Date of the last reading session (YYYY-MM-DD) */
   last_reading_date: string | null;
+}
+
+/** Input for logging an offline reading session */
+export interface ManualLogInput {
+  /** Text IDs read in this session */
+  text_ids: number[];
+  /** When the session was finished (ISO 8601) */
+  finished_at: string;
+  /** Total duration of the session in seconds */
+  total_duration_seconds: number;
+  /** Source identifier for this offline session */
+  source: string | null;
 }
 
 // =============================================================================
@@ -222,6 +238,13 @@ export async function getDailyReadingVolume(days: number): Promise<DailyReadingV
  */
 export async function getReadingStreak(): Promise<ReadingStreak> {
   return invoke<ReadingStreak>("get_reading_streak");
+}
+
+/**
+ * Log an offline reading session for one or more texts
+ */
+export async function logOfflineRead(input: ManualLogInput): Promise<ReadingSession[]> {
+  return invoke<ReadingSession[]>("log_offline_read", { input });
 }
 
 // =============================================================================
