@@ -282,6 +282,8 @@ CREATE TABLE IF NOT EXISTS reading_sessions (
     auto_marked_characters INTEGER NOT NULL DEFAULT 0,
     auto_marked_words INTEGER NOT NULL DEFAULT 0,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    is_manual_log INTEGER NOT NULL DEFAULT 0,
+    source TEXT,
     FOREIGN KEY (text_id) REFERENCES texts(id) ON DELETE CASCADE
 );
 
@@ -438,6 +440,36 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // Migration: add is_manual_log to reading_sessions
+    let has_manual_log: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('reading_sessions') WHERE name = 'is_manual_log'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0) > 0;
+
+    if !has_manual_log {
+        conn.execute_batch(
+            "ALTER TABLE reading_sessions ADD COLUMN is_manual_log INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+
+    // Migration: add source to reading_sessions
+    let has_source: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('reading_sessions') WHERE name = 'source'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0) > 0;
+
+    if !has_source {
+        conn.execute_batch(
+            "ALTER TABLE reading_sessions ADD COLUMN source TEXT;",
+        )?;
+    }
+
     Ok(())
 }
 
@@ -478,6 +510,45 @@ pub fn set_metadata(conn: &Connection, key: &str, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_database(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn test_reading_sessions_has_manual_log_columns() {
+        let conn = test_db();
+        // Satisfy FK chain: shelves -> texts -> reading_sessions
+        conn.execute(
+            "INSERT INTO shelves (name) VALUES ('Test Shelf')",
+            [],
+        ).unwrap();
+        let shelf_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO texts (shelf_id, title, content, character_count) VALUES (?1, 'Test Text', 'content', 7)",
+            [shelf_id],
+        ).unwrap();
+        let text_id = conn.last_insert_rowid();
+
+        // Insert a row using the new columns — will fail if columns don't exist
+        conn.execute(
+            "INSERT INTO reading_sessions
+             (text_id, started_at, character_count, is_manual_log, source)
+             VALUES (?1, '2026-01-01T00:00:00Z', 100, 1, 'physical_book')",
+            [text_id],
+        ).unwrap();
+
+        let (is_manual, source): (i64, String) = conn.query_row(
+            "SELECT is_manual_log, source FROM reading_sessions WHERE rowid = last_insert_rowid()",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+
+        assert_eq!(is_manual, 1);
+        assert_eq!(source, "physical_book");
+    }
 
     #[test]
     fn test_schema_creation() {
