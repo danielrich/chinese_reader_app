@@ -37,6 +37,8 @@ export interface ShelfTree {
   children: ShelfTree[];
   /** Number of texts in this shelf */
   text_count: number;
+  /** Number of unread texts in this shelf */
+  unread_count: number;
 }
 
 /** A text stored in a shelf */

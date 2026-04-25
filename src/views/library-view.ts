@@ -88,7 +88,11 @@ function renderShelfNodes(nodes: library.ShelfTree[], depth: number): string {
           <div class="shelf-item ${isSelected ? "selected" : ""}" data-shelf-id="${node.shelf.id}">
             ${hasChildren ? '<span class="shelf-toggle">▶</span>' : '<span class="shelf-toggle-placeholder"></span>'}
             <span class="shelf-name">${escapeHtml(node.shelf.name)}</span>
-            <span class="shelf-count">${node.text_count}</span>
+            <span class="shelf-count">${
+              node.unread_count > 0
+                ? `${node.text_count}<span class="shelf-count-sep">/</span><span class="shelf-unread">${node.unread_count}</span>`
+                : node.text_count
+            }</span>
           </div>
           ${hasChildren ? `<div class="shelf-children">${renderShelfNodes(node.children, depth + 1)}</div>` : ""}
         </div>

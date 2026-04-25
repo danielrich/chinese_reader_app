@@ -506,6 +506,16 @@ h3 {
   border-radius: 4px;
 }
 
+.shelf-count-sep {
+  color: #3a3a3a;
+  margin: 0 1px;
+}
+
+.shelf-unread {
+  color: #f59e0b;
+  font-weight: 600;
+}
+
 .library-content {
   flex: 1;
   min-width: 0;
