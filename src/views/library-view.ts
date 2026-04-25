@@ -1812,6 +1812,8 @@ async function showOfflineLogModal() {
     updateSaveLabel();
   });
 
+  const outsideClickAbort = new AbortController();
+
   document.addEventListener(
     "click",
     (e) => {
@@ -1819,8 +1821,16 @@ async function showOfflineLogModal() {
         resultsEl.classList.remove("open");
       }
     },
-    { once: false }
+    { signal: outsideClickAbort.signal }
   );
+
+  const removalObserver = new MutationObserver(() => {
+    if (!document.contains(modal)) {
+      outsideClickAbort.abort();
+      removalObserver.disconnect();
+    }
+  });
+  removalObserver.observe(document.body, { childList: true });
 
   const saveBtn = modal.querySelector("#offline-save-btn") as HTMLButtonElement;
   saveBtn.addEventListener("click", async () => {
