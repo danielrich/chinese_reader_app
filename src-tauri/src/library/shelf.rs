@@ -128,6 +128,77 @@ fn get_text_count(conn: &Connection, shelf_id: i64) -> Result<i64> {
     Ok(count)
 }
 
+/// Returns unread text counts for the given shelf IDs in a single query.
+/// A text is "unread" if it has no completed reading session (is_complete = 1).
+pub fn get_unread_counts(
+    conn: &Connection,
+    shelf_ids: &[i64],
+) -> Result<std::collections::HashMap<i64, i64>> {
+    if shelf_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let placeholders = shelf_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT t.shelf_id, COUNT(*) as unread
+         FROM texts t
+         WHERE t.shelf_id IN ({})
+           AND NOT EXISTS (
+               SELECT 1 FROM reading_sessions rs
+               WHERE rs.text_id = t.id AND rs.is_complete = 1
+           )
+         GROUP BY t.shelf_id",
+        placeholders
+    );
+
+    let params: Vec<&dyn rusqlite::ToSql> = shelf_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::ToSql)
+        .collect();
+
+    let mut stmt = conn.prepare(&sql)?;
+    let mut map = std::collections::HashMap::new();
+
+    // Initialise all shelves to 0 so shelves with no unread still appear
+    for &id in shelf_ids {
+        map.insert(id, 0i64);
+    }
+
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+    })?;
+
+    for row in rows {
+        let (shelf_id, count) = row?;
+        map.insert(shelf_id, count);
+    }
+
+    Ok(map)
+}
+
+fn collect_shelf_ids(trees: &[ShelfTree]) -> Vec<i64> {
+    let mut ids = Vec::new();
+    for tree in trees {
+        ids.push(tree.shelf.id);
+        ids.extend(collect_shelf_ids(&tree.children));
+    }
+    ids
+}
+
+/// Recursively sets unread_count on each node.
+/// Parent unread_count = own unread + sum of children's unread_count.
+fn apply_unread_counts(
+    trees: &mut Vec<ShelfTree>,
+    counts: &std::collections::HashMap<i64, i64>,
+) {
+    for tree in trees.iter_mut() {
+        apply_unread_counts(&mut tree.children, counts);
+        let own = counts.get(&tree.shelf.id).copied().unwrap_or(0);
+        let children_sum: i64 = tree.children.iter().map(|c| c.unread_count).sum();
+        tree.unread_count = own + children_sum;
+    }
+}
+
 /// Build shelf tree recursively
 fn build_shelf_tree(conn: &Connection, shelf: Shelf) -> Result<ShelfTree> {
     let text_count = get_text_count(conn, shelf.id)?;
@@ -142,17 +213,24 @@ fn build_shelf_tree(conn: &Connection, shelf: Shelf) -> Result<ShelfTree> {
         shelf,
         children,
         text_count,
+        unread_count: 0,
     })
 }
 
 /// Get the complete shelf tree
 pub fn get_shelf_tree(conn: &Connection) -> Result<Vec<ShelfTree>> {
     let root_shelves = list_root_shelves(conn)?;
-
-    root_shelves
+    let mut trees: Vec<ShelfTree> = root_shelves
         .into_iter()
         .map(|shelf| build_shelf_tree(conn, shelf))
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+
+    // Single query for all unread counts, then aggregate in Rust
+    let all_ids = collect_shelf_ids(&trees);
+    let unread_counts = get_unread_counts(conn, &all_ids)?;
+    apply_unread_counts(&mut trees, &unread_counts);
+
+    Ok(trees)
 }
 
 /// Update a shelf
@@ -259,6 +337,49 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_database(&conn).unwrap();
         conn
+    }
+
+    fn setup() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_database(&conn).unwrap();
+        // Create a shelf and two texts, complete a session on one
+        conn.execute("INSERT INTO shelves (id, name, sort_order) VALUES (1, 'Test', 0)", []).unwrap();
+        conn.execute("INSERT INTO texts (id, shelf_id, title, content, character_count) VALUES (1, 1, 'Text A', 'content', 100)", []).unwrap();
+        conn.execute("INSERT INTO texts (id, shelf_id, title, content, character_count) VALUES (2, 1, 'Text B', 'content', 200)", []).unwrap();
+        // Only text 1 has a completed session
+        conn.execute(
+            "INSERT INTO reading_sessions (text_id, started_at, character_count, is_complete)
+             VALUES (1, '2026-01-01T00:00:00Z', 100, 1)",
+            [],
+        ).unwrap();
+        conn
+    }
+
+    #[test]
+    fn test_unread_count_excludes_completed_texts() {
+        let conn = setup();
+        let counts = get_unread_counts(&conn, &[1]).unwrap();
+        // Shelf 1 has 2 texts, 1 completed → 1 unread
+        assert_eq!(counts.get(&1), Some(&1));
+    }
+
+    #[test]
+    fn test_unread_count_zero_when_all_read() {
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO reading_sessions (text_id, started_at, character_count, is_complete)
+             VALUES (2, '2026-01-01T00:00:00Z', 200, 1)",
+            [],
+        ).unwrap();
+        let counts = get_unread_counts(&conn, &[1]).unwrap();
+        assert_eq!(counts.get(&1), Some(&0));
+    }
+
+    #[test]
+    fn test_unread_count_empty_shelf_ids() {
+        let conn = setup();
+        let counts = get_unread_counts(&conn, &[]).unwrap();
+        assert!(counts.is_empty());
     }
 
     #[test]

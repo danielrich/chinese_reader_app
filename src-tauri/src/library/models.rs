@@ -33,6 +33,8 @@ pub struct ShelfTree {
     pub children: Vec<ShelfTree>,
     /// Number of texts directly in this shelf
     pub text_count: i64,
+    /// Number of unread texts in this shelf and all descendant shelves
+    pub unread_count: i64,
 }
 
 /// A text stored in a shelf
