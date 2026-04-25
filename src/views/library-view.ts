@@ -1681,9 +1681,36 @@ function renderLibraryWelcome() {
 // Modals
 // =============================================================================
 
+function buildShelfPathMap(tree: library.ShelfTree[], prefix = ""): Map<number, string> {
+  const map = new Map<number, string>();
+  for (const node of tree) {
+    const path = prefix ? `${prefix} › ${node.shelf.name}` : node.shelf.name;
+    map.set(node.shelf.id, path);
+    for (const [id, childPath] of buildShelfPathMap(node.children, path)) {
+      map.set(id, childPath);
+    }
+  }
+  return map;
+}
+
 async function showOfflineLogModal() {
   const selectedTexts: Map<number, { id: number; title: string; character_count: number }> = new Map();
   let selectedSource: string | null = null;
+
+  // Pre-populate the currently open text
+  if (currentTextId) {
+    try {
+      const currentText = await library.getText(currentTextId);
+      selectedTexts.set(currentTextId, {
+        id: currentTextId,
+        title: currentText.title,
+        character_count: currentText.character_count,
+      });
+    } catch { /* ignore */ }
+  }
+
+  // Build shelf path map for disambiguating search results
+  const shelfPathMap = buildShelfPathMap(shelfTree);
 
   // Default finished_at to now (datetime-local format)
   const now = new Date();
@@ -1792,13 +1819,14 @@ async function showOfflineLogModal() {
       const results = await library.searchTexts(q);
       resultsEl.innerHTML = results
         .filter((r) => !selectedTexts.has(r.id))
-        .map(
-          (r) =>
-            `<div class="text-search-result-item" data-id="${r.id}" data-title="${escapeHtml(r.title)}" data-chars="${r.character_count}">
-              ${escapeHtml(r.title)}
-            </div>`
-        )
-        .join("") || `<div class="text-search-result-item" style="color:#666">No results</div>`;
+        .map((r) => {
+          const shelfPath = shelfPathMap.get(r.shelf_id) || "";
+          return `<div class="text-search-result-item" data-id="${r.id}" data-title="${escapeHtml(r.title)}" data-chars="${r.character_count}">
+            <span class="result-title">${escapeHtml(r.title)}</span>
+            ${shelfPath ? `<span class="result-shelf">${escapeHtml(shelfPath)}</span>` : ""}
+          </div>`;
+        })
+        .join("") || `<div class="text-search-result-item" style="color:var(--muted)">No results</div>`;
       resultsEl.classList.add("open");
     }, 250);
   });
