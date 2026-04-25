@@ -277,6 +277,33 @@ pub fn get_text(conn: &Connection, id: i64) -> Result<Option<Text>> {
     }
 }
 
+/// Search texts across all shelves by title substring. Returns up to 50 results.
+pub fn search_texts(conn: &Connection, query: &str) -> Result<Vec<TextSummary>> {
+    let pattern = format!("%{}%", query);
+    let mut stmt = conn.prepare(
+        "SELECT t.id, t.shelf_id, t.title, t.author, t.character_count, t.created_at,
+                EXISTS(SELECT 1 FROM text_analyses WHERE text_id = t.id) as has_analysis
+         FROM texts t
+         WHERE t.title LIKE ?1
+         ORDER BY t.title
+         LIMIT 50",
+    )?;
+
+    let rows = stmt.query_map([&pattern], |row| {
+        Ok(TextSummary {
+            id: row.get(0)?,
+            shelf_id: row.get(1)?,
+            title: row.get(2)?,
+            author: row.get(3)?,
+            character_count: row.get(4)?,
+            created_at: row.get(5)?,
+            has_analysis: row.get(6)?,
+        })
+    })?;
+
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+}
+
 /// List texts in a shelf (summaries only, without full content)
 pub fn list_texts_in_shelf(conn: &Connection, shelf_id: i64) -> Result<Vec<TextSummary>> {
     let mut stmt = conn.prepare(
@@ -564,5 +591,18 @@ mod tests {
         assert_eq!(count_cjk_characters("Hello 世界!"), 2);
         assert_eq!(count_cjk_characters("这是中文测试"), 6);
         assert_eq!(count_cjk_characters("No Chinese"), 0);
+    }
+
+    #[test]
+    fn test_search_texts_by_title() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_database(&conn).unwrap();
+        conn.execute("INSERT INTO shelves (id, name, sort_order) VALUES (1, 'S', 0)", []).unwrap();
+        conn.execute("INSERT INTO texts (shelf_id, title, content, character_count) VALUES (1, '復活節講話', 'x', 50)", []).unwrap();
+        conn.execute("INSERT INTO texts (shelf_id, title, content, character_count) VALUES (1, '信心與希望', 'x', 60)", []).unwrap();
+
+        let results = search_texts(&conn, "復活").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "復活節講話");
     }
 }

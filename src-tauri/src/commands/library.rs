@@ -161,6 +161,16 @@ pub fn get_text(state: State<AppState>, id: i64) -> CommandResult<Text> {
         .ok_or_else(|| CommandError::NotFound(format!("Text with id {} not found", id)))
 }
 
+/// Search texts across all shelves by title substring
+#[tauri::command]
+pub fn search_texts(
+    state: State<AppState>,
+    query: String,
+) -> CommandResult<Vec<TextSummary>> {
+    let conn = state.db.lock().map_err(|e| CommandError::Database(e.to_string()))?;
+    library::text::search_texts(&conn, &query).map_err(|e| CommandError::Database(e.to_string()))
+}
+
 /// List texts in a shelf
 #[tauri::command]
 pub fn list_texts_in_shelf(state: State<AppState>, shelf_id: i64) -> CommandResult<Vec<TextSummary>> {

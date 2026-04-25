@@ -89,6 +89,7 @@ pub fn run() {
             commands::create_text,
             commands::get_text,
             commands::list_texts_in_shelf,
+            commands::search_texts,
             commands::update_text,
             commands::delete_text,
             commands::import_text_file,
