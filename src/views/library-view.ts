@@ -1,7 +1,7 @@
 import * as dictionary from "../lib/dictionary";
 import * as library from "../lib/library";
 import * as speed from "../lib/speed";
-import { confirm } from "@tauri-apps/plugin-dialog";
+import { confirm } from "../lib/api";
 import {
   escapeHtml,
   createModal,

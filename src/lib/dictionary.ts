@@ -5,7 +5,7 @@
  * with the dictionary backend via Tauri commands.
  */
 
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./api";
 
 // =============================================================================
 // Types

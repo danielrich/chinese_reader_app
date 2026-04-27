@@ -19,6 +19,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 name = "import"
 path = "src/bin/import.rs"
 
+[[bin]]
+name = "server"
+path = "src/bin/server.rs"
+
 [build-dependencies]
 tauri-build = { version = "2.5.3", features = [] }
 
@@ -32,6 +36,8 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 thiserror = "1.0"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json"] }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["fs", "cors"] }
 flate2 = "1.0"
 directories = "5.0"
 chrono = { version = "0.4", features = ["serde"] }
