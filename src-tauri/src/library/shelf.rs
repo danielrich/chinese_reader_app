@@ -199,9 +199,10 @@ fn apply_unread_counts(
     }
 }
 
-/// Build shelf tree recursively
+/// Build shelf tree recursively. text_count is rolled up: parent count
+/// includes all descendants' texts, mirroring how unread_count rolls up.
 fn build_shelf_tree(conn: &Connection, shelf: Shelf) -> Result<ShelfTree> {
-    let text_count = get_text_count(conn, shelf.id)?;
+    let own_text_count = get_text_count(conn, shelf.id)?;
     let children_shelves = list_child_shelves(conn, shelf.id)?;
 
     let children: Vec<ShelfTree> = children_shelves
@@ -209,10 +210,12 @@ fn build_shelf_tree(conn: &Connection, shelf: Shelf) -> Result<ShelfTree> {
         .map(|child| build_shelf_tree(conn, child))
         .collect::<Result<Vec<_>>>()?;
 
+    let children_text_count: i64 = children.iter().map(|c| c.text_count).sum();
+
     Ok(ShelfTree {
         shelf,
         children,
-        text_count,
+        text_count: own_text_count + children_text_count,
         unread_count: 0,
     })
 }

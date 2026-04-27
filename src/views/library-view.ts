@@ -32,6 +32,24 @@ let currentSort: library.FrequencySort = "text_frequency";
 export function setupLibraryView() {
   const addShelfBtn = document.getElementById("add-shelf-btn");
   addShelfBtn?.addEventListener("click", showAddShelfModal);
+
+  const drawerToggle = document.getElementById("shelf-drawer-toggle");
+  const drawerClose = document.getElementById("shelf-drawer-close");
+  const drawerBackdrop = document.getElementById("shelf-drawer-backdrop");
+
+  drawerToggle?.addEventListener("click", openShelfDrawer);
+  drawerClose?.addEventListener("click", closeShelfDrawer);
+  drawerBackdrop?.addEventListener("click", closeShelfDrawer);
+}
+
+function openShelfDrawer() {
+  document.getElementById("shelf-sidebar")?.classList.add("open");
+  document.getElementById("shelf-drawer-backdrop")?.classList.add("visible");
+}
+
+function closeShelfDrawer() {
+  document.getElementById("shelf-sidebar")?.classList.remove("open");
+  document.getElementById("shelf-drawer-backdrop")?.classList.remove("visible");
 }
 
 export async function loadShelfTree() {
@@ -82,13 +100,17 @@ function renderShelfNodes(nodes: library.ShelfTree[], depth: number): string {
     .map((node) => {
       const hasChildren = node.children.length > 0;
       const isSelected = node.shelf.id === selectedShelfId;
+      const textWord = node.text_count === 1 ? "text" : "texts";
+      const countTitle = node.unread_count > 0
+        ? `${node.text_count} ${textWord}, ${node.unread_count} unread`
+        : `${node.text_count} ${textWord}`;
 
       return `
         <div class="shelf-node" data-depth="${depth}">
-          <div class="shelf-item ${isSelected ? "selected" : ""}" data-shelf-id="${node.shelf.id}">
+          <div class="shelf-item ${isSelected ? "selected" : ""}" data-shelf-id="${node.shelf.id}" title="${escapeHtml(node.shelf.name)}">
             ${hasChildren ? '<span class="shelf-toggle">▶</span>' : '<span class="shelf-toggle-placeholder"></span>'}
             <span class="shelf-name">${escapeHtml(node.shelf.name)}</span>
-            <span class="shelf-count">${
+            <span class="shelf-count" title="${countTitle}">${
               node.unread_count > 0
                 ? `${node.text_count}<span class="shelf-count-sep">/</span><span class="shelf-unread">${node.unread_count}</span>`
                 : node.text_count
@@ -108,6 +130,7 @@ async function selectShelf(shelfId: number) {
     item.classList.toggle("selected", parseInt((item as HTMLElement).dataset.shelfId!) === shelfId);
   });
 
+  closeShelfDrawer();
   await loadTextsInShelf(shelfId);
 }
 
@@ -169,8 +192,8 @@ async function loadTextsInShelf(shelfId: number) {
       };
 
       html += `
-        <div class="shelf-analysis">
-          <h3>Shelf Analysis</h3>
+        <details class="shelf-analysis shelf-analysis-details" open>
+          <summary class="shelf-analysis-summary">Shelf Analysis</summary>
           <div class="analysis-summary shelf-stats">
             <div class="stat-card">
               <span class="stat-value">${shelfAnalysis.text_count}</span>
@@ -239,7 +262,7 @@ async function loadTextsInShelf(shelfId: number) {
               </div>
             </div>
           </div>
-        </div>
+        </details>
       `;
     }
 
@@ -341,8 +364,13 @@ async function loadTextsInShelf(shelfId: number) {
       if (content) {
         content.innerHTML = '<p class="dict-sidebar-empty">Click on a word or character to look it up</p>';
       }
+      document.getElementById("shelf-dict-sidebar")?.classList.remove("open");
       mainContainer.querySelectorAll(".freq-item.selected").forEach(el => el.classList.remove("selected"));
     });
+
+    if (window.matchMedia("(max-width: 700px)").matches) {
+      document.querySelector(".shelf-analysis-details")?.removeAttribute("open");
+    }
   } catch (error) {
     mainContainer.innerHTML = `<p class="error">Failed to load texts: ${error}</p>`;
   }
@@ -520,6 +548,7 @@ async function loadTextView(textId: number) {
       if (content) {
         content.innerHTML = '<p class="dict-sidebar-empty">Click on a word or character to look it up</p>';
       }
+      document.getElementById("dict-sidebar")?.classList.remove("open");
       document.querySelectorAll(".text-segment.selected").forEach(el => el.classList.remove("selected"));
     });
   } catch (error) {
@@ -1146,6 +1175,7 @@ async function lookupInSidebar(term: string, termType: "character" | "word") {
   const sidebarContent = document.getElementById("dict-sidebar-content");
   if (!sidebarContent) return;
 
+  document.getElementById("dict-sidebar")?.classList.add("open");
   sidebarContent.innerHTML = '<p class="loading">Looking up...</p>';
 
   try {
@@ -1165,6 +1195,7 @@ async function lookupInShelfSidebar(term: string, termType: "character" | "word"
   const sidebarContent = document.getElementById("shelf-dict-sidebar-content");
   if (!sidebarContent) return;
 
+  document.getElementById("shelf-dict-sidebar")?.classList.add("open");
   sidebarContent.innerHTML = '<p class="loading">Looking up...</p>';
 
   try {

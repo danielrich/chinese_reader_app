@@ -393,9 +393,9 @@ h3 {
 }
 
 .shelf-sidebar {
-  width: 300px;
+  width: 340px;
   min-width: 200px;
-  max-width: 500px;
+  max-width: 800px;
   flex-shrink: 0;
   background: #1a1a1a;
   border-radius: 8px;
@@ -494,8 +494,11 @@ h3 {
 .shelf-name {
   flex: 1;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  word-break: break-word;
+  line-height: 1.3;
 }
 
 .shelf-count {
@@ -509,6 +512,215 @@ h3 {
 .shelf-count-sep {
   color: #3a3a3a;
   margin: 0 1px;
+}
+
+/* Sidebar header actions */
+.sidebar-header-actions {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.shelf-drawer-close-btn {
+  display: none;
+}
+
+/* Count legend below sidebar header */
+.shelf-count-legend {
+  font-size: 0.7rem;
+  color: #777;
+  padding: 0.4rem 1rem 0.2rem;
+  letter-spacing: 0.02em;
+}
+
+/* Reduce indent step past depth 3 to leave more room for deep names */
+.shelf-node[data-depth="4"] { --depth: 3.5; }
+.shelf-node[data-depth="5"] { --depth: 4; }
+.shelf-node[data-depth="6"] { --depth: 4.5; }
+.shelf-node[data-depth="7"] { --depth: 5; }
+.shelf-node[data-depth="8"] { --depth: 5.5; }
+
+/* Mobile drawer trigger + backdrop (hidden on desktop) */
+.shelf-drawer-toggle {
+  display: none;
+}
+
+.shelf-drawer-backdrop {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  z-index: 99;
+}
+
+.shelf-drawer-backdrop.visible {
+  display: block;
+}
+
+@media (max-width: 700px) {
+  #app {
+    padding: 0.75rem 0.5rem;
+  }
+
+  .library-layout {
+    display: block;
+    min-height: auto;
+  }
+
+  .shelf-drawer-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 0.9rem;
+    background: #2a2a2a;
+    color: #fff;
+    border: 1px solid #444;
+    border-radius: 6px;
+    cursor: pointer;
+    margin-bottom: 0.75rem;
+    font-size: 0.95rem;
+  }
+
+  .shelf-drawer-toggle:hover {
+    background: #333;
+  }
+
+  .shelf-drawer-close-btn {
+    display: flex;
+  }
+
+  .shelf-sidebar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: min(85%, 360px);
+    max-width: none;
+    height: 100vh;
+    transform: translateX(-100%);
+    transition: transform 0.22s ease;
+    z-index: 100;
+    border-radius: 0 8px 8px 0;
+    resize: none;
+  }
+
+  .shelf-sidebar.open {
+    transform: translateX(0);
+    box-shadow: 4px 0 24px rgba(0, 0, 0, 0.5);
+  }
+
+  .shelf-tree {
+    max-height: none;
+  }
+
+  .library-content {
+    width: 100%;
+  }
+
+  /* Stack shelf-main and dict-sidebar vertically on mobile */
+  .shelf-view-layout.has-analysis,
+  .text-view-layout {
+    display: block;
+  }
+
+  /* Dict sidebar becomes a bottom-sheet drawer on mobile */
+  .shelf-view-layout .dict-sidebar,
+  .text-view-layout .dict-sidebar,
+  #dict-sidebar,
+  #shelf-dict-sidebar {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    width: auto;
+    max-width: none;
+    max-height: 70vh;
+    transform: translateY(100%);
+    transition: transform 0.22s ease;
+    z-index: 110;
+    border-radius: 12px 12px 0 0;
+    box-shadow: 0 -4px 24px rgba(0, 0, 0, 0.5);
+    top: auto;
+  }
+
+  .shelf-view-layout .dict-sidebar.open,
+  .text-view-layout .dict-sidebar.open,
+  #dict-sidebar.open,
+  #shelf-dict-sidebar.open {
+    transform: translateY(0);
+  }
+
+  /* Reading content reclaims width and gets larger text on phones */
+  .text-content,
+  .text-content-interactive {
+    padding: 0.75rem;
+    font-size: 1.25rem;
+    max-height: calc(100vh - 200px);
+  }
+
+  .text-content-interactive {
+    line-height: 2;
+  }
+
+  .text-segment {
+    padding: 0.15rem 0.05rem;
+  }
+
+  /* Tighter shelf-analysis on mobile (when expanded) */
+  .shelf-analysis {
+    padding: 0.75rem;
+  }
+
+  .shelf-analysis-summary {
+    cursor: pointer;
+    padding: 0.5rem 0;
+    font-weight: 600;
+    color: #ccc;
+    user-select: none;
+  }
+
+  .shelf-stats {
+    grid-template-columns: repeat(2, 1fr) !important;
+  }
+
+  /* Shelf header buttons wrap instead of overflowing */
+  .shelf-actions {
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+
+  .shelf-actions .btn-primary,
+  .shelf-actions .btn-secondary,
+  .shelf-actions .btn-danger {
+    font-size: 0.85rem;
+    padding: 0.4rem 0.7rem;
+  }
+}
+
+/* Make <details> summary look reasonable on desktop too */
+.shelf-analysis-details > summary {
+  cursor: pointer;
+  list-style: none;
+}
+
+.shelf-analysis-details > summary::-webkit-details-marker {
+  display: none;
+}
+
+.shelf-analysis-summary {
+  margin: 0 0 1rem;
+  font-size: 1rem;
+  color: #888;
+}
+
+.shelf-analysis-summary::before {
+  content: "▾ ";
+  display: inline-block;
+  margin-right: 0.25rem;
+  transition: transform 0.15s;
+}
+
+.shelf-analysis-details:not([open]) .shelf-analysis-summary::before {
+  transform: rotate(-90deg);
 }
 
 /* Offline read log modal */
@@ -2700,6 +2912,16 @@ h3 {
 
   .sidebar-header {
     border-bottom-color: #ddd;
+  }
+
+  .shelf-drawer-toggle {
+    background: #e8e8e8;
+    color: #222;
+    border-color: #ccc;
+  }
+
+  .shelf-drawer-toggle:hover {
+    background: #dcdcdc;
   }
 
   .btn-icon {

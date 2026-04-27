@@ -147,12 +147,18 @@ async function initApp() {
       </div>
 
       <div id="library-view" class="view">
+        <button id="shelf-drawer-toggle" class="shelf-drawer-toggle" aria-label="Open shelves">📚 Shelves</button>
+        <div id="shelf-drawer-backdrop" class="shelf-drawer-backdrop"></div>
         <div class="library-layout">
-          <aside class="shelf-sidebar">
+          <aside id="shelf-sidebar" class="shelf-sidebar">
             <div class="sidebar-header">
               <h3>Shelves</h3>
-              <button id="add-shelf-btn" class="btn-icon" title="Add Shelf">+</button>
+              <div class="sidebar-header-actions">
+                <button id="add-shelf-btn" class="btn-icon" title="Add Shelf">+</button>
+                <button id="shelf-drawer-close" class="btn-icon shelf-drawer-close-btn" aria-label="Close shelves" title="Close">×</button>
+              </div>
             </div>
+            <div class="shelf-count-legend">counts: total / unread</div>
             <div id="shelf-tree" class="shelf-tree"></div>
           </aside>
           <main class="library-content">
