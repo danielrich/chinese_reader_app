@@ -1,19 +1,17 @@
 [package]
 name = "chinese-reader"
 version = "0.1.0"
-description = "A Chinese reading assistant for vocabulary tracking and comprehension analysis"
+description = "Chinese reading assistant: HTTP server backend for vocabulary tracking and comprehension analysis"
 authors = ["you"]
 license = "MIT"
 repository = ""
 edition = "2021"
 rust-version = "1.77.2"
-default-run = "chinese-reader"
-
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+default-run = "server"
 
 [lib]
 name = "chinese_reader_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [[bin]]
 name = "import"
@@ -23,15 +21,10 @@ path = "src/bin/import.rs"
 name = "server"
 path = "src/bin/server.rs"
 
-[build-dependencies]
-tauri-build = { version = "2.5.3", features = [] }
-
 [dependencies]
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
-tauri = { version = "2.9.5", features = [] }
-tauri-plugin-log = "2"
 rusqlite = { version = "0.31", features = ["bundled"] }
 thiserror = "1.0"
 tokio = { version = "1", features = ["full"] }
@@ -43,4 +36,3 @@ directories = "5.0"
 chrono = { version = "0.4", features = ["serde"] }
 jieba-rs = "0.7"
 hanconv = "0.5"
-tauri-plugin-dialog = "2.6.0"

@@ -1,17 +1,12 @@
 /**
- * Environment-aware API wrappers.
+ * HTTP API wrapper. POSTs to the Linux server's /api/invoke/:command endpoint.
  *
- * In Tauri context (desktop app):   uses @tauri-apps/api/core invoke()
- *                                   and @tauri-apps/plugin-dialog confirm()
- * In browser context (HTTP server): POSTs to /api/invoke/:command
- *                                   and uses window.confirm()
+ * Match the Tauri wire convention by converting camelCase JS arg keys to
+ * snake_case so the Rust dispatch handler finds the fields it expects.
  */
 
 type InvokeArgs = Record<string, unknown>;
 
-// Match Tauri's wire convention: convert camelCase JS arg keys to snake_case
-// for the Rust side. Recurses into plain objects and arrays so nested payloads
-// (e.g. ManualLogInput) are converted too.
 function camelToSnake(key: string): string {
   return key.replace(/[A-Z]/g, (m) => "_" + m.toLowerCase());
 }
@@ -29,11 +24,6 @@ function convertKeys(value: unknown): unknown {
 }
 
 export async function invoke<T>(command: string, args?: InvokeArgs): Promise<T> {
-  if (typeof window !== "undefined" && (window as any).__TAURI__) {
-    const { invoke: tauriInvoke } = await import("@tauri-apps/api/core");
-    return tauriInvoke<T>(command, args);
-  }
-
   const body = convertKeys(args ?? {});
   const response = await fetch(`/api/invoke/${command}`, {
     method: "POST",
@@ -54,9 +44,5 @@ export async function invoke<T>(command: string, args?: InvokeArgs): Promise<T> 
 }
 
 export async function confirm(message: string): Promise<boolean> {
-  if (typeof window !== "undefined" && (window as any).__TAURI__) {
-    const { confirm: tauriConfirm } = await import("@tauri-apps/plugin-dialog");
-    return tauriConfirm(message);
-  }
   return window.confirm(message);
 }
