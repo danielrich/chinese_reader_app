@@ -6,6 +6,8 @@
  */
 
 import { invoke } from "./api";
+import { lookupOffline } from "./vocab-cache";
+import type { VocabCacheEntry } from "./library";
 
 // =============================================================================
 // Types
@@ -184,13 +186,49 @@ export async function lookup(
   query: string,
   options: LookupOptions = {}
 ): Promise<LookupResult> {
-  return invoke<LookupResult>("dictionary_lookup", {
+  try {
+    return await invoke<LookupResult>("dictionary_lookup", {
+      query,
+      includeExamples: options.includeExamples ?? true,
+      includeCharacterInfo: options.includeCharacterInfo ?? true,
+      includeUserDictionaries: options.includeUserDictionaries ?? true,
+      sources: options.sources ?? [],
+    });
+  } catch (err) {
+    // Network/server failure — try the local IndexedDB cache
+    const cached = await lookupOffline(query);
+    if (cached) {
+      return buildOfflineLookupResult(query, cached);
+    }
+    throw err;
+  }
+}
+
+function buildOfflineLookupResult(query: string, cached: VocabCacheEntry): LookupResult {
+  const entry: DictionaryEntry = {
+    id: 0,
+    traditional: cached.term,
+    simplified: cached.term,
+    pinyin: cached.pinyin,
+    pinyin_display: cached.pinyin,
+    zhuyin: null,
+    definitions: cached.definitions.map((text) => ({
+      text,
+      part_of_speech: null,
+      language: "en",
+    })),
+    examples: [],
+    source: cached.source as DictionarySource,
+    frequency_rank: null,
+    hsk_level: null,
+    tocfl_level: null,
+  };
+  return {
     query,
-    includeExamples: options.includeExamples ?? true,
-    includeCharacterInfo: options.includeCharacterInfo ?? true,
-    includeUserDictionaries: options.includeUserDictionaries ?? true,
-    sources: options.sources ?? [],
-  });
+    entries: [entry],
+    character_info: null,
+    user_entries: [],
+  };
 }
 
 /**

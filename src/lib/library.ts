@@ -6,6 +6,7 @@
  */
 
 import { invoke, fetchJson } from "./api";
+import { ingestTextVocabCache } from "./vocab-cache";
 
 // =============================================================================
 // Types
@@ -405,7 +406,12 @@ export interface TextVocabCache {
  * Get the vocab cache for a text (words + characters with definitions)
  */
 export async function getTextVocabCache(textId: number): Promise<TextVocabCache> {
-  return fetchJson<TextVocabCache>(`/api/texts/${textId}/vocab-cache`);
+  const cache = await fetchJson<TextVocabCache>(`/api/texts/${textId}/vocab-cache`);
+  // Fire-and-forget: persist for offline lookup
+  ingestTextVocabCache(cache).catch((err) =>
+    console.warn("ingest vocab-cache failed:", err),
+  );
+  return cache;
 }
 
 /**

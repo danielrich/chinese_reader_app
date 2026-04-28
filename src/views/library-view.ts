@@ -897,6 +897,10 @@ async function lookupSelectedText(selectedText: string) {
 
     await renderSidebarResultsForSelection(result, selectedText, termType);
   } catch (error) {
+    if (!navigator.onLine) {
+      sidebarContent.innerHTML = `<p class="dict-sidebar-empty">"${escapeHtml(selectedText)}" is not available offline. Reconnect to look it up.</p>`;
+      return;
+    }
     sidebarContent.innerHTML = `<p class="error">Lookup failed: ${error}</p>`;
   }
 }
@@ -1192,6 +1196,10 @@ async function lookupInSidebar(term: string, termType: "character" | "word") {
 
     await renderSidebarResults(result, termType, "dict-sidebar-content");
   } catch (error) {
+    if (!navigator.onLine) {
+      sidebarContent.innerHTML = `<p class="dict-sidebar-empty">"${escapeHtml(term)}" is not available offline. Reconnect to look it up.</p>`;
+      return;
+    }
     sidebarContent.innerHTML = `<p class="error">Lookup failed: ${error}</p>`;
   }
 }
@@ -1212,6 +1220,10 @@ async function lookupInShelfSidebar(term: string, termType: "character" | "word"
 
     await renderSidebarResults(result, termType, "shelf-dict-sidebar-content");
   } catch (error) {
+    if (!navigator.onLine) {
+      sidebarContent.innerHTML = `<p class="dict-sidebar-empty">"${escapeHtml(term)}" is not available offline. Reconnect to look it up.</p>`;
+      return;
+    }
     sidebarContent.innerHTML = `<p class="error">Lookup failed: ${error}</p>`;
   }
 }
