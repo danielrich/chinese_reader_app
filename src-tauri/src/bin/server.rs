@@ -124,7 +124,7 @@ async fn dispatch(
 
 async fn get_text_vocab_cache_handler(
     State(db): State<Db>,
-    axum::extract::Path(id): axum::extract::Path<i64>,
+    Path(id): Path<i64>,
 ) -> Result<Json<Value>, AppError> {
     let result = tokio::task::spawn_blocking(move || {
         let conn = db.lock().map_err(|e| ApiError::Internal(e.to_string()))?;

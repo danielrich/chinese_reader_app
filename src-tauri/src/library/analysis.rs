@@ -989,11 +989,20 @@ pub struct TextVocabCache {
     pub characters: Vec<VocabCacheEntry>,
 }
 
-/// A single term's dictionary data for the vocab cache.
+/// A single term's dictionary data for the offline vocab cache.
+///
+/// One entry per `traditional` form. If the term appears in multiple sources
+/// (e.g. cc_cedict + moe_dict), all definitions are merged into the single
+/// `definitions` vec; `source` reflects only the lexicographically-first
+/// source row (intentional — offline UX prefers a single combined view).
+///
+/// Lookup is keyed on `traditional` only. Users who type a `simplified`
+/// form will miss offline; this is acceptable for a traditional-corpus
+/// reader.
 #[derive(Debug, serde::Serialize)]
 pub struct VocabCacheEntry {
     pub term: String,
-    pub pinyin: Option<String>,
+    pub pinyin: String,
     pub definitions: Vec<String>,
     pub source: String,
 }
@@ -1057,7 +1066,7 @@ fn build_vocab_entries(conn: &Connection, terms: &[String]) -> Result<Vec<VocabC
         let (term, pinyin, definition, source) = row?;
         let entry = grouped.entry(term.clone()).or_insert_with(|| VocabCacheEntry {
             term: term.clone(),
-            pinyin: Some(pinyin.clone()),
+            pinyin: pinyin.clone(),
             definitions: Vec::new(),
             source: source.clone(),
         });
