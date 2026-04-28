@@ -84,6 +84,7 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(health))
         .route("/api/invoke/{command}", post(dispatch))
+        .route("/api/texts/{id}/vocab-cache", get(get_text_vocab_cache_handler))
         .fallback_service(serve_static)
         .with_state(db)
         .layer(cors);
@@ -114,6 +115,21 @@ async fn dispatch(
     let result = tokio::task::spawn_blocking(move || {
         let conn = db.lock().map_err(|e| ApiError::Internal(e.to_string()))?;
         dispatch_sync(&conn, &command, &body)
+    })
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))??;
+
+    Ok(Json(result))
+}
+
+async fn get_text_vocab_cache_handler(
+    State(db): State<Db>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> Result<Json<Value>, AppError> {
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = db.lock().map_err(|e| ApiError::Internal(e.to_string()))?;
+        let cache = library::analysis::get_text_vocab_cache(&conn, id).map_err(db_err)?;
+        serialize(cache)
     })
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))??;

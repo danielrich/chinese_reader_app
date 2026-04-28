@@ -981,6 +981,93 @@ pub fn get_character_context(
     get_character_context_from_shelves(conn, &all_shelf_ids, character, max_snippets)
 }
 
+/// Vocabulary cache for a single text: every dictionary entry needed for offline lookup.
+#[derive(Debug, serde::Serialize)]
+pub struct TextVocabCache {
+    pub text_id: i64,
+    pub words: Vec<VocabCacheEntry>,
+    pub characters: Vec<VocabCacheEntry>,
+}
+
+/// A single term's dictionary data for the vocab cache.
+#[derive(Debug, serde::Serialize)]
+pub struct VocabCacheEntry {
+    pub term: String,
+    pub pinyin: Option<String>,
+    pub definitions: Vec<String>,
+    pub source: String,
+}
+
+/// Build the per-text vocabulary cache: every distinct word and character
+/// that appears in the given text, with all dictionary entries currently
+/// in the DB. This is what the PWA caches client-side for offline lookups.
+pub fn get_text_vocab_cache(conn: &Connection, text_id: i64) -> Result<TextVocabCache> {
+    // Distinct words used in this text
+    let mut word_stmt = conn.prepare(
+        "SELECT DISTINCT word FROM text_word_freq WHERE text_id = ?",
+    )?;
+    let words_in_text: Vec<String> = word_stmt
+        .query_map([text_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    // Distinct characters used in this text
+    let mut char_stmt = conn.prepare(
+        "SELECT DISTINCT character FROM text_character_freq WHERE text_id = ?",
+    )?;
+    let chars_in_text: Vec<String> = char_stmt
+        .query_map([text_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let words = build_vocab_entries(conn, &words_in_text)?;
+    let characters = build_vocab_entries(conn, &chars_in_text)?;
+
+    Ok(TextVocabCache { text_id, words, characters })
+}
+
+fn build_vocab_entries(conn: &Connection, terms: &[String]) -> Result<Vec<VocabCacheEntry>> {
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = terms.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    // Join dictionary_entries with definitions (separate table per schema)
+    let sql = format!(
+        "SELECT de.traditional, de.pinyin, d.text, de.source
+         FROM dictionary_entries de
+         JOIN definitions d ON d.entry_id = de.id
+         WHERE de.traditional IN ({})
+         ORDER BY de.traditional, de.source, d.sort_order",
+        placeholders,
+    );
+    let params: Vec<&dyn rusqlite::ToSql> =
+        terms.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        Ok((
+            row.get::<_, String>(0)?,        // traditional
+            row.get::<_, String>(1)?,        // pinyin
+            row.get::<_, String>(2)?,        // definition text
+            row.get::<_, String>(3)?,        // source
+        ))
+    })?;
+
+    use std::collections::HashMap;
+    let mut grouped: HashMap<String, VocabCacheEntry> = HashMap::new();
+    for row in rows {
+        let (term, pinyin, definition, source) = row?;
+        let entry = grouped.entry(term.clone()).or_insert_with(|| VocabCacheEntry {
+            term: term.clone(),
+            pinyin: Some(pinyin.clone()),
+            definitions: Vec::new(),
+            source: source.clone(),
+        });
+        entry.definitions.push(definition);
+    }
+
+    // Preserve input ordering
+    Ok(terms.iter().filter_map(|t| grouped.remove(t)).collect())
+}
+
 /// Get context snippets for a character/word from all texts in the library
 pub fn get_word_context_all(
     conn: &Connection,

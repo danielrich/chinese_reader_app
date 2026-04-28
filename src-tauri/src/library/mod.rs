@@ -17,6 +17,7 @@ pub mod shelf;
 pub mod speed;
 pub mod text;
 
+pub use analysis::{TextVocabCache, VocabCacheEntry};
 pub use error::{LibraryError, Result};
 pub use models::*;
 pub use speed::{DailyReadingVolume, ManualLogInput, ReadingSession, ReadingStreak, SpeedDataPoint, SpeedStats};
