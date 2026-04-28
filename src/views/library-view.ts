@@ -388,6 +388,11 @@ async function loadTextView(textId: number) {
   try {
     const text = await library.getText(textId);
 
+    // Pre-warm the per-text vocab cache so the SW caches it for offline lookup
+    library.getTextVocabCache(textId).catch((err) =>
+      console.warn("vocab-cache prefetch failed:", err),
+    );
+
     setActiveSession(await speed.getActiveReadingSession(textId));
 
     const currentTextIndex = currentShelfTexts.findIndex(t => t.id === textId);

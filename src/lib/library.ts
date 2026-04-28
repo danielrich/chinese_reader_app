@@ -5,7 +5,7 @@
  * with the library backend via Tauri commands.
  */
 
-import { invoke } from "./api";
+import { invoke, fetchJson } from "./api";
 
 // =============================================================================
 // Types
@@ -383,7 +383,29 @@ export async function createText(
  * Get a text by ID
  */
 export async function getText(id: number): Promise<Text> {
-  return invoke<Text>("get_text", { id });
+  return fetchJson<Text>(`/api/texts/${id}`);
+}
+
+/** A vocab cache entry for offline dictionary lookup */
+export interface VocabCacheEntry {
+  term: string;
+  pinyin: string;
+  definitions: string[];
+  source: string;
+}
+
+/** Cached vocab data for a text (words + characters) */
+export interface TextVocabCache {
+  text_id: number;
+  words: VocabCacheEntry[];
+  characters: VocabCacheEntry[];
+}
+
+/**
+ * Get the vocab cache for a text (words + characters with definitions)
+ */
+export async function getTextVocabCache(textId: number): Promise<TextVocabCache> {
+  return fetchJson<TextVocabCache>(`/api/texts/${textId}/vocab-cache`);
 }
 
 /**

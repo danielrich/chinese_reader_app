@@ -46,3 +46,11 @@ export async function invoke<T>(command: string, args?: InvokeArgs): Promise<T> 
 export async function confirm(message: string): Promise<boolean> {
   return window.confirm(message);
 }
+
+export async function fetchJson<T>(path: string): Promise<T> {
+  const response = await fetch(path, { method: "GET" });
+  if (!response.ok) {
+    throw new Error(`GET ${path} failed (${response.status})`);
+  }
+  return response.json() as Promise<T>;
+}

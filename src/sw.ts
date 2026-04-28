@@ -8,6 +8,7 @@ declare const self: ServiceWorkerGlobalScope;
 
 const SHELL_CACHE = "shell-v1";
 const API_CACHE = "api-v1";
+const TEXT_CACHE = "text-v1";
 
 const SHELL_FILES = ["/", "/index.html", "/manifest.webmanifest"];
 
@@ -22,7 +23,7 @@ self.addEventListener("activate", (event) => {
     (async () => {
       const keys = await caches.keys();
       await Promise.all(
-        keys.filter((k) => ![SHELL_CACHE, API_CACHE].includes(k)).map((k) => caches.delete(k)),
+        keys.filter((k) => ![SHELL_CACHE, API_CACHE, TEXT_CACHE].includes(k)).map((k) => caches.delete(k)),
       );
       await self.clients.claim();
     })(),
@@ -35,7 +36,13 @@ self.addEventListener("fetch", (event) => {
   // Same-origin only
   if (url.origin !== self.location.origin) return;
 
-  // API: network-first, cache fallback
+  // Text content + vocab-cache: cache-first in dedicated TEXT_CACHE
+  if (url.pathname.startsWith("/api/texts/")) {
+    event.respondWith(cacheFirstText(event.request));
+    return;
+  }
+
+  // Other API routes: network-first, cache fallback
   if (url.pathname.startsWith("/api/")) {
     event.respondWith(networkFirst(event.request));
     return;
@@ -44,6 +51,18 @@ self.addEventListener("fetch", (event) => {
   // Shell + assets: cache-first
   event.respondWith(cacheFirst(event.request));
 });
+
+async function cacheFirstText(request: Request): Promise<Response> {
+  const cache = await caches.open(TEXT_CACHE);
+  const cached = await cache.match(request);
+  if (cached) return cached;
+
+  const response = await fetch(request);
+  if (response.ok && request.method === "GET") {
+    cache.put(request, response.clone());
+  }
+  return response;
+}
 
 async function cacheFirst(request: Request): Promise<Response> {
   const cache = await caches.open(SHELL_CACHE);
