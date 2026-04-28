@@ -6,7 +6,7 @@
  */
 
 import { invoke, fetchJson } from "./api";
-import { ingestTextVocabCache } from "./vocab-cache";
+import { ingestTextVocabCache } from "./idb";
 
 // =============================================================================
 // Types

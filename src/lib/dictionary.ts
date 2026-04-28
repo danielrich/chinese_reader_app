@@ -6,7 +6,7 @@
  */
 
 import { invoke } from "./api";
-import { lookupOffline } from "./vocab-cache";
+import { lookupOffline } from "./idb";
 import type { VocabCacheEntry } from "./library";
 
 // =============================================================================
