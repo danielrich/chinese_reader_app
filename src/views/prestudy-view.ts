@@ -370,17 +370,24 @@ async function loadWordDetail(word: string) {
 
   detailContainer.innerHTML = '<p class="loading">Loading...</p>';
 
+  const wordChars = [...word];
+
   try {
-    const [lookupResult, contextResult] = await Promise.all([
+    const [lookupResult, contextResult, charLookups] = await Promise.all([
       dictionary.lookup(word, {
         includeExamples: true,
         includeCharacterInfo: false,
         includeUserDictionaries: true,
       }),
       library.getWordContext(currentPrestudyShelfId, word, 3),
+      Promise.all(wordChars.map(c => dictionary.lookup(c, {
+        includeExamples: false,
+        includeCharacterInfo: false,
+        includeUserDictionaries: false,
+      }))),
     ]);
 
-    const wordLen = [...word].length;
+    const wordLen = wordChars.length;
 
     let html = `
       <div class="prestudy-char-detail">
@@ -397,6 +404,25 @@ async function loadWordDetail(word: string) {
         </div>
     `;
 
+    // Character-by-character pronunciation (always shown for multi-char words)
+    if (wordChars.length > 1) {
+      html += '<div class="char-pronunciation-row">';
+      for (let i = 0; i < wordChars.length; i++) {
+        const pinyinOptions = charLookups[i].entries
+          .map(e => e.pinyin_display || e.pinyin)
+          .filter((v): v is string => Boolean(v))
+          .filter((v, idx, arr) => arr.indexOf(v) === idx)
+          .slice(0, 3);
+        html += `
+          <div class="char-pronun-tile">
+            <span class="char-pronun-char">${wordChars[i]}</span>
+            <span class="char-pronun-pinyin">${pinyinOptions.length > 0 ? pinyinOptions.join(" / ") : "?"}</span>
+          </div>
+        `;
+      }
+      html += '</div>';
+    }
+
     if (lookupResult.entries.length > 0) {
       html += '<div class="detail-definitions"><h4>Definitions</h4>';
       for (const entry of lookupResult.entries.slice(0, 3)) {
@@ -408,7 +434,6 @@ async function loadWordDetail(word: string) {
           </div>
         `;
       }
-      // Show usage examples from dictionary if available
       const examples = lookupResult.entries.flatMap(e => e.examples).slice(0, 2);
       if (examples.length > 0) {
         html += '<div class="detail-examples"><h4>Dictionary Examples</h4>';
@@ -430,10 +455,10 @@ async function loadWordDetail(word: string) {
     if (contextResult.snippets.length > 0) {
       html += '<div class="detail-context"><h4>Context from Texts</h4>';
       for (const snippet of contextResult.snippets) {
-        const chars = [...snippet.snippet];
-        const before = chars.slice(0, snippet.character_position).join("");
-        const target = chars.slice(snippet.character_position, snippet.character_position + wordLen).join("");
-        const after = chars.slice(snippet.character_position + wordLen).join("");
+        const snippetChars = [...snippet.snippet];
+        const before = snippetChars.slice(0, snippet.character_position).join("");
+        const target = snippetChars.slice(snippet.character_position, snippet.character_position + wordLen).join("");
+        const after = snippetChars.slice(snippet.character_position + wordLen).join("");
         html += `
           <div class="context-snippet">
             <span class="context-text">${escapeHtml(before)}<mark>${escapeHtml(target)}</mark>${escapeHtml(after)}</span>
@@ -446,13 +471,91 @@ async function loadWordDetail(word: string) {
       html += '<p class="empty-message">No context snippets found in this shelf.</p>';
     }
 
+    html += `
+      <div class="word-extra-actions">
+        <button class="btn-dismiss-word" data-word="${escapeHtml(word)}">Not a word (bad segmentation)</button>
+        <div class="custom-def-section">
+          <button class="btn-toggle-custom-def">+ Add custom definition</button>
+          <div class="custom-def-form" style="display:none">
+            <input class="custom-def-pinyin" type="text" placeholder="Pinyin (optional)" />
+            <textarea class="custom-def-text" rows="3" placeholder="Definition — e.g. a massive crustacean native to the Shattered Plains"></textarea>
+            <button class="btn-save-custom-def" data-word="${escapeHtml(word)}">Save & mark known</button>
+          </div>
+        </div>
+      </div>
+    `;
+
     html += '</div>';
     detailContainer.innerHTML = html;
 
     setupDetailMarkButtons(detailContainer, "words");
+    setupWordExtraActions(detailContainer, word);
   } catch (error) {
     detailContainer.innerHTML = `<p class="error">Failed to load word detail: ${error}</p>`;
   }
+}
+
+async function refreshWordListAndAdvance(currentWord: string) {
+  if (!currentPrestudyShelfId) return;
+
+  const list = hideLearningWords && currentPrestudyWordResult
+    ? currentPrestudyWordResult.words_to_study.filter(w => !w.is_learning)
+    : currentPrestudyWordResult?.words_to_study ?? [];
+  const idx = list.findIndex(w => w.word === currentWord);
+  const nextWord = idx >= 0 && idx < list.length - 1 ? list[idx + 1].word : null;
+
+  currentPrestudyWordResult = await library.getPrestudyWords(currentPrestudyShelfId, prestudyTargetRate);
+  const resultsContainer = document.getElementById("prestudy-results");
+  if (resultsContainer && currentPrestudyWordResult) {
+    resultsContainer.innerHTML = renderPrestudyWordResults(currentPrestudyWordResult);
+    setupPrestudyWordHandlers();
+    advanceSelection("words", nextWord);
+  }
+}
+
+function setupWordExtraActions(detailContainer: Element, word: string) {
+  const toggleBtn = detailContainer.querySelector(".btn-toggle-custom-def");
+  const form = detailContainer.querySelector(".custom-def-form") as HTMLElement | null;
+  toggleBtn?.addEventListener("click", () => {
+    if (!form) return;
+    const open = form.style.display !== "none";
+    form.style.display = open ? "none" : "block";
+    if (toggleBtn) (toggleBtn as HTMLElement).textContent = open ? "+ Add custom definition" : "− Add custom definition";
+  });
+
+  const dismissBtn = detailContainer.querySelector(".btn-dismiss-word") as HTMLButtonElement | null;
+  dismissBtn?.addEventListener("click", async () => {
+    if (!dismissBtn) return;
+    dismissBtn.disabled = true;
+    dismissBtn.textContent = "Dismissing…";
+    try {
+      await library.addKnownWord(word, "word", "known");
+      await refreshWordListAndAdvance(word);
+    } catch (e) {
+      dismissBtn.disabled = false;
+      dismissBtn.textContent = "Not a word (bad segmentation)";
+    }
+  });
+
+  const saveBtn = detailContainer.querySelector(".btn-save-custom-def") as HTMLButtonElement | null;
+  saveBtn?.addEventListener("click", async () => {
+    if (!saveBtn || !currentPrestudyShelfId) return;
+    const defText = (detailContainer.querySelector(".custom-def-text") as HTMLTextAreaElement)?.value.trim();
+    const pinyin = (detailContainer.querySelector(".custom-def-pinyin") as HTMLInputElement)?.value.trim() || undefined;
+    if (!defText) {
+      (detailContainer.querySelector(".custom-def-text") as HTMLTextAreaElement)?.focus();
+      return;
+    }
+    saveBtn.disabled = true;
+    saveBtn.textContent = "Saving…";
+    try {
+      await library.defineCustomWord(word, defText, pinyin, undefined, currentPrestudyShelfId, true, "known");
+      await refreshWordListAndAdvance(word);
+    } catch (e) {
+      saveBtn.disabled = false;
+      saveBtn.textContent = "Save & mark known";
+    }
+  });
 }
 
 // =============================================================================

@@ -4057,6 +4057,139 @@ h3 {
   color: #888;
 }
 
+/* Character pronunciation tiles */
+.char-pronunciation-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.char-pronun-tile {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 0.4rem 0.6rem;
+  background: #1e2530;
+  border: 1px solid #333;
+  border-radius: 6px;
+  min-width: 3rem;
+}
+
+.char-pronun-char {
+  font-size: 1.4rem;
+  line-height: 1.2;
+}
+
+.char-pronun-pinyin {
+  font-size: 0.75rem;
+  color: #7ab8f5;
+  margin-top: 0.2rem;
+  text-align: center;
+}
+
+/* Not-a-word dismiss + custom definition form */
+.word-extra-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid #333;
+}
+
+.btn-dismiss-word {
+  align-self: flex-start;
+  padding: 0.35rem 0.75rem;
+  background: none;
+  border: 1px solid #664;
+  border-radius: 4px;
+  color: #b8a060;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.btn-dismiss-word:hover {
+  background: #332200;
+  border-color: #998844;
+}
+
+.btn-dismiss-word:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-toggle-custom-def {
+  align-self: flex-start;
+  padding: 0.25rem 0;
+  background: none;
+  border: none;
+  color: #888;
+  font-size: 0.85rem;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.btn-toggle-custom-def:hover {
+  color: #bbb;
+}
+
+.custom-def-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-top: 0.25rem;
+}
+
+.custom-def-pinyin {
+  padding: 0.4rem 0.6rem;
+  background: #1a1a1a;
+  border: 1px solid #444;
+  border-radius: 4px;
+  color: #e0e0e0;
+  font-size: 0.9rem;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.custom-def-text {
+  padding: 0.4rem 0.6rem;
+  background: #1a1a1a;
+  border: 1px solid #444;
+  border-radius: 4px;
+  color: #e0e0e0;
+  font-size: 0.9rem;
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  font-family: inherit;
+}
+
+.custom-def-pinyin:focus,
+.custom-def-text:focus {
+  outline: none;
+  border-color: #4a9eff;
+}
+
+.btn-save-custom-def {
+  align-self: flex-start;
+  padding: 0.4rem 0.9rem;
+  background: #1a3a5c;
+  border: 1px solid #3a6a9c;
+  border-radius: 4px;
+  color: #7ab8f5;
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+
+.btn-save-custom-def:hover {
+  background: #2a4a7c;
+}
+
+.btn-save-custom-def:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
 .detail-definitions h4,
 .detail-context h4 {
   margin: 0 0 0.5rem;
@@ -4243,6 +4376,53 @@ h3 {
   .context-text mark {
     background: rgba(79, 70, 229, 0.2);
     color: #333;
+  }
+
+  .char-pronun-tile {
+    background: #f0f4f8;
+    border-color: #ccc;
+  }
+
+  .char-pronun-pinyin {
+    color: #3563a0;
+  }
+
+  .btn-dismiss-word {
+    color: #7a6020;
+    border-color: #c8b060;
+  }
+
+  .btn-dismiss-word:hover {
+    background: #fef9e7;
+  }
+
+  .btn-toggle-custom-def {
+    color: #555;
+  }
+
+  .btn-toggle-custom-def:hover {
+    color: #111;
+  }
+
+  .custom-def-pinyin,
+  .custom-def-text {
+    background: #fff;
+    border-color: #ccc;
+    color: #213547;
+  }
+
+  .btn-save-custom-def {
+    background: #dbeafe;
+    border-color: #93c5fd;
+    color: #1e40af;
+  }
+
+  .btn-save-custom-def:hover {
+    background: #bfdbfe;
+  }
+
+  .word-extra-actions {
+    border-top-color: #ddd;
   }
 
   .prestudy-mode-btn {
