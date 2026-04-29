@@ -545,12 +545,31 @@ fn dispatch_sync(conn: &Connection, command: &str, body: &Value) -> Result<Value
             )
         }
 
+        "get_prestudy_words" => {
+            let shelf_id: i64 = field(body, "shelf_id")?;
+            let target_rate: f64 = field(body, "target_rate")?;
+            serialize(
+                library::analysis::get_prestudy_words(conn, shelf_id, target_rate)
+                    .map_err(db_err)?,
+            )
+        }
+
         "get_character_context" => {
             let shelf_id: i64 = field(body, "shelf_id")?;
             let character: String = field(body, "character")?;
             let max_snippets: usize = opt_field(body, "max_snippets").unwrap_or(3);
             serialize(
                 library::analysis::get_character_context(conn, shelf_id, &character, max_snippets)
+                    .map_err(db_err)?,
+            )
+        }
+
+        "get_word_context" => {
+            let shelf_id: i64 = field(body, "shelf_id")?;
+            let word: String = field(body, "word")?;
+            let max_snippets: usize = opt_field(body, "max_snippets").unwrap_or(3);
+            serialize(
+                library::analysis::get_word_context(conn, shelf_id, &word, max_snippets)
                     .map_err(db_err)?,
             )
         }

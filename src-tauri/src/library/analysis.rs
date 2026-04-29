@@ -13,7 +13,8 @@ use super::error::{LibraryError, Result};
 use super::known_words;
 use super::models::{
     AnalysisReport, CharacterContext, CharacterFrequency, ContextSnippet, FrequencySort,
-    PreStudyCharacter, PreStudyResult, ShelfAnalysis, TextAnalysis, TextSegment, WordFrequency,
+    PreStudyCharacter, PreStudyResult, PreStudyWord, PreStudyWordResult,
+    ShelfAnalysis, TextAnalysis, TextSegment, WordFrequency,
 };
 use super::text;
 
@@ -1135,6 +1136,178 @@ pub fn get_word_context_all(
         character: word.to_string(),
         snippets,
     })
+}
+
+/// Word-level pre-study analysis: which words to learn before reading a shelf.
+/// Mirrors get_prestudy_characters but operates on text_word_freq / word_type='word'.
+pub fn get_prestudy_words(
+    conn: &Connection,
+    shelf_id: i64,
+    target_rate: f64,
+) -> Result<PreStudyWordResult> {
+    let vocab = build_vocabulary_sets(conn)?;
+    let all_shelf_ids = get_all_descendant_shelf_ids(conn, shelf_id)?;
+
+    let placeholders: String = all_shelf_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let query = format!("SELECT id FROM texts WHERE shelf_id IN ({})", placeholders);
+    let mut stmt = conn.prepare(&query)?;
+    let text_ids: Vec<i64> = stmt
+        .query_map(rusqlite::params_from_iter(&all_shelf_ids), |row| row.get(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let mut word_freq: HashMap<String, i64> = HashMap::new();
+    let mut total_word_occurrences: i64 = 0;
+
+    for text_id in &text_ids {
+        if get_text_analysis(conn, *text_id).is_err() {
+            analyze_text(conn, *text_id)?;
+        }
+        let mut wstmt = conn.prepare(
+            "SELECT word, frequency FROM text_word_freq WHERE text_id = ?",
+        )?;
+        for row in wstmt.query_map([text_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+            let (word, freq) = row?;
+            *word_freq.entry(word).or_insert(0) += freq;
+            total_word_occurrences += freq;
+        }
+    }
+
+    if total_word_occurrences == 0 {
+        return Ok(PreStudyWordResult {
+            shelf_id,
+            current_known_rate: 100.0,
+            target_rate,
+            needs_prestudy: false,
+            words_to_study: vec![],
+            words_needed: 0,
+            total_word_occurrences: 0,
+        });
+    }
+
+    let known_occ: i64 = word_freq.iter().filter(|(w, _)| vocab.known.contains(*w)).map(|(_, f)| f).sum();
+    let learning_occ: i64 = word_freq.iter().filter(|(w, _)| vocab.learning.contains(*w)).map(|(_, f)| f).sum();
+    let familiar_occ = known_occ + learning_occ;
+    let current_known_rate = (familiar_occ as f64 / total_word_occurrences as f64) * 100.0;
+
+    if current_known_rate >= target_rate {
+        return Ok(PreStudyWordResult {
+            shelf_id,
+            current_known_rate,
+            target_rate,
+            needs_prestudy: false,
+            words_to_study: vec![],
+            words_needed: 0,
+            total_word_occurrences,
+        });
+    }
+
+    let mut words_not_known: Vec<(String, i64, bool)> = word_freq
+        .into_iter()
+        .filter(|(w, _)| !vocab.known.contains(w))
+        .map(|(w, freq)| {
+            let is_learning = vocab.learning.contains(&w);
+            (w, freq, is_learning)
+        })
+        .collect();
+    words_not_known.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let target_occ = (target_rate / 100.0 * total_word_occurrences as f64) as i64;
+    let occ_needed = target_occ - familiar_occ;
+
+    let mut cumulative_added: i64 = 0;
+    let mut words_to_study: Vec<PreStudyWord> = vec![];
+    let mut words_needed: i64 = 0;
+    let mut non_learning_count: i64 = 0;
+
+    for (word, frequency, is_learning) in words_not_known {
+        if !is_learning {
+            cumulative_added += frequency;
+            non_learning_count += 1;
+        }
+        let cumulative_known = familiar_occ + cumulative_added;
+        let cumulative_coverage = (cumulative_known as f64 / total_word_occurrences as f64) * 100.0;
+        let coverage_contribution = (frequency as f64 / total_word_occurrences as f64) * 100.0;
+
+        words_to_study.push(PreStudyWord {
+            word,
+            frequency,
+            coverage_contribution,
+            cumulative_coverage,
+            is_learning,
+        });
+
+        if !is_learning && cumulative_added >= occ_needed && words_needed == 0 {
+            words_needed = non_learning_count;
+        }
+    }
+
+    if words_needed == 0 {
+        words_needed = non_learning_count;
+    }
+
+    Ok(PreStudyWordResult {
+        shelf_id,
+        current_known_rate,
+        target_rate,
+        needs_prestudy: true,
+        words_to_study,
+        words_needed,
+        total_word_occurrences,
+    })
+}
+
+/// Get context snippets for a word from texts in a specific shelf (and its descendants).
+pub fn get_word_context(
+    conn: &Connection,
+    shelf_id: i64,
+    word: &str,
+    max_snippets: usize,
+) -> Result<CharacterContext> {
+    let all_shelf_ids = get_all_descendant_shelf_ids(conn, shelf_id)?;
+
+    let placeholders: String = all_shelf_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let query = format!(
+        "SELECT id, title, content FROM texts WHERE shelf_id IN ({}) ORDER BY title",
+        placeholders
+    );
+    let mut stmt = conn.prepare(&query)?;
+    let texts: Vec<(i64, String, String)> = stmt
+        .query_map(rusqlite::params_from_iter(&all_shelf_ids), |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let mut snippets: Vec<ContextSnippet> = vec![];
+    let context_chars = 15;
+    let word_chars: Vec<char> = word.chars().collect();
+    let word_len = word_chars.len();
+
+    for (text_id, text_title, content) in texts {
+        if snippets.len() >= max_snippets {
+            break;
+        }
+        let chars: Vec<char> = content.chars().collect();
+        for i in 0..chars.len() {
+            if snippets.len() >= max_snippets {
+                break;
+            }
+            if i + word_len <= chars.len() {
+                let slice: String = chars[i..i + word_len].iter().collect();
+                if slice == word {
+                    let start = i.saturating_sub(context_chars);
+                    let end = (i + word_len + context_chars).min(chars.len());
+                    snippets.push(ContextSnippet {
+                        text_id,
+                        text_title: text_title.clone(),
+                        snippet: chars[start..end].iter().collect(),
+                        character_position: i - start,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(CharacterContext { character: word.to_string(), snippets })
 }
 
 fn get_character_context_from_shelves(

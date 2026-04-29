@@ -3684,6 +3684,74 @@ h3 {
   margin-bottom: 0.5rem;
 }
 
+.prestudy-mode-tabs {
+  display: flex;
+  gap: 0.25rem;
+  margin-bottom: 1rem;
+  border-bottom: 1px solid #333;
+  padding-bottom: 0;
+}
+
+.prestudy-mode-btn {
+  padding: 0.4rem 1rem;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: #888;
+  font-size: 0.9rem;
+  cursor: pointer;
+  margin-bottom: -1px;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.prestudy-mode-btn:hover {
+  color: #ccc;
+}
+
+.prestudy-mode-btn.active {
+  color: #e0e0e0;
+  border-bottom-color: #4a9eff;
+}
+
+.prestudy-word-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 0.6rem;
+  border-radius: 4px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: background 0.1s;
+}
+
+.prestudy-word-item:hover {
+  background: #2a2a2a;
+}
+
+.prestudy-word-item.selected {
+  background: #1a3a5c;
+  border-color: #4a9eff;
+}
+
+.prestudy-word-item.priority {
+  border-left: 3px solid #f0a020;
+}
+
+.prestudy-word-item.priority:hover {
+  background: #2a2a1a;
+}
+
+.prestudy-word-item.priority.selected {
+  background: #2a3a1a;
+  border-color: #a0c040;
+}
+
+.prestudy-word-label {
+  font-size: 1rem;
+  min-width: 3rem;
+  display: inline-block;
+}
+
 .prestudy-description {
   color: #888;
   margin-bottom: 1.5rem;
@@ -4175,6 +4243,47 @@ h3 {
   .context-text mark {
     background: rgba(79, 70, 229, 0.2);
     color: #333;
+  }
+
+  .prestudy-mode-btn {
+    color: #666;
+  }
+
+  .prestudy-mode-btn:hover {
+    color: #333;
+  }
+
+  .prestudy-mode-btn.active {
+    color: #111;
+    border-bottom-color: #4a9eff;
+  }
+
+  .prestudy-mode-tabs {
+    border-bottom-color: #ddd;
+  }
+
+  .prestudy-word-item {
+    background: #fff;
+  }
+
+  .prestudy-word-item:hover {
+    background: #f0f0f0;
+  }
+
+  .prestudy-word-item.selected {
+    background: rgba(100, 108, 255, 0.1);
+  }
+
+  .prestudy-word-item.priority {
+    background: #fffbeb;
+  }
+
+  .prestudy-word-item.priority:hover {
+    background: #fef3c7;
+  }
+
+  .prestudy-word-item.priority.selected {
+    background: #fef3c7;
   }
 }
 

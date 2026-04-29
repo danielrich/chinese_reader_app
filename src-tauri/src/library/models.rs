@@ -398,6 +398,34 @@ pub struct PreStudyResult {
     pub total_character_occurrences: i64,
 }
 
+/// A word to study in word-level pre-study
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreStudyWord {
+    /// The word
+    pub word: String,
+    /// Occurrences in the shelf's texts
+    pub frequency: i64,
+    /// Percentage coverage contribution if learned
+    pub coverage_contribution: f64,
+    /// Cumulative coverage after learning this and previous words
+    pub cumulative_coverage: f64,
+    /// Whether this word is in "learning" status
+    pub is_learning: bool,
+}
+
+/// Result of word-level pre-study analysis for a shelf
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreStudyWordResult {
+    pub shelf_id: i64,
+    /// Current known word rate (0-100) by occurrence
+    pub current_known_rate: f64,
+    pub target_rate: f64,
+    pub needs_prestudy: bool,
+    pub words_to_study: Vec<PreStudyWord>,
+    pub words_needed: i64,
+    pub total_word_occurrences: i64,
+}
+
 /// A context snippet showing a character in use
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextSnippet {

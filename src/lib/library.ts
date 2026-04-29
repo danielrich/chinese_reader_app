@@ -271,6 +271,26 @@ export interface PreStudyResult {
   total_character_occurrences: number;
 }
 
+/** A word to study in word-level pre-study */
+export interface PreStudyWord {
+  word: string;
+  frequency: number;
+  coverage_contribution: number;
+  cumulative_coverage: number;
+  is_learning: boolean;
+}
+
+/** Result of word-level pre-study analysis for a shelf */
+export interface PreStudyWordResult {
+  shelf_id: number;
+  current_known_rate: number;
+  target_rate: number;
+  needs_prestudy: boolean;
+  words_to_study: PreStudyWord[];
+  words_needed: number;
+  total_word_occurrences: number;
+}
+
 /** A context snippet showing a character in use */
 export interface ContextSnippet {
   /** Text ID this snippet is from */
@@ -520,6 +540,13 @@ export async function getPrestudy(
   return invoke<PreStudyResult>("get_prestudy_characters", { shelfId, targetRate });
 }
 
+export async function getPrestudyWords(
+  shelfId: number,
+  targetRate: number = 90
+): Promise<PreStudyWordResult> {
+  return invoke<PreStudyWordResult>("get_prestudy_words", { shelfId, targetRate });
+}
+
 /**
  * Get context snippets for a character from texts in a shelf
  */
@@ -529,6 +556,17 @@ export async function getCharacterContext(
   maxSnippets: number = 3
 ): Promise<CharacterContext> {
   return invoke<CharacterContext>("get_character_context", { shelfId, character, maxSnippets });
+}
+
+/**
+ * Get context snippets for a word from texts in a shelf
+ */
+export async function getWordContext(
+  shelfId: number,
+  word: string,
+  maxSnippets: number = 3
+): Promise<CharacterContext> {
+  return invoke<CharacterContext>("get_word_context", { shelfId, word, maxSnippets });
 }
 
 /**
