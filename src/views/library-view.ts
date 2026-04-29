@@ -2196,13 +2196,11 @@ async function cacheShelfForOffline(shelfId: number, directTexts: library.TextSu
       : [];
     const texts = [...directTexts, ...subTexts];
 
-    // Cache one text at a time so we don't contend with user requests
+    // Cache text content one at a time. Vocab-cache is populated on first open;
+    // doing it here would hold SQLite for several seconds per text.
     for (const text of texts) {
       try {
-        await Promise.all([
-          fetch(`/api/texts/${text.id}`),
-          library.getTextVocabCache(text.id),
-        ]);
+        await fetch(`/api/texts/${text.id}`);
       } catch { /* skip failures silently */ }
     }
   } catch { /* ignore — offline or server down */ }
