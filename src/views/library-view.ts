@@ -374,7 +374,7 @@ async function loadTextsInShelf(shelfId: number) {
       document.querySelector(".shelf-analysis-details")?.removeAttribute("open");
     }
 
-    cacheShelfForOffline(shelfId);
+    setTimeout(() => cacheShelfForOffline(shelfId, texts), 2000);
   } catch (error) {
     mainContainer.innerHTML = `<p class="error">Failed to load texts: ${error}</p>`;
   }
@@ -2185,20 +2185,27 @@ async function splitLargeTextsInShelf(shelfId: number) {
   }
 }
 
-function cacheShelfForOffline(shelfId: number) {
+async function cacheShelfForOffline(shelfId: number, directTexts: library.TextSummary[]) {
   if (!shelfTree) return;
 
-  const shelfIds = getShelfAndDescendantIds(shelfTree, shelfId);
+  try {
+    // Collect sub-shelf texts lazily (direct texts already loaded by the caller)
+    const subShelfIds = [...getShelfAndDescendantIds(shelfTree, shelfId)].filter(id => id !== shelfId);
+    const subTexts = subShelfIds.length > 0
+      ? (await Promise.all(subShelfIds.map(id => library.listTextsInShelf(id)))).flat()
+      : [];
+    const texts = [...directTexts, ...subTexts];
 
-  Promise.all([...shelfIds].map(id => library.listTextsInShelf(id)))
-    .then(lists => lists.flat())
-    .then(texts => Promise.all(texts.map(text =>
-      Promise.all([
-        fetch(`/api/texts/${text.id}`),
-        library.getTextVocabCache(text.id),
-      ]).catch(() => { /* ignore individual failures */ })
-    )))
-    .catch(() => { /* ignore — offline or server down */ });
+    // Cache one text at a time so we don't contend with user requests
+    for (const text of texts) {
+      try {
+        await Promise.all([
+          fetch(`/api/texts/${text.id}`),
+          library.getTextVocabCache(text.id),
+        ]);
+      } catch { /* skip failures silently */ }
+    }
+  } catch { /* ignore — offline or server down */ }
 }
 
 async function confirmDeleteText(textId: number) {
