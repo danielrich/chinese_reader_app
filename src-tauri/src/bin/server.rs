@@ -17,11 +17,56 @@ use chinese_reader_lib::{dictionary, library};
 use rusqlite::Connection;
 use serde_json::Value;
 use std::env;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 
-type Db = Arc<Mutex<Connection>>;
+// ── Connection pool ───────────────────────────────────────────────────────────
+
+/// A simple pool of SQLite connections backed by a semaphore.
+/// WAL mode lets readers run in parallel; writers still serialize via SQLite.
+struct DbPool {
+    conns: std::sync::Mutex<Vec<Connection>>,
+    sem: Arc<tokio::sync::Semaphore>,
+}
+
+impl DbPool {
+    fn new(conns: Vec<Connection>) -> Arc<Self> {
+        let n = conns.len();
+        Arc::new(DbPool {
+            conns: std::sync::Mutex::new(conns),
+            sem: Arc::new(tokio::sync::Semaphore::new(n)),
+        })
+    }
+
+    async fn acquire(self: &Arc<Self>) -> PoolConn {
+        let permit = Arc::clone(&self.sem).acquire_owned().await.unwrap();
+        let conn = self.conns.lock().unwrap().pop().unwrap();
+        PoolConn { pool: Arc::clone(self), conn: Some(conn), _permit: permit }
+    }
+}
+
+/// RAII guard: returns the connection to the pool on drop.
+struct PoolConn {
+    pool: Arc<DbPool>,
+    conn: Option<Connection>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl std::ops::Deref for PoolConn {
+    type Target = Connection;
+    fn deref(&self) -> &Connection { self.conn.as_ref().unwrap() }
+}
+
+impl Drop for PoolConn {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            self.pool.conns.lock().unwrap().push(conn);
+        }
+    }
+}
+
+type Db = Arc<DbPool>;
 
 #[tokio::main]
 async fn main() {
@@ -60,18 +105,37 @@ async fn main() {
     };
 
     println!("Database: {:?}", db_path);
-    let conn = dictionary::init_connection(&db_path).unwrap_or_else(|e| {
+
+    // Run schema migrations on the first connection, then build an 8-connection
+    // WAL-mode pool so reads can run in parallel without blocking each other.
+    let first = dictionary::init_connection(&db_path).unwrap_or_else(|e| {
         eprintln!("Failed to initialize database: {}", e);
         std::process::exit(1);
     });
+    first.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=10000;")
+        .unwrap_or_else(|e| eprintln!("Warning: could not enable WAL mode: {}", e));
 
-    match library::analysis::load_user_segmentation_words(&conn) {
+    match library::analysis::load_user_segmentation_words(&first) {
         Ok(count) if count > 0 => println!("Loaded {} user segmentation words", count),
         Ok(_) => {}
         Err(e) => eprintln!("Warning: failed to load segmentation words: {}", e),
     }
 
-    let db: Db = Arc::new(Mutex::new(conn));
+    let mut conns = vec![first];
+    for _ in 1..8 {
+        match Connection::open(&db_path) {
+            Ok(c) => {
+                let _ = c.execute_batch(
+                    "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=10000;",
+                );
+                conns.push(c);
+            }
+            Err(e) => eprintln!("Warning: could not open extra DB connection: {}", e),
+        }
+    }
+    println!("Connection pool: {} connections", conns.len());
+
+    let db: Db = DbPool::new(conns);
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -114,13 +178,10 @@ async fn dispatch(
     Path(command): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, AppError> {
-    let result = tokio::task::spawn_blocking(move || {
-        let conn = db.lock().map_err(|e| ApiError::Internal(e.to_string()))?;
-        dispatch_sync(&conn, &command, &body)
-    })
-    .await
-    .map_err(|e| ApiError::Internal(e.to_string()))??;
-
+    let conn = db.acquire().await;
+    let result = tokio::task::spawn_blocking(move || dispatch_sync(&conn, &command, &body))
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))??;
     Ok(Json(result))
 }
 
@@ -128,8 +189,8 @@ async fn get_text_handler(
     State(db): State<Db>,
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, AppError> {
+    let conn = db.acquire().await;
     let result = tokio::task::spawn_blocking(move || {
-        let conn = db.lock().map_err(|e| ApiError::Internal(e.to_string()))?;
         let text = library::text::get_text(&conn, id)
             .map_err(db_err)?
             .ok_or_else(|| not_found(format!("Text {} not found", id)))?;
@@ -137,7 +198,6 @@ async fn get_text_handler(
     })
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))??;
-
     Ok(Json(result))
 }
 
@@ -145,14 +205,12 @@ async fn get_text_vocab_cache_handler(
     State(db): State<Db>,
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, AppError> {
+    let conn = db.acquire().await;
     let result = tokio::task::spawn_blocking(move || {
-        let conn = db.lock().map_err(|e| ApiError::Internal(e.to_string()))?;
-        let cache = library::analysis::get_text_vocab_cache(&conn, id).map_err(db_err)?;
-        serialize(cache)
+        serialize(library::analysis::get_text_vocab_cache(&conn, id).map_err(db_err)?)
     })
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))??;
-
     Ok(Json(result))
 }
 
@@ -160,8 +218,8 @@ async fn sync_sessions_handler(
     State(db): State<Db>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, AppError> {
+    let conn = db.acquire().await;
     let result = tokio::task::spawn_blocking(move || {
-        let conn = db.lock().map_err(|e| ApiError::Internal(e.to_string()))?;
         let sessions: Vec<library::speed::UploadSession> =
             serde_json::from_value(body.get("sessions").cloned().unwrap_or(Value::Array(vec![])))
                 .map_err(|e| ApiError::BadRequest(format!("invalid sessions: {}", e)))?;
