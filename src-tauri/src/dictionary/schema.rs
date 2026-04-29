@@ -470,6 +470,23 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // Migration: add client_local_id for idempotent offline session upload
+    let has_client_local_id: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('reading_sessions') WHERE name = 'client_local_id'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if !has_client_local_id {
+        conn.execute_batch(
+            "ALTER TABLE reading_sessions ADD COLUMN client_local_id TEXT;
+             CREATE UNIQUE INDEX IF NOT EXISTS idx_rs_client_local_id
+             ON reading_sessions(client_local_id) WHERE client_local_id IS NOT NULL;",
+        )?;
+    }
+
     Ok(())
 }
 

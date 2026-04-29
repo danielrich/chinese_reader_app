@@ -84,6 +84,7 @@ export interface LocalSession {
   started_at: number;       // ms epoch
   finished_at: number | null;
   status: "in_progress" | "completed_pending_upload" | "uploaded";
+  character_count?: number; // stored at start to compute CPM locally
   duration_seconds?: number;
   characters_per_minute?: number;
   known_characters_count?: number;
@@ -145,6 +146,14 @@ export async function getInProgressSessionForText(
       reject(req.error);
     };
   });
+}
+
+export async function deleteSession(localId: string): Promise<void> {
+  const db = await openDb();
+  const tx = db.transaction(STORE_SESSIONS, "readwrite");
+  tx.objectStore(STORE_SESSIONS).delete(localId);
+  await txDone(tx);
+  db.close();
 }
 
 export async function listPendingSessions(): Promise<LocalSession[]> {

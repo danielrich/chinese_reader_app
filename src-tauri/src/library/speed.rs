@@ -6,7 +6,7 @@
 //! - Correlating speed with vocabulary knowledge
 
 use chrono::{DateTime, Duration, Local, NaiveDate, Utc};
-use rusqlite::{params, Connection, Row};
+use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 
 use super::error::{LibraryError, Result};
@@ -699,6 +699,130 @@ pub fn log_offline_read(conn: &Connection, input: ManualLogInput) -> Result<Vec<
         .iter()
         .map(|&id| get_session_by_id(conn, id))
         .collect()
+}
+
+// =============================================================================
+// Offline Session Upload
+// =============================================================================
+
+/// A completed session recorded client-side and uploaded when back online.
+#[derive(Debug, Deserialize)]
+pub struct UploadSession {
+    pub local_id: String,
+    pub text_id: i64,
+    pub started_at_ms: i64,
+    pub finished_at_ms: i64,
+}
+
+/// Insert a client-recorded session. Idempotent on `local_id`.
+/// All snapshot fields (known counts, CPM, etc.) are computed server-side
+/// at upload time — close enough for a short offline window.
+pub fn upload_completed_session(conn: &Connection, s: &UploadSession) -> Result<i64> {
+    // Idempotent: return existing server ID if already uploaded
+    let existing: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM reading_sessions WHERE client_local_id = ?",
+            [&s.local_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(id) = existing {
+        return Ok(id);
+    }
+
+    let (character_count, _): (i64, i64) = conn
+        .query_row(
+            "SELECT character_count, shelf_id FROM texts WHERE id = ?",
+            [s.text_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| LibraryError::TextNotFound(s.text_id))?;
+
+    let duration_seconds = ((s.finished_at_ms - s.started_at_ms) / 1000).max(1);
+    let characters_per_minute = character_count as f64 / (duration_seconds as f64 / 60.0);
+
+    let prior_complete: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM reading_sessions WHERE text_id = ? AND is_complete = 1",
+        [s.text_id],
+        |row| row.get(0),
+    )?;
+    let is_first_read = prior_complete == 0;
+
+    let known_characters_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM known_words WHERE word_type = 'character'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let known_words_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM known_words WHERE word_type = 'word'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let cumulative_characters_read: i64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(character_count), 0) FROM reading_sessions WHERE is_complete = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let text_known_char_percentage: Option<f64> = conn
+        .query_row(
+            r#"
+            SELECT
+                CASE WHEN COALESCE(SUM(frequency), 0) = 0 THEN NULL
+                ELSE CAST(SUM(CASE WHEN kw.id IS NOT NULL AND kw.status = 'known'
+                               THEN frequency ELSE 0 END) AS REAL)
+                     / CAST(SUM(frequency) AS REAL) * 100.0
+                END
+            FROM text_character_freq tcf
+            LEFT JOIN known_words kw ON kw.word = tcf.character AND kw.word_type = 'character'
+            WHERE tcf.text_id = ?
+            "#,
+            [s.text_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(None);
+
+    let started_at = DateTime::from_timestamp_millis(s.started_at_ms)
+        .unwrap_or_else(Utc::now)
+        .to_rfc3339();
+    let finished_at = DateTime::from_timestamp_millis(s.finished_at_ms)
+        .unwrap_or_else(Utc::now)
+        .to_rfc3339();
+
+    conn.execute(
+        r#"
+        INSERT INTO reading_sessions (
+            client_local_id, text_id, started_at, finished_at, character_count,
+            is_first_read, is_complete,
+            known_characters_count, known_words_count, cumulative_characters_read,
+            duration_seconds, characters_per_minute,
+            auto_marked_characters, auto_marked_words,
+            text_known_char_percentage,
+            is_manual_log, source
+        ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, 0, 0, ?, 0, 'in_app')
+        "#,
+        rusqlite::params![
+            s.local_id,
+            s.text_id,
+            started_at,
+            finished_at,
+            character_count,
+            is_first_read as i64,
+            known_characters_count,
+            known_words_count,
+            cumulative_characters_read,
+            duration_seconds,
+            characters_per_minute,
+            text_known_char_percentage,
+        ],
+    )?;
+
+    Ok(conn.last_insert_rowid())
 }
 
 // =============================================================================

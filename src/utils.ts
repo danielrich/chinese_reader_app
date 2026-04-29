@@ -127,6 +127,14 @@ export function getTopTwoLevels(shelves: library.ShelfTree[]): { shelf: library.
   return result;
 }
 
+export function uuid(): string {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  // Fallback for older browsers
+  return "uuid-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2);
+}
+
 /** Get all descendants of a shelf (for the secondary dropdown) */
 export function getShelfDescendants(node: library.ShelfTree, depth: number = 0): { shelf: library.Shelf; depth: number }[] {
   const result: { shelf: library.Shelf; depth: number }[] = [];

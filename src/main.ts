@@ -259,3 +259,11 @@ if ("serviceWorker" in navigator) {
       .catch((err) => console.warn("SW registration failed:", err));
   });
 }
+
+window.addEventListener("online", () => {
+  import("./lib/sync").then(({ flushPendingSessions }) => {
+    flushPendingSessions()
+      .then((n) => { if (n > 0) console.log(`Synced ${n} pending session(s)`); })
+      .catch((err) => console.warn("Session sync failed:", err));
+  });
+});

@@ -86,6 +86,7 @@ async fn main() {
         .route("/api/invoke/{command}", post(dispatch))
         .route("/api/texts/{id}", get(get_text_handler))
         .route("/api/texts/{id}/vocab-cache", get(get_text_vocab_cache_handler))
+        .route("/api/sync/sessions", post(sync_sessions_handler))
         .fallback_service(serve_static)
         .with_state(db)
         .layer(cors);
@@ -152,6 +153,26 @@ async fn get_text_vocab_cache_handler(
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))??;
 
+    Ok(Json(result))
+}
+
+async fn sync_sessions_handler(
+    State(db): State<Db>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    let result = tokio::task::spawn_blocking(move || {
+        let conn = db.lock().map_err(|e| ApiError::Internal(e.to_string()))?;
+        let sessions: Vec<library::speed::UploadSession> =
+            serde_json::from_value(body.get("sessions").cloned().unwrap_or(Value::Array(vec![])))
+                .map_err(|e| ApiError::BadRequest(format!("invalid sessions: {}", e)))?;
+        let mut ids: Vec<i64> = Vec::new();
+        for s in &sessions {
+            ids.push(library::speed::upload_completed_session(&conn, s).map_err(db_err)?);
+        }
+        serialize(serde_json::json!({ "session_ids": ids }))
+    })
+    .await
+    .map_err(|e| ApiError::Internal(e.to_string()))??;
     Ok(Json(result))
 }
 

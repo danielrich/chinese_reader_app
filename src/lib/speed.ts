@@ -6,6 +6,13 @@
  */
 
 import { invoke } from "./api";
+import {
+  saveSession,
+  getSession,
+  getInProgressSessionForText,
+  type LocalSession,
+} from "./idb";
+import { uuid } from "../utils";
 
 // =============================================================================
 // Types
@@ -144,17 +151,63 @@ export interface ManualLogInput {
 // =============================================================================
 
 /**
- * Start a new reading session for a text
+ * Start a new reading session for a text (client-first, stored in IDB).
+ * Resumes any in-progress session for this text to avoid duplicates.
+ * Pass characterCount so CPM can be computed locally when the session finishes.
  */
-export async function startReadingSession(textId: number): Promise<ReadingSession> {
-  return invoke<ReadingSession>("start_reading_session", { textId });
+export async function startReadingSession(textId: number, characterCount?: number): Promise<LocalSession> {
+  const existing = await getInProgressSessionForText(textId);
+  if (existing) return existing;
+
+  const session: LocalSession = {
+    local_id: uuid(),
+    text_id: textId,
+    started_at: Date.now(),
+    finished_at: null,
+    status: "in_progress",
+    character_count: characterCount,
+    source: "in_app",
+  };
+  await saveSession(session);
+  return session;
 }
 
 /**
- * Finish an active reading session
+ * Finish an active reading session (client-first, stored in IDB).
+ * Triggers the online-event flush path; Background Sync is registered
+ * as a best-effort bonus for browsers that support it.
  */
-export async function finishReadingSession(sessionId: number): Promise<ReadingSession> {
-  return invoke<ReadingSession>("finish_reading_session", { sessionId });
+export async function finishReadingSession(localId: string): Promise<LocalSession> {
+  const session = await getSession(localId);
+  if (!session) throw new Error(`Session ${localId} not found`);
+  if (session.status !== "in_progress") return session;
+
+  const finished_at = Date.now();
+  const duration_seconds = Math.round((finished_at - session.started_at) / 1000);
+  const characters_per_minute =
+    session.character_count && duration_seconds > 0
+      ? session.character_count / (duration_seconds / 60)
+      : undefined;
+
+  const completed: LocalSession = {
+    ...session,
+    finished_at,
+    duration_seconds,
+    characters_per_minute,
+    status: "completed_pending_upload",
+  };
+  await saveSession(completed);
+
+  if ("serviceWorker" in navigator && "SyncManager" in window) {
+    try {
+      const reg = await navigator.serviceWorker.ready;
+      await (reg as any).sync.register("sync-sessions");
+    } catch {
+      // BackgroundSync not supported — online-event fallback handles upload
+    }
+  }
+
+  return completed;
 }
 
 /**
@@ -288,18 +341,17 @@ export function formatSpeed(cpm: number): string {
 }
 
 /**
- * Calculate elapsed time in seconds from a start time
+ * Calculate elapsed time in seconds from a start time (ISO string or ms epoch number)
  */
-export function getElapsedSeconds(startedAt: string): number {
-  const start = new Date(startedAt).getTime();
-  const now = Date.now();
-  return Math.floor((now - start) / 1000);
+export function getElapsedSeconds(startedAt: string | number): number {
+  const start = typeof startedAt === "number" ? startedAt : new Date(startedAt).getTime();
+  return Math.floor((Date.now() - start) / 1000);
 }
 
 /**
  * Format elapsed time for display (updating timer)
  */
-export function formatElapsedTime(startedAt: string): string {
+export function formatElapsedTime(startedAt: string | number): string {
   const elapsed = getElapsedSeconds(startedAt);
   const minutes = Math.floor(elapsed / 60);
   const seconds = elapsed % 60;

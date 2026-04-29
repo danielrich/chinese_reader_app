@@ -1,6 +1,7 @@
 import * as dictionary from "../lib/dictionary";
 import * as library from "../lib/library";
 import * as speed from "../lib/speed";
+import { getInProgressSessionForText, deleteSession } from "../lib/idb";
 import { confirm } from "../lib/api";
 import {
   escapeHtml,
@@ -20,6 +21,7 @@ import {
   currentTextId, setCurrentTextId,
   currentShelfTexts, setCurrentShelfTexts,
   currentTextSegments, setCurrentTextSegments,
+  currentTextCharacterCount, setCurrentTextCharacterCount,
 } from "../state";
 
 // =============================================================================
@@ -387,13 +389,14 @@ async function loadTextView(textId: number) {
 
   try {
     const text = await library.getText(textId);
+    setCurrentTextCharacterCount(text.character_count);
 
     // Pre-warm the per-text vocab cache so the SW caches it for offline lookup
     library.getTextVocabCache(textId).catch((err) =>
       console.warn("vocab-cache prefetch failed:", err),
     );
 
-    setActiveSession(await speed.getActiveReadingSession(textId));
+    setActiveSession(await getInProgressSessionForText(textId));
 
     const currentTextIndex = currentShelfTexts.findIndex(t => t.id === textId);
     const hasPrevSection = currentTextIndex > 0;
@@ -567,7 +570,7 @@ async function finishCurrentReadingSession(): Promise<void> {
   const textId = activeSession.text_id;
 
   try {
-    const finished = await speed.finishReadingSession(activeSession.id);
+    const finished = await speed.finishReadingSession(activeSession.local_id);
     if (sessionTimerInterval) {
       clearInterval(sessionTimerInterval);
       setSessionTimerInterval(null);
@@ -580,13 +583,6 @@ async function finishCurrentReadingSession(): Promise<void> {
         const stats = await library.autoMarkTextAsKnown(textId);
         if (stats.characters_marked > 0 || stats.words_marked > 0) {
           autoMarkMessage = `\n\nAuto-marked: ${stats.characters_marked} characters, ${stats.words_marked} words`;
-
-          await speed.updateSessionAutoMarked(
-            finished.id,
-            stats.characters_marked,
-            stats.words_marked
-          );
-
           const textContent = document.getElementById("text-content-container");
           if (textContent) {
             const text = await library.getText(textId);
@@ -601,9 +597,10 @@ async function finishCurrentReadingSession(): Promise<void> {
     setActiveSession(null);
     updateReadingControlsUI();
 
-    const cpm = finished.characters_per_minute?.toFixed(1) || "0";
+    const cpm = finished.characters_per_minute?.toFixed(1);
     const duration = speed.formatDuration(finished.duration_seconds || 0);
-    alert(`Reading complete!\n\nTime: ${duration}\nSpeed: ${cpm} chars/min${autoMarkMessage}`);
+    const speedLine = cpm ? `\nSpeed: ${cpm} chars/min` : "\nSpeed: (syncs when online)";
+    alert(`Reading complete!\n\nTime: ${duration}${speedLine}${autoMarkMessage}`);
   } catch (error) {
     console.error("Failed to finish reading session:", error);
     alert(`Failed to finish reading: ${error}`);
@@ -613,7 +610,7 @@ async function finishCurrentReadingSession(): Promise<void> {
 function setupReadingControls(textId: number) {
   document.getElementById("start-reading-btn")?.addEventListener("click", async () => {
     try {
-      setActiveSession(await speed.startReadingSession(textId));
+      setActiveSession(await speed.startReadingSession(textId, currentTextCharacterCount));
       updateReadingControlsUI();
       startSessionTimer(activeSession!.started_at);
     } catch (error) {
@@ -634,7 +631,7 @@ function setupReadingControls(textId: number) {
     if (!confirmed) return;
 
     try {
-      await speed.discardReadingSession(activeSession.id);
+      await deleteSession(activeSession.local_id);
       if (sessionTimerInterval) {
         clearInterval(sessionTimerInterval);
         setSessionTimerInterval(null);
@@ -665,7 +662,7 @@ function updateReadingControlsUI() {
       const confirmed = await confirm("Discard this reading session? This cannot be undone.");
       if (!confirmed) return;
       try {
-        await speed.discardReadingSession(activeSession.id);
+        await deleteSession(activeSession.local_id);
         if (sessionTimerInterval) {
           clearInterval(sessionTimerInterval);
           setSessionTimerInterval(null);
@@ -687,7 +684,7 @@ function updateReadingControlsUI() {
       if (!curTextId) return;
 
       try {
-        setActiveSession(await speed.startReadingSession(curTextId));
+        setActiveSession(await speed.startReadingSession(curTextId, currentTextCharacterCount));
         updateReadingControlsUI();
         startSessionTimer(activeSession!.started_at);
       } catch (error) {
@@ -702,7 +699,7 @@ function updateReadingControlsUI() {
   }
 }
 
-function startSessionTimer(startedAt: string) {
+function startSessionTimer(startedAt: number) {
   const timerEl = document.getElementById("session-timer");
   if (!timerEl) return;
 
