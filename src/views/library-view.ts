@@ -162,6 +162,7 @@ async function loadTextsInShelf(shelfId: number) {
             <div class="shelf-actions">
               <button id="add-text-btn" class="btn-primary">Add Text</button>
               <button id="split-large-texts-btn" class="btn-secondary">Split Large Texts</button>
+              <button id="cache-shelf-btn" class="btn-secondary">Cache Shelf</button>
               <button id="edit-shelf-btn" class="btn-secondary">Edit</button>
               <button id="move-shelf-btn" class="btn-secondary">Move</button>
               <button id="delete-shelf-btn" class="btn-danger">Delete</button>
@@ -311,6 +312,8 @@ async function loadTextsInShelf(shelfId: number) {
 
     document.getElementById("add-text-btn")?.addEventListener("click", () => showAddTextModal(shelfId));
     document.getElementById("split-large-texts-btn")?.addEventListener("click", () => splitLargeTextsInShelf(shelfId));
+    const cacheBtn = document.getElementById("cache-shelf-btn") as HTMLButtonElement | null;
+    cacheBtn?.addEventListener("click", () => cacheShelfForOffline(shelfId, cacheBtn));
     document.getElementById("edit-shelf-btn")?.addEventListener("click", () => showEditShelfModal(shelfId));
     document.getElementById("move-shelf-btn")?.addEventListener("click", () => showMoveShelfModal(shelfId));
     document.getElementById("delete-shelf-btn")?.addEventListener("click", () => confirmDeleteShelf(shelfId));
@@ -2180,6 +2183,45 @@ async function splitLargeTextsInShelf(shelfId: number) {
     }
   } catch (error) {
     alert(`Failed to split texts: ${error}`);
+  }
+}
+
+async function cacheShelfForOffline(shelfId: number, btn: HTMLButtonElement) {
+  if (!shelfTree) return;
+
+  btn.disabled = true;
+  btn.textContent = "Collecting texts…";
+
+  try {
+    const shelfIds = getShelfAndDescendantIds(shelfTree, shelfId);
+    const textLists = await Promise.all([...shelfIds].map(id => library.listTextsInShelf(id)));
+    const texts = textLists.flat();
+
+    if (texts.length === 0) {
+      btn.textContent = "No texts to cache";
+      setTimeout(() => { btn.textContent = "Cache Shelf"; btn.disabled = false; }, 2000);
+      return;
+    }
+
+    let done = 0;
+    btn.textContent = `Caching 0/${texts.length}…`;
+
+    await Promise.all(texts.map(async (text) => {
+      try {
+        await Promise.all([
+          fetch(`/api/texts/${text.id}`),
+          library.getTextVocabCache(text.id),
+        ]);
+      } catch { /* individual failures counted in done */ }
+      done++;
+      btn.textContent = `Caching ${done}/${texts.length}…`;
+    }));
+
+    btn.textContent = `Cached ${texts.length} texts ✓`;
+    setTimeout(() => { btn.textContent = "Cache Shelf"; btn.disabled = false; }, 3000);
+  } catch {
+    btn.textContent = "Cache failed";
+    setTimeout(() => { btn.textContent = "Cache Shelf"; btn.disabled = false; }, 2000);
   }
 }
 
