@@ -601,6 +601,9 @@ async function finishCurrentReadingSession(): Promise<void> {
     setActiveSession(null);
     updateReadingControlsUI();
 
+    // Upload immediately if online; falls back to the online-event listener if not
+    import("../lib/sync").then(({ flushPendingSessions }) => flushPendingSessions()).catch(() => {});
+
     const cpm = finished.characters_per_minute?.toFixed(1);
     const duration = speed.formatDuration(finished.duration_seconds || 0);
     const speedLine = cpm ? `\nSpeed: ${cpm} chars/min` : "\nSpeed: (syncs when online)";
