@@ -4,7 +4,10 @@
 //! so the app can be accessed from any browser on the local network.
 //!
 //! Usage:
-//!   cargo run --bin server -- [--db-path <path>] [--port <port>] [--dist <path>]
+//!   cargo run --bin server -- [--db-path <path>] [--port <port>] [--dist <path>] [--cert <pem>] [--key <pem>]
+//!
+//! HTTPS example (generate certs with mkcert first):
+//!   ./server --cert chasmfiend.local.pem --key chasmfiend.local-key.pem
 
 use axum::{
     extract::{Path, State},
@@ -87,10 +90,24 @@ async fn main() {
         })
     };
 
+    let cert_path: Option<std::path::PathBuf> = args.iter()
+        .position(|a| a == "--cert")
+        .and_then(|i| args.get(i + 1))
+        .map(std::path::PathBuf::from);
+
+    let key_path: Option<std::path::PathBuf> = args.iter()
+        .position(|a| a == "--key")
+        .and_then(|i| args.get(i + 1))
+        .map(std::path::PathBuf::from);
+
+    let tls = cert_path.is_some() && key_path.is_some();
+
     let port: u16 = if let Some(idx) = args.iter().position(|a| a == "--port") {
         args.get(idx + 1)
             .and_then(|v| v.parse().ok())
-            .unwrap_or(3000)
+            .unwrap_or(if tls { 443 } else { 3000 })
+    } else if tls {
+        443
     } else {
         3000
     };
@@ -155,18 +172,32 @@ async fn main() {
         .with_state(db)
         .layer(cors);
 
-    let addr = format!("0.0.0.0:{}", port);
-    println!("Serving on http://{}", addr);
-    println!("Static files from: {:?}", dist_dir);
+    let addr: std::net::SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
 
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to bind {}: {}", addr, e);
-            std::process::exit(1);
-        });
-
-    axum::serve(listener, app).await.unwrap();
+    if let (Some(cert), Some(key)) = (cert_path, key_path) {
+        println!("Serving on https://{}", addr);
+        println!("Static files from: {:?}", dist_dir);
+        let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to load TLS cert/key: {}", e);
+                std::process::exit(1);
+            });
+        axum_server::bind_rustls(addr, tls_config)
+            .serve(app.into_make_service())
+            .await
+            .unwrap();
+    } else {
+        println!("Serving on http://{}", addr);
+        println!("Static files from: {:?}", dist_dir);
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to bind {}: {}", addr, e);
+                std::process::exit(1);
+            });
+        axum::serve(listener, app).await.unwrap();
+    }
 }
 
 async fn health() -> &'static str {
