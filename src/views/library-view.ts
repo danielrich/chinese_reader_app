@@ -162,6 +162,7 @@ async function loadTextsInShelf(shelfId: number) {
             <div class="shelf-actions">
               <button id="add-text-btn" class="btn-primary">Add Text</button>
               <button id="split-large-texts-btn" class="btn-secondary">Split Large Texts</button>
+              <button id="cache-shelf-btn" class="btn-secondary">Cache for Offline</button>
               <button id="edit-shelf-btn" class="btn-secondary">Edit</button>
               <button id="move-shelf-btn" class="btn-secondary">Move</button>
               <button id="delete-shelf-btn" class="btn-danger">Delete</button>
@@ -311,6 +312,8 @@ async function loadTextsInShelf(shelfId: number) {
 
     document.getElementById("add-text-btn")?.addEventListener("click", () => showAddTextModal(shelfId));
     document.getElementById("split-large-texts-btn")?.addEventListener("click", () => splitLargeTextsInShelf(shelfId));
+    const cacheBtn = document.getElementById("cache-shelf-btn") as HTMLButtonElement;
+    cacheBtn?.addEventListener("click", () => cacheShelfForOffline(shelfId, texts, cacheBtn));
     document.getElementById("edit-shelf-btn")?.addEventListener("click", () => showEditShelfModal(shelfId));
     document.getElementById("move-shelf-btn")?.addEventListener("click", () => showMoveShelfModal(shelfId));
     document.getElementById("delete-shelf-btn")?.addEventListener("click", () => confirmDeleteShelf(shelfId));
@@ -374,7 +377,6 @@ async function loadTextsInShelf(shelfId: number) {
       document.querySelector(".shelf-analysis-details")?.removeAttribute("open");
     }
 
-    setTimeout(() => cacheShelfForOffline(shelfId, texts), 2000);
   } catch (error) {
     mainContainer.innerHTML = `<p class="error">Failed to load texts: ${error}</p>`;
   }
@@ -2185,25 +2187,39 @@ async function splitLargeTextsInShelf(shelfId: number) {
   }
 }
 
-async function cacheShelfForOffline(shelfId: number, directTexts: library.TextSummary[]) {
+async function cacheShelfForOffline(shelfId: number, directTexts: library.TextSummary[], btn: HTMLButtonElement) {
   if (!shelfTree) return;
 
+  btn.disabled = true;
+  btn.textContent = "Collecting…";
+
   try {
-    // Collect sub-shelf texts lazily (direct texts already loaded by the caller)
     const subShelfIds = [...getShelfAndDescendantIds(shelfTree, shelfId)].filter(id => id !== shelfId);
     const subTexts = subShelfIds.length > 0
       ? (await Promise.all(subShelfIds.map(id => library.listTextsInShelf(id)))).flat()
       : [];
     const texts = [...directTexts, ...subTexts];
 
-    // Cache text content one at a time. Vocab-cache is populated on first open;
-    // doing it here would hold SQLite for several seconds per text.
-    for (const text of texts) {
-      try {
-        await fetch(`/api/texts/${text.id}`);
-      } catch { /* skip failures silently */ }
+    if (texts.length === 0) {
+      btn.textContent = "Nothing to cache";
+      setTimeout(() => { btn.textContent = "Cache for Offline"; btn.disabled = false; }, 2000);
+      return;
     }
-  } catch { /* ignore — offline or server down */ }
+
+    let done = 0;
+    btn.textContent = `Caching 0/${texts.length}…`;
+
+    for (const text of texts) {
+      try { await fetch(`/api/texts/${text.id}`); } catch { /* skip */ }
+      btn.textContent = `Caching ${++done}/${texts.length}…`;
+    }
+
+    btn.textContent = `Cached ${texts.length} texts ✓`;
+    setTimeout(() => { btn.textContent = "Cache for Offline"; btn.disabled = false; }, 3000);
+  } catch {
+    btn.textContent = "Cache for Offline";
+    btn.disabled = false;
+  }
 }
 
 async function confirmDeleteText(textId: number) {
