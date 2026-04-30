@@ -260,6 +260,13 @@ if ("serviceWorker" in navigator) {
   });
 }
 
+// Flush on startup (handles sessions left pending from previous visits)
+import("./lib/sync").then(({ flushPendingSessions }) => {
+  flushPendingSessions()
+    .then((n) => { if (n > 0) console.log(`Synced ${n} pending session(s) on startup`); })
+    .catch(() => {});
+});
+
 window.addEventListener("online", () => {
   import("./lib/sync").then(({ flushPendingSessions }) => {
     flushPendingSessions()
