@@ -1,12 +1,13 @@
 import type { TextVocabCache, VocabCacheEntry } from "./library";
 
 const DB_NAME = "chinese-reader";
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 
 export const STORE_VOCAB_CACHE = "vocab_cache";
 export const STORE_SESSIONS = "sessions";
 export const STORE_VOCAB_QUEUE = "vocab_queue";
 export const STORE_TEXT_META = "text_meta";
+export const STORE_NAV_CACHE = "nav_cache";
 
 export function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -35,6 +36,10 @@ export function openDb(): Promise<IDBDatabase> {
 
         // text_meta: keyPath = text_id. tracks last_cached_at etc.
         db.createObjectStore(STORE_TEXT_META, { keyPath: "text_id" });
+      }
+      if (oldVersion < 3) {
+        // nav_cache: keyPath = key (arbitrary string). persists shelf tree and text lists for offline navigation.
+        db.createObjectStore(STORE_NAV_CACHE, { keyPath: "key" });
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -235,4 +240,28 @@ export async function markVocabChangesUploaded(ids: number[]): Promise<void> {
   }
   await txDone(tx);
   db.close();
+}
+
+// ── Nav cache ──────────────────────────────────────────────────────────
+
+export async function saveNavCache(key: string, data: unknown): Promise<void> {
+  const db = await openDb();
+  const tx = db.transaction(STORE_NAV_CACHE, "readwrite");
+  tx.objectStore(STORE_NAV_CACHE).put({ key, data });
+  await txDone(tx);
+  db.close();
+}
+
+export async function getNavCache<T>(key: string): Promise<T | null> {
+  const db = await openDb();
+  const result = await new Promise<{ key: string; data: T } | null>((resolve, reject) => {
+    const req = db
+      .transaction(STORE_NAV_CACHE, "readonly")
+      .objectStore(STORE_NAV_CACHE)
+      .get(key);
+    req.onsuccess = () => resolve(req.result ?? null);
+    req.onerror = () => reject(req.error);
+  });
+  db.close();
+  return result ? result.data : null;
 }

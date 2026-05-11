@@ -1,7 +1,7 @@
 import * as dictionary from "../lib/dictionary";
 import * as library from "../lib/library";
 import * as speed from "../lib/speed";
-import { getInProgressSessionForText, deleteSession } from "../lib/idb";
+import { getInProgressSessionForText, deleteSession, saveNavCache, getNavCache } from "../lib/idb";
 import { confirm } from "../lib/api";
 import {
   escapeHtml,
@@ -56,7 +56,9 @@ function closeShelfDrawer() {
 
 export async function loadShelfTree() {
   try {
-    setShelfTree(await library.getShelfTree());
+    const tree = await library.getShelfTree();
+    setShelfTree(tree);
+    saveNavCache("shelf_tree", tree).catch(() => {});
     renderShelfTree();
 
     if (selectedShelfId) {
@@ -65,7 +67,19 @@ export async function loadShelfTree() {
       renderLibraryWelcome();
     }
   } catch (error) {
-    console.error("Failed to load shelf tree:", error);
+    console.warn("Failed to load shelf tree from server, trying IDB cache:", error);
+    const cached = await getNavCache<library.ShelfTree[]>("shelf_tree").catch(() => null);
+    if (cached) {
+      setShelfTree(cached);
+      renderShelfTree();
+      if (selectedShelfId) {
+        await loadTextsInShelf(selectedShelfId);
+      } else {
+        renderLibraryWelcome();
+      }
+    } else {
+      console.error("No cached shelf tree available offline");
+    }
   }
 }
 
@@ -140,8 +154,22 @@ async function loadTextsInShelf(shelfId: number) {
   const mainContainer = document.getElementById("library-main");
   if (!mainContainer) return;
 
+  let texts: library.TextSummary[];
   try {
-    const texts = await library.listTextsInShelf(shelfId);
+    texts = await library.listTextsInShelf(shelfId);
+    saveNavCache(`texts_in_shelf_${shelfId}`, texts).catch(() => {});
+  } catch (networkError) {
+    console.warn("Failed to load texts from server, trying IDB cache:", networkError);
+    const cached = await getNavCache<library.TextSummary[]>(`texts_in_shelf_${shelfId}`).catch(() => null);
+    if (cached) {
+      texts = cached;
+    } else {
+      mainContainer.innerHTML = `<p class="error">Offline and no cached text list available for this shelf.</p>`;
+      return;
+    }
+  }
+
+  try {
     setCurrentShelfTexts(texts);
     const shelf = findShelfById(shelfTree, shelfId);
 

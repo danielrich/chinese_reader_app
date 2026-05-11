@@ -37,11 +37,58 @@ The app includes a comprehensive dictionary system with multiple sources:
   - Domain vocabulary (Buddhist, Daoist, Confucian)
   - Classical Chinese terms
 
+## Running as a System Service (Linux)
+
+The Rust backend can run as a standalone HTTPS server — no Tauri/Electron required. This is the recommended way to use the app on a Linux server or desktop that you want always-on.
+
+### One-time setup
+
+Build the release binary and install the systemd service (requires `sudo`):
+
+```bash
+# Build the server binary
+cd src-tauri && cargo build --release && cd ..
+
+# Install and start the systemd service
+sudo bash scripts/install-service.sh
+```
+
+The service runs as root so it can bind to port 443, serves the frontend from `dist/`, and points at the existing Tauri app database so your library data carries over.
+
+**Database location (Linux):** `~/.local/share/com.chinesereader.ChineseReader/dictionary.db`
+
+### Managing the service
+
+```bash
+sudo systemctl status chinese-reader    # check status / recent logs
+sudo systemctl restart chinese-reader   # restart after rebuilding
+sudo systemctl stop chinese-reader      # stop
+sudo journalctl -u chinese-reader -f    # tail logs
+```
+
+### Rebuilding after code changes
+
+```bash
+cd src-tauri && cargo build --release && cd ..
+npm run build                            # rebuild frontend
+sudo systemctl restart chinese-reader
+```
+
+### TLS certificates
+
+The install script expects `chasmfiend.local.pem` and `chasmfiend.local-key.pem` in the project root. Generate them with [mkcert](https://github.com/FiloSottile/mkcert):
+
+```bash
+mkcert chasmfiend.local
+```
+
+---
+
 ## Prerequisites
 
 - [Node.js](https://nodejs.org/) (v18 or later)
 - [Rust](https://www.rust-lang.org/tools/install) (1.77 or later)
-- [Tauri Prerequisites](https://v2.tauri.app/start/prerequisites/)
+- [Tauri Prerequisites](https://v2.tauri.app/start/prerequisites/) (only needed for the desktop app)
 
 ## Development
 
@@ -100,7 +147,7 @@ The `scripts/` directory contains a Python tool for importing PDFs with chapter 
 cd scripts
 
 # First, find the parent shelf ID where you want to import:
-sqlite3 ~/Library/Application\ Support/com.chinesereader.ChineseReader/dictionary.db "SELECT id, name FROM shelves;"
+sqlite3 ~/.local/share/com.chinesereader.ChineseReader/dictionary.db "SELECT id, name FROM shelves;"
 
 # Preview what will be imported (dry run):
 uv run python import_pdf.py /path/to/book.pdf <parent_shelf_id> --dry-run
@@ -126,7 +173,7 @@ Import the Chinese Book of Mormon from churchofjesuschrist.org:
 cd scripts
 
 # Find the parent shelf ID:
-sqlite3 ~/Library/Application\ Support/com.chinesereader.ChineseReader/dictionary.db "SELECT id, name FROM shelves;"
+sqlite3 ~/.local/share/com.chinesereader.ChineseReader/dictionary.db "SELECT id, name FROM shelves;"
 
 # Import (takes ~6 minutes due to rate limiting):
 uv run python import_bofm.py <parent_shelf_id>
@@ -151,7 +198,7 @@ For AZW3 files, [Calibre](https://calibre-ebook.com/) must be installed so the s
 cd scripts
 
 # First, find the parent shelf ID where you want to import:
-sqlite3 ~/Library/Application\ Support/com.chinesereader.ChineseReader/dictionary.db "SELECT id, name FROM shelves;"
+sqlite3 ~/.local/share/com.chinesereader.ChineseReader/dictionary.db "SELECT id, name FROM shelves;"
 
 # Preview what will be imported (dry run):
 uv run python import_ebook.py /path/to/book.epub <parent_shelf_id> --dry-run
