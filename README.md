@@ -1,329 +1,219 @@
 # Chinese Reader
 
-A desktop and web application for Chinese reading comprehension and vocabulary tracking, built with Tauri and TypeScript.
+A local-first Chinese reading and vocabulary app. The current app is a Vite
+browser frontend served by a Rust/Axum backend with SQLite storage. It supports
+dictionary lookup, hierarchical text shelves, text analysis, known/learning
+vocabulary tracking, reading-speed history, manual offline read logs, and early
+PWA/offline reading support.
 
-## Features (Planned)
+## Current Architecture
 
-- **Vocabulary Tracking**: Mark known and unknown words while reading
-- **Anki Integration**: Export words to Anki for spaced repetition review
-- **Text Analysis**: Analyze difficulty and vocabulary coverage of texts
-- **Multiple Import Formats**: Support for web pages, EPUB files, and plain text
-- **Reading Progress**: Track reading speed improvements over time
-- **Vocabulary Domains**: Separate domains for book-specific, classical Chinese, religious, or other specialized vocabulary
-
-## Dictionary Module
-
-The app includes a comprehensive dictionary system with multiple sources:
-
-### Supported Dictionary Sources
-
-| Source | Description | Entries |
-|--------|-------------|---------|
-| **CC-CEDICT** | Community Chinese-English dictionary | ~124,000 |
-| **MOE Dict** | Taiwan Ministry of Education dictionary (Traditional Chinese) | ~163,000 |
-| **Word Frequencies** | Character/word frequency data with HSK levels | - |
-| **HanDeDict** | German-Chinese dictionary (English translation) | ~84,000 |
-| **MakeMeaHanzi** | Stroke order animations and character decomposition | ~9,000 |
-| **User Dictionaries** | Custom dictionaries for book-specific terms | User-defined |
-
-### Dictionary Features
-
-- **Unified Lookup**: Search across all dictionaries simultaneously
-- **Character Information**: Radical, stroke count, decomposition
-- **Usage Examples**: Examples from classical and modern sources
-- **Full-Text Search**: Search definitions and examples
-- **User Dictionaries**: Create custom dictionaries for:
-  - Book-specific terms (character names, locations)
-  - Domain vocabulary (Buddhist, Daoist, Confucian)
-  - Classical Chinese terms
-
-## Running as a System Service (Linux)
-
-The Rust backend can run as a standalone HTTPS server — no Tauri/Electron required. This is the recommended way to use the app on a Linux server or desktop that you want always-on.
-
-### One-time setup
-
-Build the release binary and install the systemd service (requires `sudo`):
-
-```bash
-# Build the server binary
-cd src-tauri && cargo build --release && cd ..
-
-# Install and start the systemd service
-sudo bash scripts/install-service.sh
+```text
+Browser or installed PWA
+  -> Axum HTTP server in src-tauri/src/bin/server.rs
+  -> SQLite database
 ```
 
-The service runs as root so it can bind to port 443, serves the frontend from `dist/`, and points at the existing Tauri app database so your library data carries over.
+The Rust crate still lives under `src-tauri/`, but the main runtime path is now
+the standalone HTTP server. The frontend uses `fetch()` against the same origin;
+most calls go through a Tauri-compatible `/api/invoke/:command` wrapper, with a
+few explicit PWA routes for text content, vocab cache, and session sync.
 
-**Database location (Linux):** `~/.local/share/com.chinesereader.ChineseReader/dictionary.db`
+More detail:
 
-### Managing the service
+- [Current architecture](docs/architecture/current-architecture.md)
+- [Engineering notes and concerns](docs/engineering-notes.md)
+- [AppArmor/bubblewrap sandbox note](docs/operations/apparmor-bwrap-sandbox.md)
+- [Cross-device design spec](docs/superpowers/specs/2026-04-25-cross-device-reader-design.md)
 
-```bash
-sudo systemctl status chinese-reader    # check status / recent logs
-sudo systemctl restart chinese-reader   # restart after rebuilding
-sudo systemctl stop chinese-reader      # stop
-sudo journalctl -u chinese-reader -f    # tail logs
+## Features
+
+- Multi-source Chinese dictionary lookup.
+- User dictionaries for book/domain-specific terms.
+- Hierarchical shelves and text library management.
+- Jieba-based text segmentation and character/word frequency analysis.
+- Known and learning vocabulary states.
+- Shelf aggregate analysis and unread-count badges.
+- Reading sessions, speed statistics, and reading history.
+- Manual offline read logging for physical books or other reading surfaces.
+- Linux HTTP server for browser access from other devices.
+- PWA manifest, service worker, IndexedDB caches, and queued session upload.
+
+Offline support is still in progress. Text/nav/vocab caching and session upload
+exist; offline vocabulary-change sync is not yet fully wired end to end.
+
+## Repository Layout
+
+```text
+src/                         TypeScript frontend
+src/views/                   DOM-rendered app views
+src/lib/                     API clients, IndexedDB, sync helpers
+src/sw.ts                    Service worker
+public/                      PWA manifest and icons
+src-tauri/src/bin/server.rs  Axum HTTP server
+src-tauri/src/bin/import.rs  Dictionary import binary
+src-tauri/src/dictionary/    Dictionary schema, lookup, import sources
+src-tauri/src/library/       Shelves, texts, analysis, vocab, speed tracking
+scripts/                     Import/download/maintenance scripts
+docs/                        Architecture, operations, and implementation plans
 ```
-
-### Rebuilding after code changes
-
-```bash
-cd src-tauri && cargo build --release && cd ..
-npm run build                            # rebuild frontend
-sudo systemctl restart chinese-reader
-```
-
-### TLS certificates
-
-The install script expects `chasmfiend.local.pem` and `chasmfiend.local-key.pem` in the project root. Generate them with [mkcert](https://github.com/FiloSottile/mkcert):
-
-```bash
-mkcert chasmfiend.local
-```
-
----
 
 ## Prerequisites
 
-- [Node.js](https://nodejs.org/) (v18 or later)
-- [Rust](https://www.rust-lang.org/tools/install) (1.77 or later)
-- [Tauri Prerequisites](https://v2.tauri.app/start/prerequisites/) (only needed for the desktop app)
+- Node.js 18+
+- Rust 1.77+
+- `uv` for Python import scripts
+- Optional: `mkcert` for trusted LAN HTTPS
+- Optional: Calibre for AZW3 ebook imports
 
-## Development
+## Setup
 
-### Continuous Integration
-
-This project uses GitHub Actions to automatically run unit tests on all pull requests. The tests must pass before a PR can be merged.
-
-**To enable branch protection (requires repository admin access):**
-1. Go to repository Settings → Branches
-2. Click "Add branch protection rule"
-3. Set "Branch name pattern" to `main` (or `master`)
-4. Check "Require status checks to pass before merging"
-5. Select the "test" check from the list
-6. Check "Require branches to be up to date before merging" (optional)
-7. Click "Create" or "Save changes"
-
-### Install dependencies
+Install frontend dependencies:
 
 ```bash
 npm install
 ```
 
-### Download dictionary data
+Download dictionary source data:
 
 ```bash
 node scripts/download-dictionaries.js --all
 ```
 
-This downloads:
-- CC-CEDICT from MDBG (~9 MB)
-- MOE Dictionary from g0v/moedict-data (~72 MB)
-- Word Frequencies with HSK levels (~163 MB)
-- HanDeDict English translations (~66 MB)
-- MakeMeaHanzi stroke animations (~129 MB)
-
-Available options: `--cedict`, `--moedict`, `--wordfreq`, `--handedict`, `--strokes`, `--all`
-
-### Import dictionaries into database
-
-After downloading, import the dictionaries into the SQLite database:
+Import dictionaries into SQLite:
 
 ```bash
 cd src-tauri
 cargo run --bin import
 ```
 
-This creates `src-tauri/data/dictionary.db` with all dictionary entries indexed for fast lookup.
+The default Linux app database path is:
 
-Available options: `--cedict`, `--moedict`, `--all` (default)
-
-### Import PDFs into the library
-
-The `scripts/` directory contains a Python tool for importing PDFs with chapter structure into the library. It uses the PDF's table of contents to create a hierarchy of shelves and texts.
-
-```bash
-cd scripts
-
-# First, find the parent shelf ID where you want to import:
-sqlite3 ~/.local/share/com.chinesereader.ChineseReader/dictionary.db "SELECT id, name FROM shelves;"
-
-# Preview what will be imported (dry run):
-uv run python import_pdf.py /path/to/book.pdf <parent_shelf_id> --dry-run
-
-# Import the PDF:
-uv run python import_pdf.py /path/to/book.pdf <parent_shelf_id>
-
-# Import without simplified-to-traditional conversion:
-uv run python import_pdf.py /path/to/book.pdf <parent_shelf_id> --no-convert
+```text
+~/.local/share/com.chinesereader.ChineseReader/dictionary.db
 ```
 
-The importer:
-- Creates shelves based on the PDF's table of contents hierarchy
-- Extracts text for each chapter
-- Converts simplified Chinese to traditional (Taiwan style) by default
-- Skips metadata sections (character lists, glossaries, etc.)
+## Development
 
-### Import Book of Mormon (Chinese)
-
-Import the Chinese Book of Mormon from churchofjesuschrist.org:
+Run the frontend dev server:
 
 ```bash
-cd scripts
-
-# Find the parent shelf ID:
-sqlite3 ~/.local/share/com.chinesereader.ChineseReader/dictionary.db "SELECT id, name FROM shelves;"
-
-# Import (takes ~6 minutes due to rate limiting):
-uv run python import_bofm.py <parent_shelf_id>
-
-# Dry run to preview:
-uv run python import_bofm.py <parent_shelf_id> --dry-run
+npm run dev
 ```
 
-The importer:
-- Fetches all 239 chapters from the 15 books
-- Creates a "摩爾門經" shelf with sub-shelves for each book
-- Maintains proper chapter ordering
-- Includes 1.5 second delay between requests to be gentle on the server
-
-### Import EPUB/AZW3 into the library
-
-The `scripts/` directory contains a Python tool for importing EPUB or AZW3 ebooks into the library. It uses the ebook's table of contents to create a hierarchy of shelves and texts (one per chapter).
-
-For AZW3 files, [Calibre](https://calibre-ebook.com/) must be installed so the script can convert them to EPUB first.
+Build the frontend:
 
 ```bash
-cd scripts
-
-# First, find the parent shelf ID where you want to import:
-sqlite3 ~/.local/share/com.chinesereader.ChineseReader/dictionary.db "SELECT id, name FROM shelves;"
-
-# Preview what will be imported (dry run):
-uv run python import_ebook.py /path/to/book.epub <parent_shelf_id> --dry-run
-
-# Import the ebook:
-uv run python import_ebook.py /path/to/book.epub <parent_shelf_id>
-
-# Convert simplified Chinese to traditional (Taiwan style) during import:
-uv run python import_ebook.py /path/to/book.epub <parent_shelf_id> --convert-traditional
-# or use the short form:
-uv run python import_ebook.py /path/to/book.epub <parent_shelf_id> -t
+npm run build
 ```
 
-The importer:
-- Creates shelves and texts based on the ebook's table of contents (one text per chapter)
-- Supports both EPUB and AZW3 (AZW3 is converted to EPUB via Calibre's `ebook-convert`)
-- Optionally converts simplified Chinese to traditional using OpenCC (`--convert-traditional` / `-t`)
-- Uses the same database as the app (path varies by OS; the example above is for macOS)
-
-### Run in development mode
+Run the Rust server against the built frontend:
 
 ```bash
-npm run tauri:dev
+cd src-tauri
+cargo run --bin server -- \
+  --db-path "$HOME/.local/share/com.chinesereader.ChineseReader/dictionary.db" \
+  --dist ../dist \
+  --port 3000
 ```
 
-### Run tests
+Run Rust tests:
 
 ```bash
-# Run Rust unit tests
 cd src-tauri
 cargo test --lib
 ```
 
-### Build for production
+## Linux Service
+
+Build and install the systemd service:
 
 ```bash
-npm run tauri:build
+cd src-tauri && cargo build --release && cd ..
+npm run build
+sudo bash scripts/install-service.sh
 ```
 
-## Project Structure
+Manage the service:
 
-```
-chinese-reader/
-├── src/                       # TypeScript frontend source
-│   ├── lib/
-│   │   └── dictionary.ts      # Dictionary API client
-│   ├── main.ts                # Main entry point
-│   └── style.css              # Global styles
-├── src-tauri/                 # Rust backend source
-│   ├── src/
-│   │   ├── dictionary/        # Dictionary module
-│   │   │   ├── mod.rs         # Module root
-│   │   │   ├── models.rs      # Data models
-│   │   │   ├── schema.rs      # Database schema
-│   │   │   ├── lookup.rs      # Lookup functionality
-│   │   │   ├── user.rs        # User dictionary management
-│   │   │   ├── error.rs       # Error types
-│   │   │   └── sources/       # Dictionary parsers
-│   │   │       ├── cedict.rs  # CC-CEDICT parser
-│   │   │       └── moedict.rs # MOE Dict parser
-│   │   ├── bin/
-│   │   │   └── import.rs      # CLI import tool
-│   │   ├── commands.rs        # Tauri commands
-│   │   ├── lib.rs             # Library entry point
-│   │   └── main.rs            # Application entry point
-│   ├── data/                  # Dictionary data files (after download)
-│   ├── Cargo.toml             # Rust dependencies
-│   └── tauri.conf.json        # Tauri configuration
-├── scripts/
-│   ├── download-dictionaries.js  # Dictionary download script
-│   ├── import_pdf.py             # PDF import tool (uv project)
-│   ├── import_bofm.py            # Book of Mormon import tool
-│   └── import_ebook.py           # EPUB/AZW3 import tool (uv project)
-├── index.html                 # HTML entry point
-├── package.json               # Node.js dependencies
-└── tsconfig.json              # TypeScript configuration
+```bash
+sudo systemctl status chinese-reader
+sudo systemctl restart chinese-reader
+sudo journalctl -u chinese-reader -f
 ```
 
-## Dictionary API
+For PWA/offline use from Android or another LAN device, serve over HTTPS.
+The server supports mkcert-generated certificates:
 
-### TypeScript Usage
+```bash
+mkcert chasmfiend.local
 
-```typescript
-import * as dictionary from './lib/dictionary';
-
-// Look up a word
-const result = await dictionary.lookup('中文', {
-  includeExamples: true,
-  includeCharacterInfo: true,
-});
-
-// Create a user dictionary
-const dict = await dictionary.createUserDictionary(
-  '紅樓夢人物',
-  'Character names from Dream of the Red Chamber',
-  'book:紅樓夢'
-);
-
-// Add an entry
-await dictionary.addUserDictionaryEntry(
-  dict.id,
-  '賈寶玉',
-  'Main protagonist, son of Jia Zheng',
-  'jiǎ bǎo yù',
-  'Also called 寶二爺',
-  ['character', 'protagonist']
-);
+src-tauri/target/release/server \
+  --db-path "$HOME/.local/share/com.chinesereader.ChineseReader/dictionary.db" \
+  --dist dist \
+  --cert chasmfiend.local.pem \
+  --key chasmfiend.local-key.pem
 ```
 
-### Rust Usage
+## Importing Texts
 
-```rust
-use chinese_reader_lib::dictionary::{self, models::LookupOptions};
+The `scripts/` directory contains importers for PDFs, ebooks, and several
+domain-specific sources. Most scripts need a parent shelf ID:
 
-// Initialize database
-let conn = dictionary::init_connection(&db_path)?;
-
-// Lookup a word
-let options = LookupOptions {
-    include_examples: true,
-    include_character_info: true,
-    ..Default::default()
-};
-let result = dictionary::lookup(&conn, "中文", &options)?;
+```bash
+sqlite3 ~/.local/share/com.chinesereader.ChineseReader/dictionary.db \
+  "SELECT id, name FROM shelves;"
 ```
+
+EPUB/AZW3:
+
+```bash
+cd scripts
+uv run python import_ebook.py /path/to/book.epub <parent_shelf_id> --dry-run
+uv run python import_ebook.py /path/to/book.epub <parent_shelf_id>
+```
+
+PDF:
+
+```bash
+cd scripts
+uv run python import_pdf.py /path/to/book.pdf <parent_shelf_id> --dry-run
+uv run python import_pdf.py /path/to/book.pdf <parent_shelf_id>
+```
+
+Chinese Book of Mormon:
+
+```bash
+cd scripts
+uv run python import_bofm.py <parent_shelf_id> --dry-run
+uv run python import_bofm.py <parent_shelf_id>
+```
+
+See [scripts/README.md](scripts/README.md) for script details.
+
+## Dictionary Sources
+
+Supported sources include:
+
+- CC-CEDICT
+- MOE Dict
+- Kangxi Dictionary data
+- Word frequency data
+- HanDeDict-derived data
+- MakeMeaHanzi character data
+- User dictionaries
+
+## Offline/PWA Notes
+
+- `src/sw.ts` caches the app shell and text/vocab API responses.
+- `src/lib/idb.ts` stores navigation cache, per-term vocab cache, local
+  sessions, and a vocabulary queue.
+- `src/lib/sync.ts` uploads completed local sessions to `/api/sync/sessions`.
+- The "Cache for Offline" shelf action walks descendant shelves and caches
+  shelf lists, analysis, text content, and vocab entries.
+
+Current gap: vocabulary-change queueing exists in IndexedDB, but the server
+does not yet expose a complete vocab-change sync endpoint.
 
 ## License
 
