@@ -6,6 +6,9 @@
  */
 
 type InvokeArgs = Record<string, unknown>;
+interface RequestOptions {
+  signal?: AbortSignal;
+}
 
 function camelToSnake(key: string): string {
   return key.replace(/[A-Z]/g, (m) => "_" + m.toLowerCase());
@@ -23,12 +26,13 @@ function convertKeys(value: unknown): unknown {
   return value;
 }
 
-export async function invoke<T>(command: string, args?: InvokeArgs): Promise<T> {
+export async function invoke<T>(command: string, args?: InvokeArgs, options?: RequestOptions): Promise<T> {
   const body = convertKeys(args ?? {});
   const response = await fetch(`/api/invoke/${command}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    signal: options?.signal,
   });
 
   if (!response.ok) {
@@ -47,8 +51,8 @@ export async function confirm(message: string): Promise<boolean> {
   return window.confirm(message);
 }
 
-export async function fetchJson<T>(path: string): Promise<T> {
-  const response = await fetch(path, { method: "GET" });
+export async function fetchJson<T>(path: string, options?: RequestOptions): Promise<T> {
+  const response = await fetch(path, { method: "GET", signal: options?.signal });
   if (!response.ok) {
     throw new Error(`GET ${path} failed (${response.status})`);
   }

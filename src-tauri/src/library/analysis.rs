@@ -85,26 +85,66 @@ fn is_cjk_character(c: char) -> bool {
     matches!(c, '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}')
 }
 
-/// Look up general frequency rank for a word/character from dictionary
-fn get_general_frequency_rank(conn: &Connection, term: &str) -> Option<i64> {
-    // Look up in dictionary entries by traditional or simplified form
-    let result: std::result::Result<Option<i64>, _> = conn.query_row(
-        "SELECT MIN(frequency_rank) FROM dictionary_entries
-         WHERE (traditional = ? OR simplified = ?) AND frequency_rank IS NOT NULL",
-        [term, term],
-        |row| row.get(0),
-    );
-
-    result.ok().flatten()
-}
-
 /// Build a map of term -> general frequency rank for batch lookup
 fn build_frequency_rank_map(conn: &Connection, terms: &[String]) -> HashMap<String, i64> {
     let mut map = HashMap::new();
+    let unique_terms: HashSet<String> = terms.iter().cloned().collect();
+    if unique_terms.is_empty() {
+        return map;
+    }
 
-    for term in terms {
-        if let Some(rank) = get_general_frequency_rank(conn, term) {
-            map.insert(term.clone(), rank);
+    let all_terms: Vec<String> = unique_terms.into_iter().collect();
+
+    // Keep batches comfortably below SQLite's parameter limit.
+    for chunk in all_terms.chunks(400) {
+        let chunk_set: HashSet<&str> = chunk.iter().map(String::as_str).collect();
+        let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT traditional, simplified, frequency_rank
+             FROM dictionary_entries
+             WHERE frequency_rank IS NOT NULL
+               AND (traditional IN ({0}) OR simplified IN ({0}))",
+            placeholders
+        );
+
+        let params = chunk
+            .iter()
+            .map(String::as_str)
+            .chain(chunk.iter().map(String::as_str));
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(stmt) => stmt,
+            Err(err) => {
+                log::warn!("Failed to prepare batched frequency-rank query: {err}");
+                continue;
+            }
+        };
+
+        let rows = match stmt.query_map(rusqlite::params_from_iter(params), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        }) {
+            Ok(rows) => rows,
+            Err(err) => {
+                log::warn!("Failed to execute batched frequency-rank query: {err}");
+                continue;
+            }
+        };
+
+        for row in rows.flatten() {
+            let (traditional, simplified, rank) = row;
+            if chunk_set.contains(traditional.as_str()) {
+                map.entry(traditional.clone())
+                    .and_modify(|existing| *existing = (*existing).min(rank))
+                    .or_insert(rank);
+            }
+            if chunk_set.contains(simplified.as_str()) {
+                map.entry(simplified.clone())
+                    .and_modify(|existing| *existing = (*existing).min(rank))
+                    .or_insert(rank);
+            }
         }
     }
 

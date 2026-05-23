@@ -256,7 +256,12 @@ if ("serviceWorker" in navigator) {
     navigator.serviceWorker
       .register("/sw.js")
       .then((reg) => console.log("SW registered:", reg.scope))
-      .catch((err) => console.warn("SW registration failed:", err));
+      .catch((err) => {
+        console.warn("SW registration failed:", err);
+        if (!window.isSecureContext && location.hostname !== "localhost" && location.hostname !== "127.0.0.1") {
+          showError("Offline mode is unavailable here because the app is not running in a secure context. Plain HTTP only works reliably on localhost.");
+        }
+      });
   });
 }
 
