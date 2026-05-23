@@ -6,15 +6,28 @@
 // for your dev IP during testing.
 declare const self: ServiceWorkerGlobalScope;
 
-const SHELL_CACHE = "shell-v1";
+const SHELL_CACHE = "shell-v2";
 const API_CACHE = "api-v1";
 const TEXT_CACHE = "text-v1";
 
-const SHELL_FILES = ["/", "/index.html", "/manifest.webmanifest"];
+const SHELL_FILES = [
+  "/",
+  "/index.html",
+  "/manifest.webmanifest",
+  "/icon-192.png",
+  "/icon-512.png",
+  "/icon-maskable-512.png",
+  "/apple-touch-icon.png",
+];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
-    caches.open(SHELL_CACHE).then((cache) => cache.addAll(SHELL_FILES)).then(() => self.skipWaiting()),
+    (async () => {
+      const cache = await caches.open(SHELL_CACHE);
+      await cache.addAll(SHELL_FILES);
+      await cacheLinkedShellAssets(cache);
+      await self.skipWaiting();
+    })(),
   );
 });
 
@@ -83,6 +96,40 @@ async function cacheFirst(request: Request): Promise<Response> {
     }
     throw err;
   }
+}
+
+async function cacheLinkedShellAssets(cache: Cache): Promise<void> {
+  const indexResponse = await cache.match("/index.html") ?? await cache.match("/");
+  if (!indexResponse) return;
+
+  const html = await indexResponse.clone().text();
+  const assetUrls = new Set<string>();
+  const attrPattern = /\s(?:src|href)=["']([^"']+)["']/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = attrPattern.exec(html)) !== null) {
+    const rawUrl = match[1];
+    if (!rawUrl || rawUrl.startsWith("http:") || rawUrl.startsWith("https:") || rawUrl.startsWith("data:")) {
+      continue;
+    }
+    const url = new URL(rawUrl, self.location.origin);
+    if (url.origin === self.location.origin) {
+      assetUrls.add(url.pathname);
+    }
+  }
+
+  await Promise.all(
+    [...assetUrls].map(async (url) => {
+      try {
+        const response = await fetch(url, { cache: "reload" });
+        if (response.ok) {
+          await cache.put(url, response);
+        }
+      } catch (err) {
+        console.warn("Failed to cache shell asset:", url, err);
+      }
+    }),
+  );
 }
 
 async function networkFirst(request: Request): Promise<Response> {
