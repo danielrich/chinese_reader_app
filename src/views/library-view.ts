@@ -1,7 +1,14 @@
 import * as dictionary from "../lib/dictionary";
 import * as library from "../lib/library";
 import * as speed from "../lib/speed";
-import { getInProgressSessionForText, deleteSession, saveNavCache, getNavCache } from "../lib/idb";
+import {
+  getInProgressSessionForText,
+  deleteSession,
+  saveNavCache,
+  getNavCache,
+  saveTextSegments,
+  getTextSegments,
+} from "../lib/idb";
 import { confirm } from "../lib/api";
 import {
   escapeHtml,
@@ -30,6 +37,16 @@ import {
 
 // Track current sort mode (local to library view)
 let currentSort: library.FrequencySort = "text_frequency";
+let pendingShelfAnalysisTimer: number | null = null;
+let activeShelfAnalysisController: AbortController | null = null;
+
+function textsCacheKey(shelfId: number): string {
+  return `texts_in_shelf_${shelfId}`;
+}
+
+function shelfAnalysisCacheKey(shelfId: number): string {
+  return `shelf_analysis_${shelfId}`;
+}
 
 export function setupLibraryView() {
   const addShelfBtn = document.getElementById("add-shelf-btn");
@@ -154,13 +171,20 @@ async function loadTextsInShelf(shelfId: number) {
   const mainContainer = document.getElementById("library-main");
   if (!mainContainer) return;
 
+  if (pendingShelfAnalysisTimer !== null) {
+    window.clearTimeout(pendingShelfAnalysisTimer);
+    pendingShelfAnalysisTimer = null;
+  }
+  activeShelfAnalysisController?.abort();
+  activeShelfAnalysisController = null;
+
   let texts: library.TextSummary[];
   try {
     texts = await library.listTextsInShelf(shelfId);
-    saveNavCache(`texts_in_shelf_${shelfId}`, texts).catch(() => {});
+    saveNavCache(textsCacheKey(shelfId), texts).catch(() => {});
   } catch (networkError) {
     console.warn("Failed to load texts from server, trying IDB cache:", networkError);
-    const cached = await getNavCache<library.TextSummary[]>(`texts_in_shelf_${shelfId}`).catch(() => null);
+    const cached = await getNavCache<library.TextSummary[]>(textsCacheKey(shelfId)).catch(() => null);
     if (cached) {
       texts = cached;
     } else {
@@ -172,241 +196,293 @@ async function loadTextsInShelf(shelfId: number) {
   try {
     setCurrentShelfTexts(texts);
     const shelf = findShelfById(shelfTree, shelfId);
+    const cachedAnalysis = await getNavCache<library.ShelfAnalysis>(shelfAnalysisCacheKey(shelfId)).catch(() => null);
+    renderShelfContents(mainContainer, shelfId, shelf?.shelf.name || "Shelf", texts, cachedAnalysis, cachedAnalysis ? "cached" : "loading");
 
-    let shelfAnalysis: library.ShelfAnalysis | null = null;
-    try {
-      shelfAnalysis = await library.getShelfAnalysis(shelfId);
-    } catch {
-      // Ignore errors - will just not show analysis
-    }
+    pendingShelfAnalysisTimer = window.setTimeout(async () => {
+      pendingShelfAnalysisTimer = null;
+      const controller = new AbortController();
+      activeShelfAnalysisController = controller;
 
-    const hasTexts = shelfAnalysis !== null && shelfAnalysis.text_count > 0;
-
-    let html = `
-      <div class="shelf-view-layout ${hasTexts ? 'has-analysis' : ''}">
-        <div class="shelf-main">
-          <div class="shelf-header">
-            <h2>${escapeHtml(shelf?.shelf.name || "Shelf")}</h2>
-            <div class="shelf-actions">
-              <button id="add-text-btn" class="btn-primary">Add Text</button>
-              <button id="split-large-texts-btn" class="btn-secondary">Split Large Texts</button>
-              <button id="cache-shelf-btn" class="btn-secondary">Cache for Offline</button>
-              <button id="edit-shelf-btn" class="btn-secondary">Edit</button>
-              <button id="move-shelf-btn" class="btn-secondary">Move</button>
-              <button id="delete-shelf-btn" class="btn-danger">Delete</button>
-            </div>
-          </div>
-    `;
-
-    if (shelfAnalysis !== null && shelfAnalysis.text_count > 0) {
-      const knownCharOccurrences = shelfAnalysis.known_characters.reduce((sum, c) => sum + c.frequency, 0);
-      const knownWordOccurrences = shelfAnalysis.known_words.reduce((sum, w) => sum + w.frequency, 0);
-      const knownCharRate = shelfAnalysis.total_characters > 0
-        ? Math.round((knownCharOccurrences / shelfAnalysis.total_characters) * 100)
-        : 100;
-      const knownWordRate = shelfAnalysis.total_words > 0
-        ? Math.round((knownWordOccurrences / shelfAnalysis.total_words) * 100)
-        : 100;
-
-      const formatShelfFreqItem = (item: library.CharacterFrequency | library.WordFrequency, type: "character" | "word") => {
-        const label = type === "character" ? (item as library.CharacterFrequency).character : (item as library.WordFrequency).word;
-        return `
-          <div class="freq-item ${item.is_known ? "known" : "unknown"}" data-lookup="${escapeHtml(label)}" data-lookup-type="${type}">
-            <span class="freq-${type === "character" ? "char" : "word"} freq-clickable">${label}</span>
-            <span class="freq-count">${item.frequency}x</span>
-            ${!item.is_known
-              ? `<button class="btn-mark-known-shelf" data-word="${label}" data-type="${type}">Mark Known</button>`
-              : '<span class="known-badge">Known</span>'
-            }
-          </div>
-        `;
-      };
-
-      html += `
-        <details class="shelf-analysis shelf-analysis-details" open>
-          <summary class="shelf-analysis-summary">Shelf Analysis</summary>
-          <div class="analysis-summary shelf-stats">
-            <div class="stat-card">
-              <span class="stat-value">${shelfAnalysis.text_count}</span>
-              <span class="stat-label">Texts</span>
-            </div>
-            <div class="stat-card">
-              <span class="stat-value">${library.formatCharacterCount(shelfAnalysis.total_characters)}</span>
-              <span class="stat-label">Total Characters</span>
-            </div>
-            <div class="stat-card">
-              <span class="stat-value">${shelfAnalysis.unique_characters}</span>
-              <span class="stat-label">Unique Characters</span>
-            </div>
-            <div class="stat-card ${knownCharRate >= 98 ? "highlight-good" : knownCharRate < 90 ? "highlight-bad" : ""}">
-              <span class="stat-value">${knownCharRate}%</span>
-              <span class="stat-label">Known Char Rate</span>
-            </div>
-            <div class="stat-card">
-              <span class="stat-value">${shelfAnalysis.unique_words}</span>
-              <span class="stat-label">Unique Words</span>
-            </div>
-            <div class="stat-card ${knownWordRate >= 98 ? "highlight-good" : knownWordRate < 90 ? "highlight-bad" : ""}">
-              <span class="stat-value">${knownWordRate}%</span>
-              <span class="stat-label">Known Word Rate</span>
-            </div>
-          </div>
-
-          <div class="analysis-sections">
-            <div class="analysis-section">
-              <h3>Unknown Characters (${shelfAnalysis.unknown_characters.length})</h3>
-              <div class="freq-list">
-                ${shelfAnalysis.unknown_characters.length === 0
-                  ? '<p class="empty-message">All characters are known!</p>'
-                  : shelfAnalysis.unknown_characters.slice(0, 50).map(cf => formatShelfFreqItem(cf, "character")).join("")
-                }
-              </div>
-            </div>
-
-            <div class="analysis-section">
-              <h3>Known Characters (${shelfAnalysis.known_characters.length})</h3>
-              <div class="freq-list">
-                ${shelfAnalysis.known_characters.length === 0
-                  ? '<p class="empty-message">No known characters yet.</p>'
-                  : shelfAnalysis.known_characters.slice(0, 50).map(cf => formatShelfFreqItem(cf, "character")).join("")
-                }
-              </div>
-            </div>
-
-            <div class="analysis-section">
-              <h3>Unknown Words (${shelfAnalysis.unknown_words.length})</h3>
-              <div class="freq-list">
-                ${shelfAnalysis.unknown_words.length === 0
-                  ? '<p class="empty-message">All words are known!</p>'
-                  : shelfAnalysis.unknown_words.slice(0, 50).map(wf => formatShelfFreqItem(wf, "word")).join("")
-                }
-              </div>
-            </div>
-
-            <div class="analysis-section">
-              <h3>Known Words (${shelfAnalysis.known_words.length})</h3>
-              <div class="freq-list">
-                ${shelfAnalysis.known_words.length === 0
-                  ? '<p class="empty-message">No known words yet.</p>'
-                  : shelfAnalysis.known_words.slice(0, 50).map(wf => formatShelfFreqItem(wf, "word")).join("")
-                }
-              </div>
-            </div>
-          </div>
-        </details>
-      `;
-    }
-
-    if (texts.length === 0) {
-      html += `<p class="empty-message">No texts in this shelf yet. Add one to get started.</p>`;
-    } else {
-      html += `<div class="text-list">`;
-      for (const text of texts) {
-        html += `
-          <div class="text-item" data-text-id="${text.id}">
-            <div class="text-info">
-              <h4 class="text-title">${escapeHtml(text.title)}</h4>
-              ${text.author ? `<p class="text-author">${escapeHtml(text.author)}</p>` : ""}
-            </div>
-            <div class="text-meta">
-              <span class="text-chars">${library.formatCharacterCount(text.character_count)} chars</span>
-              ${text.has_analysis ? '<span class="text-analyzed">Analyzed</span>' : ""}
-            </div>
-          </div>
-        `;
-      }
-      html += `</div>`;
-    }
-
-    html += `</div>`;
-
-    if (hasTexts) {
-      html += `
-        <aside class="dict-sidebar" id="shelf-dict-sidebar">
-          <div class="dict-sidebar-header">
-            <h3>Dictionary</h3>
-            <button class="dict-sidebar-close" id="shelf-dict-sidebar-close">&times;</button>
-          </div>
-          <div class="dict-sidebar-content" id="shelf-dict-sidebar-content">
-            <p class="dict-sidebar-empty">Click on a word or character to look it up</p>
-          </div>
-        </aside>
-      `;
-    }
-
-    html += `</div>`;
-
-    mainContainer.innerHTML = html;
-
-    document.getElementById("add-text-btn")?.addEventListener("click", () => showAddTextModal(shelfId));
-    document.getElementById("split-large-texts-btn")?.addEventListener("click", () => splitLargeTextsInShelf(shelfId));
-    const cacheBtn = document.getElementById("cache-shelf-btn") as HTMLButtonElement;
-    cacheBtn?.addEventListener("click", () => cacheShelfForOffline(shelfId, texts, cacheBtn));
-    document.getElementById("edit-shelf-btn")?.addEventListener("click", () => showEditShelfModal(shelfId));
-    document.getElementById("move-shelf-btn")?.addEventListener("click", () => showMoveShelfModal(shelfId));
-    document.getElementById("delete-shelf-btn")?.addEventListener("click", () => confirmDeleteShelf(shelfId));
-
-    mainContainer.querySelectorAll(".text-item").forEach((item) => {
-      item.addEventListener("click", () => {
-        const textId = parseInt((item as HTMLElement).dataset.textId!);
-        loadTextView(textId);
-      });
-    });
-
-    mainContainer.querySelectorAll(".btn-mark-known-shelf").forEach((btn) => {
-      btn.addEventListener("click", async (e) => {
-        e.stopPropagation();
-        const word = (btn as HTMLElement).dataset.word!;
-        const wordType = (btn as HTMLElement).dataset.type!;
-        const freqItem = (btn as HTMLElement).closest(".freq-item");
-
-        (btn as HTMLButtonElement).textContent = "Marked!";
-        (btn as HTMLButtonElement).disabled = true;
-        freqItem?.classList.remove("unknown");
-        freqItem?.classList.add("known");
-
-        try {
-          await library.addKnownWord(word, wordType);
-          btn.outerHTML = '<span class="known-badge">Known</span>';
-        } catch (error) {
-          console.error("Failed to mark as known:", error);
-          (btn as HTMLButtonElement).textContent = "Mark Known";
-          (btn as HTMLButtonElement).disabled = false;
-          freqItem?.classList.add("unknown");
-          freqItem?.classList.remove("known");
+      try {
+        const freshAnalysis = await library.getShelfAnalysis(shelfId, { signal: controller.signal });
+        saveNavCache(shelfAnalysisCacheKey(shelfId), freshAnalysis).catch(() => {});
+        if (selectedShelfId === shelfId) {
+          renderShelfContents(mainContainer, shelfId, shelf?.shelf.name || "Shelf", texts, freshAnalysis, "fresh");
         }
-      });
-    });
-
-    mainContainer.querySelectorAll(".shelf-analysis .freq-item[data-lookup]").forEach((item) => {
-      item.addEventListener("click", (e) => {
-        if ((e.target as HTMLElement).closest(".btn-mark-known-shelf")) return;
-
-        const term = (item as HTMLElement).dataset.lookup!;
-        const termType = (item as HTMLElement).dataset.lookupType as "character" | "word";
-
-        mainContainer.querySelectorAll(".shelf-analysis .freq-item").forEach(el => el.classList.remove("selected"));
-        item.classList.add("selected");
-
-        lookupInShelfSidebar(term, termType);
-      });
-    });
-
-    document.getElementById("shelf-dict-sidebar-close")?.addEventListener("click", () => {
-      const content = document.getElementById("shelf-dict-sidebar-content");
-      if (content) {
-        content.innerHTML = '<p class="dict-sidebar-empty">Click on a word or character to look it up</p>';
+      } catch (analysisError) {
+        if ((analysisError as Error).name === "AbortError") return;
+        if (cachedAnalysis || selectedShelfId !== shelfId) return;
+        console.warn("Failed to load shelf analysis:", analysisError);
+        renderShelfContents(mainContainer, shelfId, shelf?.shelf.name || "Shelf", texts, null, navigator.onLine ? "unavailable" : "offline");
+      } finally {
+        if (activeShelfAnalysisController === controller) {
+          activeShelfAnalysisController = null;
+        }
       }
-      document.getElementById("shelf-dict-sidebar")?.classList.remove("open");
-      mainContainer.querySelectorAll(".freq-item.selected").forEach(el => el.classList.remove("selected"));
-    });
-
-    if (window.matchMedia("(max-width: 700px)").matches) {
-      document.querySelector(".shelf-analysis-details")?.removeAttribute("open");
-    }
+    }, cachedAnalysis ? 150 : 350);
 
   } catch (error) {
     mainContainer.innerHTML = `<p class="error">Failed to load texts: ${error}</p>`;
+  }
+}
+
+function renderShelfContents(
+  mainContainer: HTMLElement,
+  shelfId: number,
+  shelfName: string,
+  texts: library.TextSummary[],
+  shelfAnalysis: library.ShelfAnalysis | null,
+  analysisState: "loading" | "cached" | "fresh" | "offline" | "unavailable",
+) {
+  const hasTexts = shelfAnalysis !== null && shelfAnalysis.text_count > 0;
+
+  let html = `
+    <div class="shelf-view-layout ${hasTexts ? "has-analysis" : ""}">
+      <div class="shelf-main">
+        <div class="shelf-header">
+          <h2>${escapeHtml(shelfName)}</h2>
+          <div class="shelf-actions">
+            <button id="add-text-btn" class="btn-primary">Add Text</button>
+            <button id="split-large-texts-btn" class="btn-secondary">Split Large Texts</button>
+            <button id="cache-shelf-btn" class="btn-secondary">Cache for Offline</button>
+            <button id="edit-shelf-btn" class="btn-secondary">Edit</button>
+            <button id="move-shelf-btn" class="btn-secondary">Move</button>
+            <button id="delete-shelf-btn" class="btn-danger">Delete</button>
+          </div>
+        </div>
+  `;
+
+  html += renderShelfAnalysisSection(shelfAnalysis, analysisState, texts.length > 0);
+
+  if (texts.length === 0) {
+    html += `<p class="empty-message">No texts in this shelf yet. Add one to get started.</p>`;
+  } else {
+    html += `<div class="text-list">`;
+    for (const text of texts) {
+      html += `
+        <div class="text-item" data-text-id="${text.id}">
+          <div class="text-info">
+            <h4 class="text-title">${escapeHtml(text.title)}</h4>
+            ${text.author ? `<p class="text-author">${escapeHtml(text.author)}</p>` : ""}
+          </div>
+          <div class="text-meta">
+            <span class="text-chars">${library.formatCharacterCount(text.character_count)} chars</span>
+            ${text.has_analysis ? '<span class="text-analyzed">Analyzed</span>' : ""}
+          </div>
+        </div>
+      `;
+    }
+    html += `</div>`;
+  }
+
+  html += `</div>`;
+
+  if (hasTexts) {
+    html += `
+      <aside class="dict-sidebar" id="shelf-dict-sidebar">
+        <div class="dict-sidebar-header">
+          <h3>Dictionary</h3>
+          <button class="dict-sidebar-close" id="shelf-dict-sidebar-close">&times;</button>
+        </div>
+        <div class="dict-sidebar-content" id="shelf-dict-sidebar-content">
+          <p class="dict-sidebar-empty">Click on a word or character to look it up</p>
+        </div>
+      </aside>
+    `;
+  }
+
+  html += `</div>`;
+  mainContainer.innerHTML = html;
+  bindShelfContents(mainContainer, shelfId, texts);
+}
+
+function renderShelfAnalysisSection(
+  shelfAnalysis: library.ShelfAnalysis | null,
+  analysisState: "loading" | "cached" | "fresh" | "offline" | "unavailable",
+  hasAnyTexts: boolean,
+): string {
+  if (shelfAnalysis === null) {
+    if (!hasAnyTexts) return "";
+    const message = analysisState === "loading"
+      ? "Loading shelf analysis..."
+      : analysisState === "offline"
+        ? "Offline and no cached shelf analysis is available yet."
+        : "Shelf analysis is currently unavailable.";
+    return `
+      <details class="shelf-analysis shelf-analysis-details" open>
+        <summary class="shelf-analysis-summary">Shelf Analysis</summary>
+        <p class="empty-message">${message}</p>
+      </details>
+    `;
+  }
+
+  const knownCharOccurrences = shelfAnalysis.known_characters.reduce((sum, c) => sum + c.frequency, 0);
+  const knownWordOccurrences = shelfAnalysis.known_words.reduce((sum, w) => sum + w.frequency, 0);
+  const knownCharRate = shelfAnalysis.total_characters > 0
+    ? Math.round((knownCharOccurrences / shelfAnalysis.total_characters) * 100)
+    : 100;
+  const knownWordRate = shelfAnalysis.total_words > 0
+    ? Math.round((knownWordOccurrences / shelfAnalysis.total_words) * 100)
+    : 100;
+  const cacheStatus = analysisState === "cached" ? "Showing cached analysis." : "";
+
+  const formatShelfFreqItem = (item: library.CharacterFrequency | library.WordFrequency, type: "character" | "word") => {
+    const label = type === "character" ? (item as library.CharacterFrequency).character : (item as library.WordFrequency).word;
+    return `
+      <div class="freq-item ${item.is_known ? "known" : "unknown"}" data-lookup="${escapeHtml(label)}" data-lookup-type="${type}">
+        <span class="freq-${type === "character" ? "char" : "word"} freq-clickable">${label}</span>
+        <span class="freq-count">${item.frequency}x</span>
+        ${!item.is_known
+          ? `<button class="btn-mark-known-shelf" data-word="${label}" data-type="${type}">Mark Known</button>`
+          : '<span class="known-badge">Known</span>'
+        }
+      </div>
+    `;
+  };
+
+  return `
+    <details class="shelf-analysis shelf-analysis-details" open>
+      <summary class="shelf-analysis-summary">Shelf Analysis</summary>
+      ${cacheStatus ? `<p class="empty-message">${cacheStatus}</p>` : ""}
+      <div class="analysis-summary shelf-stats">
+        <div class="stat-card">
+          <span class="stat-value">${shelfAnalysis.text_count}</span>
+          <span class="stat-label">Texts</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-value">${library.formatCharacterCount(shelfAnalysis.total_characters)}</span>
+          <span class="stat-label">Total Characters</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-value">${shelfAnalysis.unique_characters}</span>
+          <span class="stat-label">Unique Characters</span>
+        </div>
+        <div class="stat-card ${knownCharRate >= 98 ? "highlight-good" : knownCharRate < 90 ? "highlight-bad" : ""}">
+          <span class="stat-value">${knownCharRate}%</span>
+          <span class="stat-label">Known Char Rate</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-value">${shelfAnalysis.unique_words}</span>
+          <span class="stat-label">Unique Words</span>
+        </div>
+        <div class="stat-card ${knownWordRate >= 98 ? "highlight-good" : knownWordRate < 90 ? "highlight-bad" : ""}">
+          <span class="stat-value">${knownWordRate}%</span>
+          <span class="stat-label">Known Word Rate</span>
+        </div>
+      </div>
+
+      <div class="analysis-sections">
+        <div class="analysis-section">
+          <h3>Unknown Characters (${shelfAnalysis.unknown_characters.length})</h3>
+          <div class="freq-list">
+            ${shelfAnalysis.unknown_characters.length === 0
+              ? '<p class="empty-message">All characters are known!</p>'
+              : shelfAnalysis.unknown_characters.slice(0, 50).map(cf => formatShelfFreqItem(cf, "character")).join("")
+            }
+          </div>
+        </div>
+
+        <div class="analysis-section">
+          <h3>Known Characters (${shelfAnalysis.known_characters.length})</h3>
+          <div class="freq-list">
+            ${shelfAnalysis.known_characters.length === 0
+              ? '<p class="empty-message">No known characters yet.</p>'
+              : shelfAnalysis.known_characters.slice(0, 50).map(cf => formatShelfFreqItem(cf, "character")).join("")
+            }
+          </div>
+        </div>
+
+        <div class="analysis-section">
+          <h3>Unknown Words (${shelfAnalysis.unknown_words.length})</h3>
+          <div class="freq-list">
+            ${shelfAnalysis.unknown_words.length === 0
+              ? '<p class="empty-message">All words are known!</p>'
+              : shelfAnalysis.unknown_words.slice(0, 50).map(wf => formatShelfFreqItem(wf, "word")).join("")
+            }
+          </div>
+        </div>
+
+        <div class="analysis-section">
+          <h3>Known Words (${shelfAnalysis.known_words.length})</h3>
+          <div class="freq-list">
+            ${shelfAnalysis.known_words.length === 0
+              ? '<p class="empty-message">No known words yet.</p>'
+              : shelfAnalysis.known_words.slice(0, 50).map(wf => formatShelfFreqItem(wf, "word")).join("")
+            }
+          </div>
+        </div>
+      </div>
+    </details>
+  `;
+}
+
+function bindShelfContents(mainContainer: HTMLElement, shelfId: number, texts: library.TextSummary[]) {
+  document.getElementById("add-text-btn")?.addEventListener("click", () => showAddTextModal(shelfId));
+  document.getElementById("split-large-texts-btn")?.addEventListener("click", () => splitLargeTextsInShelf(shelfId));
+  const cacheBtn = document.getElementById("cache-shelf-btn") as HTMLButtonElement;
+  cacheBtn?.addEventListener("click", () => cacheShelfForOffline(shelfId, texts, cacheBtn));
+  document.getElementById("edit-shelf-btn")?.addEventListener("click", () => showEditShelfModal(shelfId));
+  document.getElementById("move-shelf-btn")?.addEventListener("click", () => showMoveShelfModal(shelfId));
+  document.getElementById("delete-shelf-btn")?.addEventListener("click", () => confirmDeleteShelf(shelfId));
+
+  mainContainer.querySelectorAll(".text-item").forEach((item) => {
+    item.addEventListener("click", () => {
+      const textId = parseInt((item as HTMLElement).dataset.textId!);
+      loadTextView(textId);
+    });
+  });
+
+  mainContainer.querySelectorAll(".btn-mark-known-shelf").forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const word = (btn as HTMLElement).dataset.word!;
+      const wordType = (btn as HTMLElement).dataset.type!;
+      const freqItem = (btn as HTMLElement).closest(".freq-item");
+
+      (btn as HTMLButtonElement).textContent = "Marked!";
+      (btn as HTMLButtonElement).disabled = true;
+      freqItem?.classList.remove("unknown");
+      freqItem?.classList.add("known");
+
+      try {
+        await library.addKnownWord(word, wordType);
+        btn.outerHTML = '<span class="known-badge">Known</span>';
+      } catch (error) {
+        console.error("Failed to mark as known:", error);
+        (btn as HTMLButtonElement).textContent = "Mark Known";
+        (btn as HTMLButtonElement).disabled = false;
+        freqItem?.classList.add("unknown");
+        freqItem?.classList.remove("known");
+      }
+    });
+  });
+
+  mainContainer.querySelectorAll(".shelf-analysis .freq-item[data-lookup]").forEach((item) => {
+    item.addEventListener("click", (e) => {
+      if ((e.target as HTMLElement).closest(".btn-mark-known-shelf")) return;
+
+      const term = (item as HTMLElement).dataset.lookup!;
+      const termType = (item as HTMLElement).dataset.lookupType as "character" | "word";
+
+      mainContainer.querySelectorAll(".shelf-analysis .freq-item").forEach(el => el.classList.remove("selected"));
+      item.classList.add("selected");
+
+      lookupInShelfSidebar(term, termType);
+    });
+  });
+
+  document.getElementById("shelf-dict-sidebar-close")?.addEventListener("click", () => {
+    const content = document.getElementById("shelf-dict-sidebar-content");
+    if (content) {
+      content.innerHTML = '<p class="dict-sidebar-empty">Click on a word or character to look it up</p>';
+    }
+    document.getElementById("shelf-dict-sidebar")?.classList.remove("open");
+    mainContainer.querySelectorAll(".freq-item.selected").forEach(el => el.classList.remove("selected"));
+  });
+
+  if (window.matchMedia("(max-width: 700px)").matches) {
+    document.querySelector(".shelf-analysis-details")?.removeAttribute("open");
   }
 }
 
@@ -853,7 +929,17 @@ async function loadInteractiveText(content: string, textId: number) {
   setCurrentTextId(textId);
 
   try {
-    const segments = await library.segmentText(content);
+    let segments: library.TextSegment[];
+    try {
+      segments = await library.segmentText(content);
+      saveTextSegments(textId, segments).catch((err) =>
+        console.warn("save text-segments failed:", err),
+      );
+    } catch (segmentError) {
+      const cachedSegments = await getTextSegments(textId).catch(() => null);
+      if (!cachedSegments) throw segmentError;
+      segments = cachedSegments;
+    }
 
     setCurrentTextSegments(segments);
 
@@ -2222,14 +2308,33 @@ async function cacheShelfForOffline(shelfId: number, directTexts: library.TextSu
   if (!shelfTree) return;
 
   btn.disabled = true;
-  btn.textContent = "Collecting…";
+  btn.textContent = "Collecting...";
 
   try {
-    const subShelfIds = [...getShelfAndDescendantIds(shelfTree, shelfId)].filter(id => id !== shelfId);
-    const subTexts = subShelfIds.length > 0
-      ? (await Promise.all(subShelfIds.map(id => library.listTextsInShelf(id)))).flat()
-      : [];
-    const texts = [...directTexts, ...subTexts];
+    saveNavCache("shelf_tree", shelfTree).catch(() => {});
+
+    const shelfIds = [...getShelfAndDescendantIds(shelfTree, shelfId)];
+    const textMap = new Map<number, library.TextSummary>();
+    for (const text of directTexts) {
+      textMap.set(text.id, text);
+    }
+
+    btn.textContent = `Caching shelves 1/${shelfIds.length}...`;
+    saveNavCache(textsCacheKey(shelfId), directTexts).catch(() => {});
+
+    for (let index = 0; index < shelfIds.length; index += 1) {
+      const currentShelfId = shelfIds[index];
+      if (currentShelfId !== shelfId) {
+        const shelfTexts = await library.listTextsInShelf(currentShelfId);
+        saveNavCache(textsCacheKey(currentShelfId), shelfTexts).catch(() => {});
+        for (const text of shelfTexts) {
+          textMap.set(text.id, text);
+        }
+      }
+      btn.textContent = `Caching shelves ${index + 1}/${shelfIds.length}...`;
+    }
+
+    const texts = [...textMap.values()];
 
     if (texts.length === 0) {
       btn.textContent = "Nothing to cache";
@@ -2237,17 +2342,38 @@ async function cacheShelfForOffline(shelfId: number, directTexts: library.TextSu
       return;
     }
 
-    let done = 0;
-    btn.textContent = `Caching 0/${texts.length}…`;
+    for (let index = 0; index < shelfIds.length; index += 1) {
+      const currentShelfId = shelfIds[index];
+      btn.textContent = `Caching analysis ${index + 1}/${shelfIds.length}...`;
+      try {
+        const analysis = await library.getShelfAnalysis(currentShelfId);
+        saveNavCache(shelfAnalysisCacheKey(currentShelfId), analysis).catch(() => {});
+      } catch (error) {
+        console.warn(`Failed to cache shelf analysis for ${currentShelfId}:`, error);
+      }
+    }
 
-    for (const text of texts) {
-      try { await fetch(`/api/texts/${text.id}`); } catch { /* skip */ }
-      btn.textContent = `Caching ${++done}/${texts.length}…`;
+    for (let index = 0; index < texts.length; index += 1) {
+      const text = texts[index];
+      btn.textContent = `Caching text ${index + 1}/${texts.length}...`;
+      const fullText = await library.getText(text.id);
+      try {
+        const segments = await library.segmentText(fullText.content);
+        await saveTextSegments(text.id, segments);
+      } catch (error) {
+        console.warn(`Failed to cache segments for text ${text.id}:`, error);
+      }
+      try {
+        await library.getTextVocabCache(text.id);
+      } catch (error) {
+        console.warn(`Failed to cache vocab for text ${text.id}:`, error);
+      }
     }
 
     btn.textContent = `Cached ${texts.length} texts ✓`;
     setTimeout(() => { btn.textContent = "Cache for Offline"; btn.disabled = false; }, 3000);
-  } catch {
+  } catch (error) {
+    console.error("Failed to cache shelf for offline use:", error);
     btn.textContent = "Cache for Offline";
     btn.disabled = false;
   }

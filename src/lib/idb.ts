@@ -1,13 +1,15 @@
-import type { TextVocabCache, VocabCacheEntry } from "./library";
+import type { Text, TextSegment, TextVocabCache, VocabCacheEntry } from "./library";
 
 const DB_NAME = "chinese-reader";
-const DB_VERSION = 3;
+const DB_VERSION = 4;
 
 export const STORE_VOCAB_CACHE = "vocab_cache";
 export const STORE_SESSIONS = "sessions";
 export const STORE_VOCAB_QUEUE = "vocab_queue";
 export const STORE_TEXT_META = "text_meta";
 export const STORE_NAV_CACHE = "nav_cache";
+export const STORE_TEXT_CACHE = "text_cache";
+export const STORE_TEXT_SEGMENTS = "text_segments";
 
 export function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -40,6 +42,11 @@ export function openDb(): Promise<IDBDatabase> {
       if (oldVersion < 3) {
         // nav_cache: keyPath = key (arbitrary string). persists shelf tree and text lists for offline navigation.
         db.createObjectStore(STORE_NAV_CACHE, { keyPath: "key" });
+      }
+      if (oldVersion < 4) {
+        // Full text records and server-generated segmentation for offline reading.
+        db.createObjectStore(STORE_TEXT_CACHE, { keyPath: "id" });
+        db.createObjectStore(STORE_TEXT_SEGMENTS, { keyPath: "text_id" });
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -264,4 +271,56 @@ export async function getNavCache<T>(key: string): Promise<T | null> {
   });
   db.close();
   return result ? result.data : null;
+}
+
+// ── Text cache ─────────────────────────────────────────────────────────
+
+export async function saveTextCache(text: Text): Promise<void> {
+  const db = await openDb();
+  const tx = db.transaction(STORE_TEXT_CACHE, "readwrite");
+  tx.objectStore(STORE_TEXT_CACHE).put({ ...text, cached_at: Date.now() });
+  await txDone(tx);
+  db.close();
+}
+
+export async function getTextCache(id: number): Promise<Text | null> {
+  const db = await openDb();
+  const result = await new Promise<(Text & { cached_at?: number }) | null>((resolve, reject) => {
+    const req = db
+      .transaction(STORE_TEXT_CACHE, "readonly")
+      .objectStore(STORE_TEXT_CACHE)
+      .get(id);
+    req.onsuccess = () => resolve(req.result ?? null);
+    req.onerror = () => reject(req.error);
+  });
+  db.close();
+  if (!result) return null;
+  const { cached_at: _cachedAt, ...text } = result;
+  return text;
+}
+
+export async function saveTextSegments(textId: number, segments: TextSegment[]): Promise<void> {
+  const db = await openDb();
+  const tx = db.transaction(STORE_TEXT_SEGMENTS, "readwrite");
+  tx.objectStore(STORE_TEXT_SEGMENTS).put({
+    text_id: textId,
+    segments,
+    cached_at: Date.now(),
+  });
+  await txDone(tx);
+  db.close();
+}
+
+export async function getTextSegments(textId: number): Promise<TextSegment[] | null> {
+  const db = await openDb();
+  const result = await new Promise<{ text_id: number; segments: TextSegment[]; cached_at: number } | null>((resolve, reject) => {
+    const req = db
+      .transaction(STORE_TEXT_SEGMENTS, "readonly")
+      .objectStore(STORE_TEXT_SEGMENTS)
+      .get(textId);
+    req.onsuccess = () => resolve(req.result ?? null);
+    req.onerror = () => reject(req.error);
+  });
+  db.close();
+  return result ? result.segments : null;
 }

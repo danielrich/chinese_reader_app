@@ -6,7 +6,7 @@
  */
 
 import { invoke, fetchJson } from "./api";
-import { ingestTextVocabCache } from "./idb";
+import { getTextCache, ingestTextVocabCache, saveTextCache } from "./idb";
 
 // =============================================================================
 // Types
@@ -404,7 +404,17 @@ export async function createText(
  * Get a text by ID
  */
 export async function getText(id: number): Promise<Text> {
-  return fetchJson<Text>(`/api/texts/${id}`);
+  try {
+    const text = await fetchJson<Text>(`/api/texts/${id}`);
+    saveTextCache(text).catch((err) =>
+      console.warn("save text-cache failed:", err),
+    );
+    return text;
+  } catch (error) {
+    const cached = await getTextCache(id).catch(() => null);
+    if (cached) return cached;
+    throw error;
+  }
 }
 
 /** A vocab cache entry for offline dictionary lookup */
@@ -422,11 +432,15 @@ export interface TextVocabCache {
   characters: VocabCacheEntry[];
 }
 
+interface RequestOptions {
+  signal?: AbortSignal;
+}
+
 /**
  * Get the vocab cache for a text (words + characters with definitions)
  */
-export async function getTextVocabCache(textId: number): Promise<TextVocabCache> {
-  const cache = await fetchJson<TextVocabCache>(`/api/texts/${textId}/vocab-cache`);
+export async function getTextVocabCache(textId: number, options?: RequestOptions): Promise<TextVocabCache> {
+  const cache = await fetchJson<TextVocabCache>(`/api/texts/${textId}/vocab-cache`, options);
   // Fire-and-forget: persist for offline lookup
   ingestTextVocabCache(cache).catch((err) =>
     console.warn("ingest vocab-cache failed:", err),
@@ -519,8 +533,8 @@ export async function reanalyzeText(textId: number): Promise<TextAnalysis> {
 /**
  * Get aggregated analysis for a shelf
  */
-export async function getShelfAnalysis(shelfId: number): Promise<ShelfAnalysis> {
-  return invoke<ShelfAnalysis>("get_shelf_analysis", { shelfId });
+export async function getShelfAnalysis(shelfId: number, options?: RequestOptions): Promise<ShelfAnalysis> {
+  return invoke<ShelfAnalysis>("get_shelf_analysis", { shelfId }, options);
 }
 
 /**
