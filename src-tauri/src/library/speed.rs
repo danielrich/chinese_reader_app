@@ -34,6 +34,8 @@ pub struct ReadingSession {
     pub auto_marked_words: i64,
     /// Percentage of known characters in this specific text at session start (0-100)
     pub text_known_char_percentage: Option<f64>,
+    /// Percentage of known words in this specific text at session start (0-100)
+    pub text_known_word_percentage: Option<f64>,
     pub created_at: String,
     pub is_manual_log: bool,
     pub source: Option<String>,
@@ -57,6 +59,7 @@ impl ReadingSession {
             auto_marked_characters: row.get("auto_marked_characters")?,
             auto_marked_words: row.get("auto_marked_words")?,
             text_known_char_percentage: row.get("text_known_char_percentage")?,
+            text_known_word_percentage: row.get("text_known_word_percentage")?,
             created_at: row.get("created_at")?,
             is_manual_log: row.get::<_, i64>("is_manual_log")? == 1,
             source: row.get("source")?,
@@ -90,6 +93,10 @@ pub struct SpeedDataPoint {
     pub auto_marked_words: i64,
     /// Percentage of known characters in this specific text at session start (0-100)
     pub text_known_char_percentage: Option<f64>,
+    /// Percentage of known words in this specific text at session start (0-100)
+    pub text_known_word_percentage: Option<f64>,
+    /// 1 for first read, 2 for second read, etc.
+    pub read_number: i64,
 }
 
 /// Aggregated speed statistics
@@ -106,6 +113,18 @@ pub struct SpeedStats {
     pub unread_characters: i64,
     /// Estimated seconds to complete unread texts (based on recent speed)
     pub estimated_completion_seconds: Option<i64>,
+}
+
+/// Estimated time for one complete pass through the selected shelf.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadPassEstimate {
+    pub read_number: i64,
+    pub completed_texts: i64,
+    pub total_texts: i64,
+    pub completed_characters: i64,
+    pub remaining_characters: i64,
+    pub recent_average_speed: f64,
+    pub estimated_remaining_seconds: Option<i64>,
 }
 
 impl Default for SpeedStats {
@@ -180,24 +199,8 @@ pub fn start_reading_session(conn: &Connection, text_id: i64) -> Result<ReadingS
         )
         .unwrap_or(0);
 
-    // Calculate known character percentage for this specific text
-    // This uses text_character_freq table which contains character frequencies for the text
-    let text_known_char_percentage: Option<f64> = conn
-        .query_row(
-            r#"
-            SELECT
-                CASE WHEN COALESCE(SUM(frequency), 0) = 0 THEN NULL
-                ELSE CAST(SUM(CASE WHEN kw.id IS NOT NULL AND kw.status = 'known' THEN frequency ELSE 0 END) AS REAL)
-                     / CAST(SUM(frequency) AS REAL) * 100.0
-                END
-            FROM text_character_freq tcf
-            LEFT JOIN known_words kw ON kw.word = tcf.character AND kw.word_type = 'character'
-            WHERE tcf.text_id = ?
-            "#,
-            [text_id],
-            |row| row.get(0),
-        )
-        .unwrap_or(None);
+    let text_known_char_percentage = calculate_text_known_percentage(conn, text_id, "character")?;
+    let text_known_word_percentage = calculate_text_known_percentage(conn, text_id, "word")?;
 
     // Insert the session
     let started_at = Utc::now().to_rfc3339();
@@ -207,8 +210,8 @@ pub fn start_reading_session(conn: &Connection, text_id: i64) -> Result<ReadingS
         INSERT INTO reading_sessions (
             text_id, started_at, character_count, is_first_read,
             known_characters_count, known_words_count, cumulative_characters_read,
-            text_known_char_percentage
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            text_known_char_percentage, text_known_word_percentage
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
         params![
             text_id,
@@ -219,6 +222,7 @@ pub fn start_reading_session(conn: &Connection, text_id: i64) -> Result<ReadingS
             known_words_count,
             cumulative_characters_read,
             text_known_char_percentage,
+            text_known_word_percentage,
         ],
     )?;
 
@@ -309,7 +313,7 @@ pub fn get_active_session(conn: &Connection, text_id: i64) -> Result<Option<Read
                known_words_count, cumulative_characters_read,
                duration_seconds, characters_per_minute,
                auto_marked_characters, auto_marked_words,
-               text_known_char_percentage, created_at,
+               text_known_char_percentage, text_known_word_percentage, created_at,
                is_manual_log, source
         FROM reading_sessions
         WHERE text_id = ? AND is_complete = 0
@@ -336,7 +340,7 @@ pub fn get_text_reading_history(conn: &Connection, text_id: i64) -> Result<Vec<R
                known_words_count, cumulative_characters_read,
                duration_seconds, characters_per_minute,
                auto_marked_characters, auto_marked_words,
-               text_known_char_percentage, created_at,
+               text_known_char_percentage, text_known_word_percentage, created_at,
                is_manual_log, source
         FROM reading_sessions
         WHERE text_id = ?
@@ -362,9 +366,7 @@ pub fn get_speed_data(
     first_reads_only: bool,
     limit: Option<usize>,
 ) -> Result<Vec<SpeedDataPoint>> {
-    let limit_clause = limit
-        .map(|l| format!("LIMIT {}", l))
-        .unwrap_or_default();
+    let limit_clause = limit.map(|l| format!("LIMIT {}", l)).unwrap_or_default();
 
     let mut query = String::from(
         r#"
@@ -373,7 +375,17 @@ pub fn get_speed_data(
                rs.character_count, rs.cumulative_characters_read,
                rs.known_characters_count, rs.known_words_count,
                rs.auto_marked_characters, rs.auto_marked_words,
-               rs.text_known_char_percentage
+               rs.text_known_char_percentage, rs.text_known_word_percentage,
+               (
+                   SELECT COUNT(*)
+                   FROM reading_sessions prior
+                   WHERE prior.text_id = rs.text_id
+                     AND prior.is_complete = 1
+                     AND (
+                         prior.finished_at < rs.finished_at
+                         OR (prior.finished_at = rs.finished_at AND prior.id <= rs.id)
+                     )
+               ) AS read_number
         FROM reading_sessions rs
         JOIN texts t ON rs.text_id = t.id
         WHERE rs.is_complete = 1
@@ -420,6 +432,8 @@ pub fn get_speed_data(
                 auto_marked_characters: row.get("auto_marked_characters")?,
                 auto_marked_words: row.get("auto_marked_words")?,
                 text_known_char_percentage: row.get("text_known_char_percentage")?,
+                text_known_word_percentage: row.get("text_known_word_percentage")?,
+                read_number: row.get("read_number")?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -428,7 +442,11 @@ pub fn get_speed_data(
 }
 
 /// Get aggregated speed statistics
-pub fn get_speed_stats(conn: &Connection, shelf_id: Option<i64>) -> Result<SpeedStats> {
+pub fn get_speed_stats(
+    conn: &Connection,
+    shelf_id: Option<i64>,
+    first_reads_only: bool,
+) -> Result<SpeedStats> {
     let shelf_filter = if let Some(sid) = shelf_id {
         format!(
             r#" AND t.shelf_id IN (
@@ -458,16 +476,22 @@ pub fn get_speed_stats(conn: &Connection, shelf_id: Option<i64>) -> Result<Speed
             COALESCE(MIN(rs.characters_per_minute), 0) as slowest_speed
         FROM reading_sessions rs
         JOIN texts t ON rs.text_id = t.id
-        WHERE rs.is_complete = 1 AND rs.is_first_read = 1
+        WHERE rs.is_complete = 1
+          AND (? = 0 OR rs.is_first_read = 1)
         {}
         "#,
         shelf_filter
     );
 
-    let (total_sessions, total_characters_read, total_reading_time_seconds, average_speed, fastest_speed, slowest_speed): (i64, i64, i64, f64, f64, f64) = conn.query_row(
-        &base_query,
-        [],
-        |row| {
+    let (
+        total_sessions,
+        total_characters_read,
+        total_reading_time_seconds,
+        average_speed,
+        fastest_speed,
+        slowest_speed,
+    ): (i64, i64, i64, f64, f64, f64) =
+        conn.query_row(&base_query, [first_reads_only as i64], |row| {
             Ok((
                 row.get(0)?,
                 row.get(1)?,
@@ -476,8 +500,7 @@ pub fn get_speed_stats(conn: &Connection, shelf_id: Option<i64>) -> Result<Speed
                 row.get(4)?,
                 row.get(5)?,
             ))
-        },
-    )?;
+        })?;
 
     // Get recent average (last 5 sessions)
     let recent_query = format!(
@@ -487,7 +510,8 @@ pub fn get_speed_stats(conn: &Connection, shelf_id: Option<i64>) -> Result<Speed
             SELECT rs.characters_per_minute
             FROM reading_sessions rs
             JOIN texts t ON rs.text_id = t.id
-            WHERE rs.is_complete = 1 AND rs.is_first_read = 1
+            WHERE rs.is_complete = 1
+              AND (? = 0 OR rs.is_first_read = 1)
             {}
             ORDER BY rs.finished_at DESC
             LIMIT 5
@@ -496,7 +520,8 @@ pub fn get_speed_stats(conn: &Connection, shelf_id: Option<i64>) -> Result<Speed
         shelf_filter
     );
 
-    let recent_average_speed: f64 = conn.query_row(&recent_query, [], |row| row.get(0))?;
+    let recent_average_speed: f64 =
+        conn.query_row(&recent_query, [first_reads_only as i64], |row| row.get(0))?;
 
     // If shelf-specific speed is 0, fall back to global speed for estimation
     let speed_for_estimation = if recent_average_speed > 0.0 {
@@ -509,12 +534,13 @@ pub fn get_speed_stats(conn: &Connection, shelf_id: Option<i64>) -> Result<Speed
             FROM (
                 SELECT rs.characters_per_minute
                 FROM reading_sessions rs
-                WHERE rs.is_complete = 1 AND rs.is_first_read = 1
+                WHERE rs.is_complete = 1
+                  AND (? = 0 OR rs.is_first_read = 1)
                 ORDER BY rs.finished_at DESC
                 LIMIT 5
             )
             "#,
-            [],
+            [first_reads_only as i64],
             |row| row.get(0),
         )?;
         global_recent
@@ -573,6 +599,92 @@ pub fn get_speed_stats(conn: &Connection, shelf_id: Option<i64>) -> Result<Speed
     })
 }
 
+/// Estimate remaining time for first read, second read, and later reread passes.
+pub fn get_read_pass_estimates(
+    conn: &Connection,
+    shelf_id: Option<i64>,
+) -> Result<Vec<ReadPassEstimate>> {
+    let shelf_filter = shelf_subtree_filter("t", shelf_id);
+    let total_texts: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM texts t WHERE 1=1 {}", shelf_filter),
+        [],
+        |row| row.get(0),
+    )?;
+
+    if total_texts == 0 {
+        return Ok(Vec::new());
+    }
+
+    let max_read_number: i64 = conn
+        .query_row(
+            &format!(
+                r#"
+                SELECT COALESCE(MAX(read_count), 0)
+                FROM (
+                    SELECT COUNT(rs.id) AS read_count
+                    FROM texts t
+                    LEFT JOIN reading_sessions rs
+                      ON rs.text_id = t.id AND rs.is_complete = 1
+                    WHERE 1=1 {}
+                    GROUP BY t.id
+                )
+                "#,
+                shelf_filter
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    let pass_count = max_read_number.max(2);
+    let mut estimates = Vec::new();
+
+    for read_number in 1..=pass_count {
+        let (completed_texts, completed_characters, remaining_characters): (i64, i64, i64) = conn
+            .query_row(
+            &format!(
+                r#"
+                    SELECT
+                        COALESCE(SUM(CASE WHEN read_count >= ? THEN 1 ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN read_count >= ? THEN character_count ELSE 0 END), 0),
+                        COALESCE(SUM(CASE WHEN read_count < ? THEN character_count ELSE 0 END), 0)
+                    FROM (
+                        SELECT t.id, t.character_count, COUNT(rs.id) AS read_count
+                        FROM texts t
+                        LEFT JOIN reading_sessions rs
+                          ON rs.text_id = t.id AND rs.is_complete = 1
+                        WHERE 1=1 {}
+                        GROUP BY t.id
+                    )
+                    "#,
+                shelf_filter
+            ),
+            params![read_number, read_number, read_number],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+
+        let recent_average_speed = recent_average_for_read_number(conn, shelf_id, read_number)?;
+        let estimated_remaining_seconds = if recent_average_speed > 0.0 && remaining_characters > 0
+        {
+            Some(((remaining_characters as f64) / recent_average_speed * 60.0) as i64)
+        } else {
+            None
+        };
+
+        estimates.push(ReadPassEstimate {
+            read_number,
+            completed_texts,
+            total_texts,
+            completed_characters,
+            remaining_characters,
+            recent_average_speed,
+            estimated_remaining_seconds,
+        });
+    }
+
+    Ok(estimates)
+}
+
 /// Create completed reading sessions for texts read offline.
 /// Duration is split proportionally by character count so all texts get the same CPM.
 pub fn log_offline_read(conn: &Connection, input: ManualLogInput) -> Result<Vec<ReadingSession>> {
@@ -580,7 +692,9 @@ pub fn log_offline_read(conn: &Connection, input: ManualLogInput) -> Result<Vec<
         return Err(LibraryError::InvalidInput("No texts specified".into()));
     }
     if input.total_duration_seconds <= 0 {
-        return Err(LibraryError::InvalidInput("Duration must be positive".into()));
+        return Err(LibraryError::InvalidInput(
+            "Duration must be positive".into(),
+        ));
     }
 
     let finished_at = DateTime::parse_from_rfc3339(&input.finished_at)
@@ -646,6 +760,9 @@ pub fn log_offline_read(conn: &Connection, input: ManualLogInput) -> Result<Vec<
         let started_at = finished_at - chrono::Duration::seconds(duration_secs);
 
         let characters_per_minute = char_count as f64 / (duration_secs as f64 / 60.0);
+        let text_known_char_percentage =
+            calculate_text_known_percentage(conn, text_id, "character")?;
+        let text_known_word_percentage = calculate_text_known_percentage(conn, text_id, "word")?;
 
         // Is this the first completed read of this text?
         let prior_complete: i64 = conn
@@ -674,8 +791,9 @@ pub fn log_offline_read(conn: &Connection, input: ManualLogInput) -> Result<Vec<
                 cumulative_characters_read,
                 duration_seconds, characters_per_minute,
                 auto_marked_characters, auto_marked_words,
+                text_known_char_percentage, text_known_word_percentage,
                 is_manual_log, source
-            ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, 0, 0, 1, ?)",
+            ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, 0, 0, ?, ?, 1, ?)",
             rusqlite::params![
                 text_id,
                 started_at.to_rfc3339(),
@@ -687,6 +805,8 @@ pub fn log_offline_read(conn: &Connection, input: ManualLogInput) -> Result<Vec<
                 cumulative,
                 duration_secs,
                 characters_per_minute,
+                text_known_char_percentage,
+                text_known_word_percentage,
                 input.source,
             ],
         )?;
@@ -769,23 +889,8 @@ pub fn upload_completed_session(conn: &Connection, s: &UploadSession) -> Result<
             |row| row.get(0),
         )
         .unwrap_or(0);
-    let text_known_char_percentage: Option<f64> = conn
-        .query_row(
-            r#"
-            SELECT
-                CASE WHEN COALESCE(SUM(frequency), 0) = 0 THEN NULL
-                ELSE CAST(SUM(CASE WHEN kw.id IS NOT NULL AND kw.status = 'known'
-                               THEN frequency ELSE 0 END) AS REAL)
-                     / CAST(SUM(frequency) AS REAL) * 100.0
-                END
-            FROM text_character_freq tcf
-            LEFT JOIN known_words kw ON kw.word = tcf.character AND kw.word_type = 'character'
-            WHERE tcf.text_id = ?
-            "#,
-            [s.text_id],
-            |row| row.get(0),
-        )
-        .unwrap_or(None);
+    let text_known_char_percentage = calculate_text_known_percentage(conn, s.text_id, "character")?;
+    let text_known_word_percentage = calculate_text_known_percentage(conn, s.text_id, "word")?;
 
     let started_at = DateTime::from_timestamp_millis(s.started_at_ms)
         .unwrap_or_else(Utc::now)
@@ -802,9 +907,9 @@ pub fn upload_completed_session(conn: &Connection, s: &UploadSession) -> Result<
             known_characters_count, known_words_count, cumulative_characters_read,
             duration_seconds, characters_per_minute,
             auto_marked_characters, auto_marked_words,
-            text_known_char_percentage,
+            text_known_char_percentage, text_known_word_percentage,
             is_manual_log, source
-        ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, 0, 0, ?, 0, 'in_app')
+        ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, 0, 0, ?, ?, 0, 'in_app')
         "#,
         rusqlite::params![
             s.local_id,
@@ -819,6 +924,7 @@ pub fn upload_completed_session(conn: &Connection, s: &UploadSession) -> Result<
             duration_seconds,
             characters_per_minute,
             text_known_char_percentage,
+            text_known_word_percentage,
         ],
     )?;
 
@@ -837,7 +943,7 @@ fn get_session_by_id(conn: &Connection, session_id: i64) -> Result<ReadingSessio
                known_words_count, cumulative_characters_read,
                duration_seconds, characters_per_minute,
                auto_marked_characters, auto_marked_words,
-               text_known_char_percentage, created_at,
+               text_known_char_percentage, text_known_word_percentage, created_at,
                is_manual_log, source
         FROM reading_sessions
         WHERE id = ?
@@ -846,6 +952,109 @@ fn get_session_by_id(conn: &Connection, session_id: i64) -> Result<ReadingSessio
         ReadingSession::from_row,
     )
     .map_err(|_| LibraryError::SessionNotFound(session_id))
+}
+
+fn calculate_text_known_percentage(
+    conn: &Connection,
+    text_id: i64,
+    word_type: &str,
+) -> Result<Option<f64>> {
+    let (freq_table, term_column) = match word_type {
+        "character" => ("text_character_freq", "character"),
+        "word" => ("text_word_freq", "word"),
+        _ => {
+            return Err(LibraryError::InvalidInput(format!(
+                "Invalid word type: {}",
+                word_type
+            )))
+        }
+    };
+
+    let query = format!(
+        r#"
+        SELECT
+            CASE WHEN COALESCE(SUM(tf.frequency), 0) = 0 THEN NULL
+            ELSE CAST(SUM(CASE WHEN kw.id IS NOT NULL AND kw.status = 'known'
+                           THEN tf.frequency ELSE 0 END) AS REAL)
+                 / CAST(SUM(tf.frequency) AS REAL) * 100.0
+            END
+        FROM {freq_table} tf
+        LEFT JOIN known_words kw ON kw.word = tf.{term_column} AND kw.word_type = ?
+        WHERE tf.text_id = ?
+        "#
+    );
+
+    Ok(conn
+        .query_row(&query, params![word_type, text_id], |row| row.get(0))
+        .unwrap_or(None))
+}
+
+fn shelf_subtree_filter(table_alias: &str, shelf_id: Option<i64>) -> String {
+    if let Some(sid) = shelf_id {
+        format!(
+            r#" AND {table_alias}.shelf_id IN (
+                WITH RECURSIVE shelf_tree AS (
+                    SELECT id FROM shelves WHERE id = {sid}
+                    UNION ALL
+                    SELECT s.id FROM shelves s
+                    JOIN shelf_tree st ON s.parent_id = st.id
+                )
+                SELECT id FROM shelf_tree
+            )"#
+        )
+    } else {
+        String::new()
+    }
+}
+
+fn recent_average_for_read_number(
+    conn: &Connection,
+    shelf_id: Option<i64>,
+    read_number: i64,
+) -> Result<f64> {
+    let average = recent_average_for_read_number_scoped(conn, shelf_id, read_number)?;
+    if average > 0.0 || shelf_id.is_none() {
+        return Ok(average);
+    }
+    recent_average_for_read_number_scoped(conn, None, read_number)
+}
+
+fn recent_average_for_read_number_scoped(
+    conn: &Connection,
+    shelf_id: Option<i64>,
+    read_number: i64,
+) -> Result<f64> {
+    let shelf_filter = shelf_subtree_filter("t", shelf_id);
+    conn.query_row(
+        &format!(
+            r#"
+            SELECT COALESCE(AVG(characters_per_minute), 0)
+            FROM (
+                SELECT rs.characters_per_minute
+                FROM reading_sessions rs
+                JOIN texts t ON rs.text_id = t.id
+                WHERE rs.is_complete = 1
+                  AND (
+                      SELECT COUNT(*)
+                      FROM reading_sessions prior
+                      WHERE prior.text_id = rs.text_id
+                        AND prior.is_complete = 1
+                        AND (
+                            prior.finished_at < rs.finished_at
+                            OR (prior.finished_at = rs.finished_at AND prior.id <= rs.id)
+                        )
+                  ) = ?
+                  {}
+                ORDER BY rs.finished_at DESC
+                LIMIT 5
+            )
+            "#,
+            shelf_filter
+        ),
+        [read_number],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
 }
 
 /// Update auto-marked counts for a session
@@ -1040,11 +1249,8 @@ mod tests {
         init_database(&conn).unwrap();
 
         // Create a test shelf
-        conn.execute(
-            "INSERT INTO shelves (name) VALUES ('Test Shelf')",
-            [],
-        )
-        .unwrap();
+        conn.execute("INSERT INTO shelves (name) VALUES ('Test Shelf')", [])
+            .unwrap();
 
         // Create a test text
         conn.execute(
@@ -1143,7 +1349,7 @@ mod tests {
     fn test_get_speed_stats_empty() {
         let conn = setup_test_db();
 
-        let stats = get_speed_stats(&conn, None).unwrap();
+        let stats = get_speed_stats(&conn, None, true).unwrap();
 
         assert_eq!(stats.total_sessions, 0);
         assert_eq!(stats.total_characters_read, 0);
@@ -1155,7 +1361,11 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_database(&conn).unwrap();
 
-        conn.execute("INSERT INTO shelves (id, name, sort_order) VALUES (1, 'S', 0)", []).unwrap();
+        conn.execute(
+            "INSERT INTO shelves (id, name, sort_order) VALUES (1, 'S', 0)",
+            [],
+        )
+        .unwrap();
         // Text A: 1000 chars, Text B: 2000 chars → total 3000
         conn.execute("INSERT INTO texts (id, shelf_id, title, content, character_count) VALUES (1, 1, 'A', 'x', 1000)", []).unwrap();
         conn.execute("INSERT INTO texts (id, shelf_id, title, content, character_count) VALUES (2, 1, 'B', 'x', 2000)", []).unwrap();
@@ -1192,14 +1402,19 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_database(&conn).unwrap();
 
-        conn.execute("INSERT INTO shelves (id, name, sort_order) VALUES (1, 'S', 0)", []).unwrap();
+        conn.execute(
+            "INSERT INTO shelves (id, name, sort_order) VALUES (1, 'S', 0)",
+            [],
+        )
+        .unwrap();
         conn.execute("INSERT INTO texts (id, shelf_id, title, content, character_count) VALUES (1, 1, 'A', 'x', 500)", []).unwrap();
         // Pre-existing completed session on text 1
         conn.execute(
             "INSERT INTO reading_sessions (text_id, started_at, character_count, is_complete)
              VALUES (1, '2026-01-01T00:00:00Z', 500, 1)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         let input = ManualLogInput {
             text_ids: vec![1],

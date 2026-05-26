@@ -101,6 +101,7 @@ export interface LocalSession {
   characters_per_minute?: number;
   known_characters_count?: number;
   text_known_char_percentage?: number;
+  text_known_word_percentage?: number;
   auto_marked_characters?: number;
   auto_marked_words?: number;
   source?: "in_app" | "offline";

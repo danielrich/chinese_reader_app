@@ -281,6 +281,9 @@ CREATE TABLE IF NOT EXISTS reading_sessions (
     -- Auto-marked vocabulary counts (recorded when session completed with auto-mark)
     auto_marked_characters INTEGER NOT NULL DEFAULT 0,
     auto_marked_words INTEGER NOT NULL DEFAULT 0,
+    -- Percentage of known vocabulary in this specific text at session start
+    text_known_char_percentage REAL,
+    text_known_word_percentage REAL,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     is_manual_log INTEGER NOT NULL DEFAULT 0,
     source TEXT,
@@ -440,6 +443,24 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    // Migration: Add text_known_word_percentage column to reading_sessions table.
+    // Older rows cannot be backfilled exactly because sessions did not store the
+    // per-session known word set.
+    let has_text_known_word_pct_column: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM pragma_table_info('reading_sessions') WHERE name = 'text_known_word_percentage'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if !has_text_known_word_pct_column {
+        conn.execute(
+            "ALTER TABLE reading_sessions ADD COLUMN text_known_word_percentage REAL",
+            [],
+        )?;
+    }
+
     // Migration: add is_manual_log to reading_sessions
     let has_manual_log: bool = conn
         .query_row(
@@ -465,9 +486,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         .unwrap_or(false);
 
     if !has_source {
-        conn.execute_batch(
-            "ALTER TABLE reading_sessions ADD COLUMN source TEXT;",
-        )?;
+        conn.execute_batch("ALTER TABLE reading_sessions ADD COLUMN source TEXT;")?;
     }
 
     // Migration: add client_local_id for idempotent offline session upload
@@ -538,10 +557,8 @@ mod tests {
     fn test_reading_sessions_has_manual_log_columns() {
         let conn = test_db();
         // Satisfy FK chain: shelves -> texts -> reading_sessions
-        conn.execute(
-            "INSERT INTO shelves (name) VALUES ('Test Shelf')",
-            [],
-        ).unwrap();
+        conn.execute("INSERT INTO shelves (name) VALUES ('Test Shelf')", [])
+            .unwrap();
         let shelf_id = conn.last_insert_rowid();
         conn.execute(
             "INSERT INTO texts (shelf_id, title, content, character_count) VALUES (?1, 'Test Text', 'content', 7)",
@@ -555,7 +572,8 @@ mod tests {
              (text_id, started_at, character_count, is_manual_log, source)
              VALUES (?1, '2026-01-01T00:00:00Z', 100, 1, 'physical_book')",
             [text_id],
-        ).unwrap();
+        )
+        .unwrap();
 
         let (is_manual, source): (i64, String) = conn.query_row(
             "SELECT is_manual_log, source FROM reading_sessions WHERE rowid = last_insert_rowid()",

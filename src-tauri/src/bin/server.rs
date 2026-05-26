@@ -45,7 +45,11 @@ impl DbPool {
     async fn acquire(self: &Arc<Self>) -> PoolConn {
         let permit = Arc::clone(&self.sem).acquire_owned().await.unwrap();
         let conn = self.conns.lock().unwrap().pop().unwrap();
-        PoolConn { pool: Arc::clone(self), conn: Some(conn), _permit: permit }
+        PoolConn {
+            pool: Arc::clone(self),
+            conn: Some(conn),
+            _permit: permit,
+        }
     }
 }
 
@@ -58,7 +62,9 @@ struct PoolConn {
 
 impl std::ops::Deref for PoolConn {
     type Target = Connection;
-    fn deref(&self) -> &Connection { self.conn.as_ref().unwrap() }
+    fn deref(&self) -> &Connection {
+        self.conn.as_ref().unwrap()
+    }
 }
 
 impl Drop for PoolConn {
@@ -90,12 +96,14 @@ async fn main() {
         })
     };
 
-    let cert_path: Option<std::path::PathBuf> = args.iter()
+    let cert_path: Option<std::path::PathBuf> = args
+        .iter()
         .position(|a| a == "--cert")
         .and_then(|i| args.get(i + 1))
         .map(std::path::PathBuf::from);
 
-    let key_path: Option<std::path::PathBuf> = args.iter()
+    let key_path: Option<std::path::PathBuf> = args
+        .iter()
         .position(|a| a == "--key")
         .and_then(|i| args.get(i + 1))
         .map(std::path::PathBuf::from);
@@ -129,7 +137,8 @@ async fn main() {
         eprintln!("Failed to initialize database: {}", e);
         std::process::exit(1);
     });
-    first.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=10000;")
+    first
+        .execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=10000;")
         .unwrap_or_else(|e| eprintln!("Warning: could not enable WAL mode: {}", e));
 
     match library::analysis::load_user_segmentation_words(&first) {
@@ -166,7 +175,10 @@ async fn main() {
         .route("/health", get(health))
         .route("/api/invoke/{command}", post(dispatch))
         .route("/api/texts/{id}", get(get_text_handler))
-        .route("/api/texts/{id}/vocab-cache", get(get_text_vocab_cache_handler))
+        .route(
+            "/api/texts/{id}/vocab-cache",
+            get(get_text_vocab_cache_handler),
+        )
         .route("/api/sync/sessions", post(sync_sessions_handler))
         .fallback_service(serve_static)
         .with_state(db)
@@ -251,9 +263,12 @@ async fn sync_sessions_handler(
 ) -> Result<Json<Value>, AppError> {
     let conn = db.acquire().await;
     let result = tokio::task::spawn_blocking(move || {
-        let sessions: Vec<library::speed::UploadSession> =
-            serde_json::from_value(body.get("sessions").cloned().unwrap_or(Value::Array(vec![])))
-                .map_err(|e| ApiError::BadRequest(format!("invalid sessions: {}", e)))?;
+        let sessions: Vec<library::speed::UploadSession> = serde_json::from_value(
+            body.get("sessions")
+                .cloned()
+                .unwrap_or(Value::Array(vec![])),
+        )
+        .map_err(|e| ApiError::BadRequest(format!("invalid sessions: {}", e)))?;
         let mut ids: Vec<i64> = Vec::new();
         for s in &sessions {
             ids.push(library::speed::upload_completed_session(&conn, s).map_err(db_err)?);
@@ -790,7 +805,16 @@ fn dispatch_sync(conn: &Connection, command: &str, body: &Value) -> Result<Value
 
         "get_speed_stats" => {
             let shelf_id: Option<i64> = opt_field(body, "shelf_id");
-            serialize(library::speed::get_speed_stats(conn, shelf_id).map_err(db_err)?)
+            let first_reads_only: bool = opt_field(body, "first_reads_only").unwrap_or(true);
+            serialize(
+                library::speed::get_speed_stats(conn, shelf_id, first_reads_only)
+                    .map_err(db_err)?,
+            )
+        }
+
+        "get_read_pass_estimates" => {
+            let shelf_id: Option<i64> = opt_field(body, "shelf_id");
+            serialize(library::speed::get_read_pass_estimates(conn, shelf_id).map_err(db_err)?)
         }
 
         "get_daily_reading_volume" => {
@@ -823,7 +847,8 @@ fn dispatch_sync(conn: &Connection, command: &str, body: &Value) -> Result<Value
         // ── Auto-mark ──────────────────────────────────────────────────────
         "auto_mark_text_as_known" => {
             let text_id: i64 = field(body, "text_id")?;
-            let stats = library::analysis::auto_mark_text_as_known(conn, text_id).map_err(db_err)?;
+            let stats =
+                library::analysis::auto_mark_text_as_known(conn, text_id).map_err(db_err)?;
             serialize(serde_json::json!({
                 "characters_marked": stats.characters_marked,
                 "words_marked": stats.words_marked,
@@ -965,7 +990,10 @@ fn dispatch_sync(conn: &Connection, command: &str, body: &Value) -> Result<Value
                     let dict = dictionary::user::create_dictionary(
                         conn,
                         &dict_name,
-                        Some(&format!("Custom word definitions for shelf: {}", shelf_name)),
+                        Some(&format!(
+                            "Custom word definitions for shelf: {}",
+                            shelf_name
+                        )),
                         Some(&domain),
                     )
                     .map_err(db_err)?;
@@ -1043,6 +1071,9 @@ fn dispatch_sync(conn: &Connection, command: &str, body: &Value) -> Result<Value
             }))
         }
 
-        _ => Err(ApiError::BadRequest(format!("Unknown command: {}", command))),
+        _ => Err(ApiError::BadRequest(format!(
+            "Unknown command: {}",
+            command
+        ))),
     }
 }

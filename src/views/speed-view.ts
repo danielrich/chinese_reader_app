@@ -8,8 +8,10 @@ import { escapeHtml, renderTwoLevelShelfSelector } from "../utils";
 
 let currentSpeedShelfId: number | null = null;
 let currentSpeedPrimaryShelfId: number | null = null;
-let currentGraphType: "cumulative" | "known_chars" | "known_words" | "known_char_pct" = "cumulative";
+type SpeedGraphType = "cumulative" | "known_chars" | "known_words" | "known_char_pct" | "known_word_pct";
+let currentGraphType: SpeedGraphType = "cumulative";
 let excludeHighAutoMarked: boolean = false;
+let firstReadsOnly: boolean = true;
 
 export async function loadSpeedView() {
   const container = document.getElementById("speed-main");
@@ -18,9 +20,10 @@ export async function loadSpeedView() {
   container.innerHTML = '<p class="loading">Loading speed data...</p>';
 
   try {
-    const [stats, data, shelves, autoMarkEnabled] = await Promise.all([
-      speed.getSpeedStats(currentSpeedShelfId ?? undefined),
-      speed.getSpeedData(currentSpeedShelfId ?? undefined, true, 100),
+    const [stats, data, passEstimates, shelves, autoMarkEnabled] = await Promise.all([
+      speed.getSpeedStats(currentSpeedShelfId ?? undefined, firstReadsOnly),
+      speed.getSpeedData(currentSpeedShelfId ?? undefined, firstReadsOnly, 100),
+      speed.getReadPassEstimates(currentSpeedShelfId ?? undefined),
       library.getShelfTree(),
       library.isAutoMarkEnabled(),
     ]);
@@ -71,6 +74,15 @@ export async function loadSpeedView() {
             <input type="checkbox" id="exclude-high-automark-toggle" ${excludeHighAutoMarked ? "checked" : ""}>
             <span class="toggle-label">Exclude sessions with >10% auto-marked from knowledge correlation graphs</span>
           </label>
+          <label class="toggle-setting" style="margin-top: 0.5rem;">
+            <input type="checkbox" id="first-reads-only-toggle" ${firstReadsOnly ? "checked" : ""}>
+            <span class="toggle-label">Show first reads only in graphs and recent sessions</span>
+          </label>
+        </div>
+
+        <div class="read-pass-estimates-section">
+          <h3>Shelf Pass Estimates</h3>
+          ${renderReadPassEstimates(passEstimates)}
         </div>
 
         <div class="speed-graph-section">
@@ -79,7 +91,10 @@ export async function loadSpeedView() {
               Speed vs Experience
             </button>
             <button class="graph-tab ${currentGraphType === "known_char_pct" ? "active" : ""}" data-graph="known_char_pct">
-              Speed vs Known %
+              Speed vs Known Char %
+            </button>
+            <button class="graph-tab ${currentGraphType === "known_word_pct" ? "active" : ""}" data-graph="known_word_pct">
+              Speed vs Known Word %
             </button>
             <button class="graph-tab ${currentGraphType === "known_chars" ? "active" : ""}" data-graph="known_chars">
               Speed vs Known Chars
@@ -153,22 +168,25 @@ function calculateLowessSmoothing(
   return smoothed;
 }
 
-function renderSpeedGraph(data: speed.SpeedDataPoint[], graphType: "cumulative" | "known_chars" | "known_words" | "known_char_pct"): string {
+function renderSpeedGraph(data: speed.SpeedDataPoint[], graphType: SpeedGraphType): string {
   let filteredData = data;
-  if (excludeHighAutoMarked && (graphType === "known_chars" || graphType === "known_words" || graphType === "known_char_pct")) {
+  if (excludeHighAutoMarked && graphType !== "cumulative") {
     filteredData = speed.filterHighAutoMarked(data);
   }
 
   if (graphType === "known_char_pct") {
     filteredData = filteredData.filter(d => d.text_known_char_percentage !== null);
   }
+  if (graphType === "known_word_pct") {
+    filteredData = filteredData.filter(d => d.text_known_word_percentage !== null);
+  }
 
   if (filteredData.length === 0) {
     let filterNote = "";
     if (excludeHighAutoMarked && data.length > 0) {
       filterNote = " (all sessions excluded due to high auto-mark filter)";
-    } else if (graphType === "known_char_pct" && data.length > 0) {
-      filterNote = " (older sessions don't have this data - it will appear for future reading sessions)";
+    } else if ((graphType === "known_char_pct" || graphType === "known_word_pct") && data.length > 0) {
+      filterNote = " (older sessions may not have this data - it will appear for future reading sessions)";
     }
     return `<p class="empty-message graph-empty">No reading sessions yet${filterNote}. Start reading to see your progress!</p>`;
   }
@@ -186,7 +204,11 @@ function renderSpeedGraph(data: speed.SpeedDataPoint[], graphType: "cumulative" 
         break;
       case "known_char_pct":
         x = d.text_known_char_percentage!;
-        xLabel = `${d.text_known_char_percentage!.toFixed(1)}% known`;
+        xLabel = `${d.text_known_char_percentage!.toFixed(1)}% known chars`;
+        break;
+      case "known_word_pct":
+        x = d.text_known_word_percentage!;
+        xLabel = `${d.text_known_word_percentage!.toFixed(1)}% known words`;
         break;
       case "known_chars":
         x = d.known_characters_count;
@@ -280,6 +302,11 @@ function renderSpeedGraph(data: speed.SpeedDataPoint[], graphType: "cumulative" 
       xMinLabel = `${Math.round(minX)}%`;
       xMaxLabel = `${Math.round(maxX)}%`;
       break;
+    case "known_word_pct":
+      xAxisLabel = "Known Word %";
+      xMinLabel = `${Math.round(minX)}%`;
+      xMaxLabel = `${Math.round(maxX)}%`;
+      break;
     case "known_chars":
       xAxisLabel = "Known Characters";
       xMinLabel = library.formatCharacterCount(Math.round(minX));
@@ -327,11 +354,45 @@ function renderRecentSessions(data: speed.SpeedDataPoint[]): string {
       <div class="recent-session-item">
         <div class="session-info">
           <span class="session-title">${escapeHtml(session.text_title)}</span>
-          <span class="session-date">${speed.formatSessionDate(session.finished_at)}</span>
+          <span class="session-date">${speed.formatSessionDate(session.finished_at)} · read ${session.read_number}</span>
         </div>
         <div class="session-stats">
           <span class="session-speed">${speed.formatSpeed(session.characters_per_minute)} chars/min</span>
           <span class="session-chars">${library.formatCharacterCount(session.character_count)} chars</span>
+        </div>
+      </div>
+    `;
+  }
+
+  html += '</div>';
+  return html;
+}
+
+function renderReadPassEstimates(estimates: speed.ReadPassEstimate[]): string {
+  if (estimates.length === 0) {
+    return '<p class="empty-message">Select a shelf with texts to see pass estimates.</p>';
+  }
+
+  let html = '<div class="read-pass-estimates-list">';
+
+  for (const estimate of estimates) {
+    const remaining = estimate.estimated_remaining_seconds !== null
+      ? speed.formatDuration(estimate.estimated_remaining_seconds)
+      : "-";
+    const recentSpeed = estimate.recent_average_speed > 0
+      ? `${speed.formatSpeed(estimate.recent_average_speed)} chars/min`
+      : "-";
+
+    html += `
+      <div class="read-pass-estimate-item">
+        <div class="pass-info">
+          <span class="pass-title">Read ${estimate.read_number}</span>
+          <span class="pass-progress">${estimate.completed_texts}/${estimate.total_texts} texts</span>
+        </div>
+        <div class="pass-stats">
+          <span>${library.formatCharacterCount(estimate.remaining_characters)} chars remaining</span>
+          <span>${recentSpeed}</span>
+          <span>${remaining}</span>
         </div>
       </div>
     `;
@@ -357,7 +418,7 @@ function setupSpeedViewHandlers(data: speed.SpeedDataPoint[]) {
 
   document.querySelectorAll(".graph-tab").forEach((tab) => {
     tab.addEventListener("click", () => {
-      const graphType = (tab as HTMLElement).dataset.graph as "cumulative" | "known_chars" | "known_words" | "known_char_pct";
+      const graphType = (tab as HTMLElement).dataset.graph as SpeedGraphType;
       currentGraphType = graphType;
 
       document.querySelectorAll(".graph-tab").forEach((t) => t.classList.remove("active"));
@@ -387,5 +448,10 @@ function setupSpeedViewHandlers(data: speed.SpeedDataPoint[]) {
     if (graphContainer) {
       graphContainer.innerHTML = renderSpeedGraph(data, currentGraphType);
     }
+  });
+
+  document.getElementById("first-reads-only-toggle")?.addEventListener("change", async (e) => {
+    firstReadsOnly = (e.target as HTMLInputElement).checked;
+    await loadSpeedView();
   });
 }

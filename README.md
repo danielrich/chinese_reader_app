@@ -22,6 +22,7 @@ few explicit PWA routes for text content, vocab cache, and session sync.
 More detail:
 
 - [Current architecture](docs/architecture/current-architecture.md)
+- [Style guide](docs/style-guide.md)
 - [Engineering notes and concerns](docs/engineering-notes.md)
 - [AppArmor/bubblewrap sandbox note](docs/operations/apparmor-bwrap-sandbox.md)
 - [Cross-device design spec](docs/superpowers/specs/2026-04-25-cross-device-reader-design.md)
@@ -141,6 +142,35 @@ sudo systemctl status chinese-reader
 sudo systemctl restart chinese-reader
 sudo journalctl -u chinese-reader -f
 ```
+
+## Database Migrations
+
+The server runs SQLite migrations automatically when it starts, but for an
+existing daemon it is safer to back up the database, apply migrations, and then
+restart the service:
+
+```bash
+scripts/backup-and-migrate-db.sh
+```
+
+The script defaults to:
+
+```text
+~/.local/share/com.chinesereader.ChineseReader/dictionary.db
+```
+
+It builds the frontend and release binaries, stops `chinese-reader` if it is
+running, writes a timestamped backup under the database directory, runs the
+`migrate` binary, and starts the service again. For a custom deployment:
+
+```bash
+scripts/backup-and-migrate-db.sh \
+  --db-path /opt/chinese-reader/dictionary.db \
+  --service chinese-reader
+```
+
+Use `--no-restart` if you are not using systemd, and restart your daemon
+manually after replacing the server binary.
 
 For PWA/offline use from Android or another LAN device, serve over HTTPS.
 The server supports mkcert-generated certificates:

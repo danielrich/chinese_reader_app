@@ -50,6 +50,8 @@ export interface ReadingSession {
   auto_marked_words: number;
   /** Percentage of known characters in this specific text at session start (0-100) */
   text_known_char_percentage: number | null;
+  /** Percentage of known words in this specific text at session start (0-100) */
+  text_known_word_percentage: number | null;
   /** Session creation timestamp */
   created_at: string;
   /** Whether this session was manually logged (offline) */
@@ -86,6 +88,10 @@ export interface SpeedDataPoint {
   auto_marked_words: number;
   /** Percentage of known characters in this specific text at session start (0-100) */
   text_known_char_percentage: number | null;
+  /** Percentage of known words in this specific text at session start (0-100) */
+  text_known_word_percentage: number | null;
+  /** 1 for first read, 2 for second read, etc. */
+  read_number: number;
 }
 
 /** Aggregated speed statistics */
@@ -108,6 +114,17 @@ export interface SpeedStats {
   unread_characters: number;
   /** Estimated seconds to complete unread texts */
   estimated_completion_seconds: number | null;
+}
+
+/** Estimated time for one complete pass through the selected shelf */
+export interface ReadPassEstimate {
+  read_number: number;
+  completed_texts: number;
+  total_texts: number;
+  completed_characters: number;
+  remaining_characters: number;
+  recent_average_speed: number;
+  estimated_remaining_seconds: number | null;
 }
 
 /** Daily reading volume data point */
@@ -275,8 +292,15 @@ export async function getSpeedData(
 /**
  * Get aggregated speed statistics
  */
-export async function getSpeedStats(shelfId?: number): Promise<SpeedStats> {
-  return invoke<SpeedStats>("get_speed_stats", { shelfId });
+export async function getSpeedStats(shelfId?: number, firstReadsOnly: boolean = true): Promise<SpeedStats> {
+  return invoke<SpeedStats>("get_speed_stats", { shelfId, firstReadsOnly });
+}
+
+/**
+ * Get remaining time estimates for first read, second read, and later reread passes.
+ */
+export async function getReadPassEstimates(shelfId?: number): Promise<ReadPassEstimate[]> {
+  return invoke<ReadPassEstimate[]>("get_read_pass_estimates", { shelfId });
 }
 
 /**
