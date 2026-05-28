@@ -183,10 +183,46 @@ export async function startReadingSession(textId: number, characterCount?: numbe
     finished_at: null,
     status: "in_progress",
     character_count: characterCount,
+    paused_at: null,
     source: "in_app",
   };
   await saveSession(session);
   return session;
+}
+
+/**
+ * Pause an active local reading session.
+ */
+export async function pauseReadingSession(localId: string): Promise<LocalSession> {
+  const session = await getSession(localId);
+  if (!session) throw new Error(`Session ${localId} not found`);
+  if (session.status !== "in_progress" || session.paused_at) return session;
+
+  const paused: LocalSession = {
+    ...session,
+    paused_at: Date.now(),
+  };
+  await saveSession(paused);
+  return paused;
+}
+
+/**
+ * Resume an active local reading session, shifting start time forward by the pause gap.
+ */
+export async function resumeReadingSession(localId: string): Promise<LocalSession> {
+  const session = await getSession(localId);
+  if (!session) throw new Error(`Session ${localId} not found`);
+  if (session.status !== "in_progress" || !session.paused_at) return session;
+
+  const resumedAt = Date.now();
+  const pauseMs = Math.max(0, resumedAt - session.paused_at);
+  const resumed: LocalSession = {
+    ...session,
+    started_at: session.started_at + pauseMs,
+    paused_at: null,
+  };
+  await saveSession(resumed);
+  return resumed;
 }
 
 /**
@@ -199,7 +235,7 @@ export async function finishReadingSession(localId: string): Promise<LocalSessio
   if (!session) throw new Error(`Session ${localId} not found`);
   if (session.status !== "in_progress") return session;
 
-  const finished_at = Date.now();
+  const finished_at = session.paused_at ?? Date.now();
   const duration_seconds = Math.round((finished_at - session.started_at) / 1000);
   const characters_per_minute =
     session.character_count && duration_seconds > 0
@@ -211,6 +247,7 @@ export async function finishReadingSession(localId: string): Promise<LocalSessio
     finished_at,
     duration_seconds,
     characters_per_minute,
+    paused_at: null,
     status: "completed_pending_upload",
   };
   await saveSession(completed);
@@ -373,10 +410,29 @@ export function getElapsedSeconds(startedAt: string | number): number {
 }
 
 /**
+ * Calculate active reading time for a local session, excluding current pause time.
+ */
+export function getSessionElapsedSeconds(session: LocalSession): number {
+  const end = session.paused_at ?? Date.now();
+  return Math.max(0, Math.floor((end - session.started_at) / 1000));
+}
+
+/**
  * Format elapsed time for display (updating timer)
  */
 export function formatElapsedTime(startedAt: string | number): string {
   const elapsed = getElapsedSeconds(startedAt);
+  return formatSecondsAsTimer(elapsed);
+}
+
+/**
+ * Format active reading time for a local session.
+ */
+export function formatSessionElapsedTime(session: LocalSession): string {
+  return formatSecondsAsTimer(getSessionElapsedSeconds(session));
+}
+
+function formatSecondsAsTimer(elapsed: number): string {
   const minutes = Math.floor(elapsed / 60);
   const seconds = elapsed % 60;
   return `${minutes.toString().padStart(2, "0")}:${seconds.toString().padStart(2, "0")}`;

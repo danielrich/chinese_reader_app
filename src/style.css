@@ -406,6 +406,16 @@ h3 {
   border-bottom-color: #646cff;
 }
 
+.nav-tab-action {
+  margin-left: auto;
+  font-size: 0.9rem;
+}
+
+.nav-tab-action:disabled {
+  color: #888;
+  cursor: wait;
+}
+
 /* Views */
 .view {
   display: none;
@@ -656,7 +666,8 @@ h3 {
   .shelf-view-layout .dict-sidebar,
   .text-view-layout .dict-sidebar,
   #dict-sidebar,
-  #shelf-dict-sidebar {
+  #shelf-dict-sidebar,
+  #learning-dict-sidebar {
     position: fixed;
     left: 0;
     right: 0;
@@ -675,7 +686,8 @@ h3 {
   .shelf-view-layout .dict-sidebar.open,
   .text-view-layout .dict-sidebar.open,
   #dict-sidebar.open,
-  #shelf-dict-sidebar.open {
+  #shelf-dict-sidebar.open,
+  #learning-dict-sidebar.open {
     transform: translateY(0);
   }
 
@@ -1846,6 +1858,11 @@ h3 {
   text-align: center;
 }
 
+.session-timer.paused {
+  color: #b58900;
+  background: rgba(181, 137, 0, 0.14);
+}
+
 /* Reading History */
 .reading-history {
   padding: 1rem 0;
@@ -2415,6 +2432,10 @@ h3 {
   .learning-stats {
     grid-template-columns: repeat(2, 1fr);
   }
+
+  .learning-priorities-layout {
+    display: block;
+  }
 }
 
 /* Percentile Coverage Section */
@@ -2677,6 +2698,27 @@ h3 {
   font-size: 1.1rem;
 }
 
+.learning-priorities-layout {
+  display: flex;
+  gap: 1rem;
+  align-items: flex-start;
+}
+
+.learning-priorities-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.priority-group h4 {
+  margin: 0 0 0.75rem;
+  color: #888;
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
 .priorities-list {
   display: flex;
   flex-wrap: wrap;
@@ -2691,12 +2733,19 @@ h3 {
   background: #242424;
   border-radius: 6px;
   border: 1px solid #333;
+  color: inherit;
   cursor: pointer;
   transition: border-color 0.15s;
+  font: inherit;
 }
 
 .priority-item:hover {
   border-color: #646cff;
+}
+
+.priority-item.selected {
+  border-color: #646cff;
+  box-shadow: 0 0 0 1px rgba(100, 108, 255, 0.35);
 }
 
 .priority-item.learning {
@@ -2740,6 +2789,14 @@ h3 {
   background: #444;
   color: #888;
   cursor: not-allowed;
+}
+
+#learning-dict-sidebar {
+  display: none;
+}
+
+#learning-dict-sidebar.open {
+  display: flex;
 }
 
 /* Learning Vocabulary Section */
@@ -3333,6 +3390,10 @@ h3 {
 
   .priority-type {
     background: #e0e0e0;
+    color: #666;
+  }
+
+  .priority-group h4 {
     color: #666;
   }
 

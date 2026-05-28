@@ -527,7 +527,8 @@ async function loadTextView(textId: number) {
           <div class="reading-controls" id="reading-controls">
             ${activeSession
               ? `
-                <span class="session-timer" id="session-timer">${speed.formatElapsedTime(activeSession.started_at)}</span>
+                <span class="session-timer ${activeSession.paused_at ? "paused" : ""}" id="session-timer">${speed.formatSessionElapsedTime(activeSession)}</span>
+                <button id="pause-reading-btn" class="btn-secondary">${activeSession.paused_at ? "Resume" : "Pause"}</button>
                 <button id="finish-reading-btn" class="btn-primary">Finish Reading</button>
                 <button id="discard-reading-btn" class="btn-secondary">Discard</button>
               `
@@ -593,7 +594,7 @@ async function loadTextView(textId: number) {
     loadInteractiveText(text.content, textId);
 
     if (activeSession) {
-      startSessionTimer(activeSession.started_at);
+      startSessionTimer();
     }
 
     mainContainer.querySelectorAll(".text-tab").forEach((tab) => {
@@ -723,7 +724,7 @@ function setupReadingControls(textId: number) {
     try {
       setActiveSession(await speed.startReadingSession(textId, currentTextCharacterCount));
       updateReadingControlsUI();
-      startSessionTimer(activeSession!.started_at);
+      startSessionTimer();
     } catch (error) {
       console.error("Failed to start reading session:", error);
       alert(`Failed to start reading: ${error}`);
@@ -734,6 +735,7 @@ function setupReadingControls(textId: number) {
     showOfflineLogModal();
   });
 
+  document.getElementById("pause-reading-btn")?.addEventListener("click", toggleReadingPause);
   document.getElementById("finish-reading-btn")?.addEventListener("click", finishCurrentReadingSession);
 
   document.getElementById("discard-reading-btn")?.addEventListener("click", async () => {
@@ -762,10 +764,12 @@ function updateReadingControlsUI() {
 
   if (activeSession) {
     container.innerHTML = `
-      <span class="session-timer" id="session-timer">${speed.formatElapsedTime(activeSession.started_at)}</span>
+      <span class="session-timer ${activeSession.paused_at ? "paused" : ""}" id="session-timer">${speed.formatSessionElapsedTime(activeSession)}</span>
+      <button id="pause-reading-btn" class="btn-secondary">${activeSession.paused_at ? "Resume" : "Pause"}</button>
       <button id="finish-reading-btn" class="btn-primary">Finish Reading</button>
       <button id="discard-reading-btn" class="btn-secondary">Discard</button>
     `;
+    document.getElementById("pause-reading-btn")?.addEventListener("click", toggleReadingPause);
     document.getElementById("finish-reading-btn")?.addEventListener("click", finishCurrentReadingSession);
 
     document.getElementById("discard-reading-btn")?.addEventListener("click", async () => {
@@ -797,7 +801,7 @@ function updateReadingControlsUI() {
       try {
         setActiveSession(await speed.startReadingSession(curTextId, currentTextCharacterCount));
         updateReadingControlsUI();
-        startSessionTimer(activeSession!.started_at);
+        startSessionTimer();
       } catch (error) {
         console.error("Failed to start reading session:", error);
         alert(`Failed to start reading: ${error}`);
@@ -810,16 +814,45 @@ function updateReadingControlsUI() {
   }
 }
 
-function startSessionTimer(startedAt: number) {
+async function toggleReadingPause() {
+  if (!activeSession) return;
+
+  try {
+    if (activeSession.paused_at) {
+      setActiveSession(await speed.resumeReadingSession(activeSession.local_id));
+      updateReadingControlsUI();
+      startSessionTimer();
+    } else {
+      setActiveSession(await speed.pauseReadingSession(activeSession.local_id));
+      if (sessionTimerInterval) {
+        clearInterval(sessionTimerInterval);
+        setSessionTimerInterval(null);
+      }
+      updateReadingControlsUI();
+    }
+  } catch (error) {
+    console.error("Failed to toggle reading pause:", error);
+    alert(`Failed to update timer: ${error}`);
+  }
+}
+
+function startSessionTimer() {
+  if (!activeSession) return;
+  if (sessionTimerInterval) {
+    clearInterval(sessionTimerInterval);
+    setSessionTimerInterval(null);
+  }
+
   const timerEl = document.getElementById("session-timer");
   if (!timerEl) return;
 
-  timerEl.textContent = speed.formatElapsedTime(startedAt);
+  timerEl.textContent = speed.formatSessionElapsedTime(activeSession);
+  if (activeSession.paused_at) return;
 
   setSessionTimerInterval(window.setInterval(() => {
     const el = document.getElementById("session-timer");
-    if (el) {
-      el.textContent = speed.formatElapsedTime(startedAt);
+    if (el && activeSession) {
+      el.textContent = speed.formatSessionElapsedTime(activeSession);
     }
   }, 1000));
 }

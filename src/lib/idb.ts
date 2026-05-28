@@ -97,6 +97,7 @@ export interface LocalSession {
   finished_at: number | null;
   status: "in_progress" | "completed_pending_upload" | "uploaded";
   character_count?: number; // stored at start to compute CPM locally
+  paused_at?: number | null;
   duration_seconds?: number;
   characters_per_minute?: number;
   known_characters_count?: number;

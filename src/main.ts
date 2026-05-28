@@ -109,6 +109,9 @@ async function initApp() {
         <button class="nav-tab" data-view="speed">Speed</button>
         <button class="nav-tab" data-view="stats">Stats</button>
         <button class="nav-tab" data-view="prestudy">Pre-Study</button>
+        <button id="refresh-app-btn" class="nav-tab nav-tab-action" type="button" title="Refresh the app UI without clearing offline texts">
+          Refresh App
+        </button>
       </nav>
 
       <div id="dictionary-view" class="view active">
@@ -187,6 +190,7 @@ async function initApp() {
 
   // Set up navigation
   setupNavigation();
+  setupAppRefresh();
 
   // Set up dictionary view
   setupDictionaryView();
@@ -212,6 +216,42 @@ async function initApp() {
 
   // Load initial data
   await loadStats();
+}
+
+async function refreshAppShell() {
+  if (!("serviceWorker" in navigator)) {
+    window.location.reload();
+    return;
+  }
+
+  const registrations = await navigator.serviceWorker.getRegistrations();
+  await Promise.all(registrations.map((reg) => reg.update().catch(() => undefined)));
+
+  const controller = navigator.serviceWorker.controller;
+  if (controller) {
+    controller.postMessage({ type: "REFRESH_APP_SHELL" });
+  }
+
+  window.setTimeout(() => {
+    window.location.href = `${window.location.pathname}?refresh=${Date.now()}`;
+  }, 250);
+}
+
+function setupAppRefresh() {
+  document.getElementById("refresh-app-btn")?.addEventListener("click", async () => {
+    const btn = document.getElementById("refresh-app-btn") as HTMLButtonElement | null;
+    if (btn) {
+      btn.textContent = "Refreshing...";
+      btn.disabled = true;
+    }
+
+    try {
+      await refreshAppShell();
+    } catch (error) {
+      console.warn("Failed to refresh app shell:", error);
+      window.location.reload();
+    }
+  });
 }
 
 function setupNavigation() {
@@ -255,7 +295,10 @@ if ("serviceWorker" in navigator) {
   window.addEventListener("load", () => {
     navigator.serviceWorker
       .register("/sw.js")
-      .then((reg) => console.log("SW registered:", reg.scope))
+      .then((reg) => {
+        console.log("SW registered:", reg.scope);
+        reg.update().catch((err) => console.warn("SW update check failed:", err));
+      })
       .catch((err) => {
         console.warn("SW registration failed:", err);
         if (!window.isSecureContext && location.hostname !== "localhost" && location.hostname !== "127.0.0.1") {

@@ -11,6 +11,10 @@ let currentLearningSource: string | null = null;
 let currentLearningTab: "characters" | "words" = "characters";
 let coverageViewMode: "cumulative" | "bucket" = "cumulative";
 
+type MonthlyVocabularyProgress = learning.VocabularyProgress & {
+  month: string;
+};
+
 export async function loadLearningView() {
   const container = document.getElementById("learning-main");
   if (!container) return;
@@ -23,7 +27,7 @@ export async function loadLearningView() {
     const [sources, stats, progress] = await Promise.all([
       learning.listFrequencySources(),
       learning.getLearningStats(currentLearningSource ?? undefined),
-      learning.getVocabularyProgress(30),
+      learning.getVocabularyProgress(730),
     ]);
 
     if (!currentLearningSource && sources.length > 0) {
@@ -124,12 +128,36 @@ export async function loadLearningView() {
 
     if (sources.length > 0 && currentLearningSource) {
       try {
-        const priorities = await learning.getStudyPriorities(currentLearningSource, undefined, 20);
+        const [characterPriorities, wordPriorities] = await Promise.all([
+          learning.getStudyPriorities(currentLearningSource, "character", 20),
+          learning.getStudyPriorities(currentLearningSource, "word", 20),
+        ]);
+
         html += `
           <div class="priorities-section">
             <h3>Study Priorities</h3>
-            <p class="section-description">High-frequency terms you don't know yet</p>
-            ${renderStudyPriorities(priorities)}
+            <p class="section-description">High-frequency unknown and learning items to review</p>
+            <div class="learning-priorities-layout">
+              <div class="learning-priorities-main">
+                <section class="priority-group">
+                  <h4>Character Learning Priorities</h4>
+                  ${renderStudyPriorities(characterPriorities)}
+                </section>
+                <section class="priority-group">
+                  <h4>Word Learning Priorities</h4>
+                  ${renderStudyPriorities(wordPriorities)}
+                </section>
+              </div>
+              <aside class="dict-sidebar" id="learning-dict-sidebar">
+                <div class="dict-sidebar-header">
+                  <h3>Lookup</h3>
+                  <button class="dict-sidebar-close" id="learning-dict-sidebar-close">&times;</button>
+                </div>
+                <div class="dict-sidebar-content" id="learning-dict-sidebar-content">
+                  <p class="dict-sidebar-empty">Click a priority item to review it</p>
+                </div>
+              </aside>
+            </div>
           </div>
         `;
       } catch {
@@ -253,12 +281,14 @@ function renderVocabularyProgress(progress: learning.VocabularyProgress[]): stri
     return '<p class="empty-message">No progress data yet. Keep learning!</p>';
   }
 
+  const monthlyProgress = getMonthlyVocabularyProgress(progress).slice(-24);
+
   let html = `
     <div class="progress-table-container">
       <table class="progress-table">
         <thead>
           <tr>
-            <th>Date</th>
+            <th>Month</th>
             <th>Known Chars</th>
             <th>Known Words</th>
             <th>Learning</th>
@@ -267,16 +297,16 @@ function renderVocabularyProgress(progress: learning.VocabularyProgress[]): stri
         <tbody>
   `;
 
-  const recentProgress = [...progress].reverse().slice(0, 10);
+  const displayProgress = [...monthlyProgress].reverse();
 
-  for (let i = 0; i < recentProgress.length; i++) {
-    const item = recentProgress[i];
-    const prev = recentProgress[i + 1] || null;
+  for (let i = 0; i < displayProgress.length; i++) {
+    const item = displayProgress[i];
+    const prev = displayProgress[i + 1] || null;
     const diff = learning.calculateProgressDiff(item, prev);
 
     html += `
       <tr>
-        <td>${formatProgressDate(item.date)}</td>
+        <td>${formatProgressMonth(item.month)}</td>
         <td>
           ${item.known_characters.toLocaleString()}
           ${diff.charsDiff > 0 ? `<span class="diff-positive">+${diff.charsDiff}</span>` : ""}
@@ -303,7 +333,7 @@ function renderVocabularyProgress(progress: learning.VocabularyProgress[]): stri
 
 function renderStudyPriorities(priorities: learning.TermFrequencyInfo[]): string {
   if (priorities.length === 0) {
-    return '<p class="empty-message">No study priorities found. Great job!</p>';
+    return '<p class="empty-message">No unknown priorities found.</p>';
   }
 
   let html = '<div class="priorities-list">';
@@ -313,15 +343,12 @@ function renderStudyPriorities(priorities: learning.TermFrequencyInfo[]): string
     const statusBadge = item.is_learning ? '<span class="learning-badge">Learning</span>' : "";
 
     html += `
-      <div class="priority-item ${statusClass}" data-term="${escapeHtml(item.term)}" data-type="${item.term_type}">
-        <span class="priority-term">${item.term}</span>
+      <button type="button" class="priority-item ${statusClass}" data-term="${escapeHtml(item.term)}" data-type="${item.term_type}">
+        <span class="priority-term">${escapeHtml(item.term)}</span>
         <span class="priority-type">${item.term_type}</span>
         ${item.rank ? `<span class="priority-rank">#${item.rank.toLocaleString()}</span>` : ""}
         ${statusBadge}
-        <button class="btn-mark-known-priority" data-word="${escapeHtml(item.term)}" data-type="${item.term_type}">
-          Mark Known
-        </button>
-      </div>
+      </button>
     `;
   }
 
@@ -329,9 +356,24 @@ function renderStudyPriorities(priorities: learning.TermFrequencyInfo[]): string
   return html;
 }
 
-function formatProgressDate(dateStr: string): string {
-  const date = new Date(dateStr);
-  return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+function getMonthlyVocabularyProgress(progress: learning.VocabularyProgress[]): MonthlyVocabularyProgress[] {
+  const monthMap = new Map<string, MonthlyVocabularyProgress>();
+
+  for (const item of progress) {
+    const month = item.date.slice(0, 7);
+    const existing = monthMap.get(month);
+    if (!existing || item.date > existing.date) {
+      monthMap.set(month, { ...item, month });
+    }
+  }
+
+  return [...monthMap.values()].sort((a, b) => a.month.localeCompare(b.month));
+}
+
+function formatProgressMonth(monthStr: string): string {
+  const [year, month] = monthStr.split("-").map(Number);
+  const date = new Date(year, month - 1, 1);
+  return date.toLocaleDateString(undefined, { year: "numeric", month: "short" });
 }
 
 function setupLearningViewHandlers(stats: learning.LearningStats) {
@@ -376,34 +418,24 @@ function setupLearningViewHandlers(stats: learning.LearningStats) {
 
   document.getElementById("import-frequency-btn")?.addEventListener("click", showImportFrequencyModal);
 
-  document.querySelectorAll(".btn-mark-known-priority").forEach((btn) => {
-    btn.addEventListener("click", async (e) => {
-      e.stopPropagation();
-      const word = (btn as HTMLElement).dataset.word!;
-      const wordType = (btn as HTMLElement).dataset.type!;
-      const item = (btn as HTMLElement).closest(".priority-item");
+  document.querySelectorAll(".priority-item").forEach((item) => {
+    item.addEventListener("click", async () => {
+      const term = (item as HTMLElement).dataset.term!;
+      const termType = (item as HTMLElement).dataset.type as "character" | "word";
 
-      (btn as HTMLButtonElement).textContent = "Marked!";
-      (btn as HTMLButtonElement).disabled = true;
-
-      try {
-        await library.addKnownWord(word, wordType, "known");
-        item?.remove();
-      } catch (error) {
-        console.error("Failed to mark as known:", error);
-        (btn as HTMLButtonElement).textContent = "Mark Known";
-        (btn as HTMLButtonElement).disabled = false;
-      }
+      document.querySelectorAll(".priority-item").forEach((i) => i.classList.remove("selected"));
+      item.classList.add("selected");
+      await lookupLearningPrioritySidebar(term, termType);
     });
   });
 
-  document.querySelectorAll(".priority-item").forEach((item) => {
-    item.addEventListener("click", (e) => {
-      if ((e.target as HTMLElement).closest(".btn-mark-known-priority")) return;
-
-      const term = (item as HTMLElement).dataset.term!;
-      window.dispatchEvent(new CustomEvent("navigate-to-dictionary-search", { detail: { term } }));
-    });
+  document.getElementById("learning-dict-sidebar-close")?.addEventListener("click", () => {
+    const content = document.getElementById("learning-dict-sidebar-content");
+    if (content) {
+      content.innerHTML = '<p class="dict-sidebar-empty">Click a priority item to review it</p>';
+    }
+    document.getElementById("learning-dict-sidebar")?.classList.remove("open");
+    document.querySelectorAll(".priority-item").forEach((i) => i.classList.remove("selected"));
   });
 
   document.querySelectorAll(".learning-vocab-item").forEach((item) => {
@@ -419,6 +451,146 @@ function setupLearningViewHandlers(stats: learning.LearningStats) {
       detailDiv.innerHTML = '<p class="loading">Loading...</p>';
 
       await loadLearningVocabDetail(word, wordType, detailDiv);
+    });
+  });
+}
+
+async function lookupLearningPrioritySidebar(term: string, termType: "character" | "word") {
+  const sidebar = document.getElementById("learning-dict-sidebar");
+  const sidebarContent = document.getElementById("learning-dict-sidebar-content");
+  if (!sidebar || !sidebarContent) return;
+
+  sidebar.classList.add("open");
+  sidebarContent.innerHTML = `<p class="loading">Looking up ${escapeHtml(term)}...</p>`;
+
+  try {
+    const result = await dictionary.lookup(term, {
+      includeExamples: false,
+      includeCharacterInfo: termType === "character",
+      includeUserDictionaries: true,
+    });
+
+    await renderLearningPrioritySidebarResults(result, termType);
+  } catch (error) {
+    console.error("Priority lookup failed:", error);
+    sidebarContent.innerHTML = `<p class="dict-sidebar-empty">"${escapeHtml(term)}" is not available offline. Reconnect to look it up.</p>`;
+  }
+}
+
+async function renderLearningPrioritySidebarResults(result: dictionary.LookupResult, termType: "character" | "word") {
+  const sidebarContent = document.getElementById("learning-dict-sidebar-content");
+  if (!sidebarContent) return;
+
+  let html = `
+    <div class="dict-sidebar-actions-top">
+      <button class="btn-primary btn-mark-known-sidebar" data-word="${escapeHtml(result.query)}" data-type="${termType}">
+        Mark Known
+      </button>
+      <button class="btn-secondary btn-mark-learning-sidebar" data-word="${escapeHtml(result.query)}" data-type="${termType}">
+        Mark Learning
+      </button>
+    </div>
+  `;
+
+  if (result.entries.length === 0 && result.user_entries.length === 0) {
+    html += `<p class="dict-sidebar-empty">No dictionary entries found for "${escapeHtml(result.query)}"</p>`;
+  }
+
+  if (result.character_info) {
+    const char = result.character_info;
+    html += `
+      <div class="entry">
+        <div class="entry-header">
+          <span class="traditional" style="font-size: 2rem;">${escapeHtml(char.character)}</span>
+        </div>
+        <div style="font-size: 0.85rem; color: #888; margin-top: 0.5rem;">
+          ${char.radical ? `Radical: ${escapeHtml(char.radical)} (#${char.radical_number})` : ""}
+          ${char.total_strokes ? ` · ${char.total_strokes} strokes` : ""}
+        </div>
+      </div>
+    `;
+  }
+
+  for (const entry of result.entries.slice(0, 5)) {
+    html += `
+      <div class="entry">
+        <div class="entry-header">
+          <span class="traditional">${escapeHtml(entry.traditional)}</span>
+          ${entry.simplified !== entry.traditional ? `<span class="simplified">(${escapeHtml(entry.simplified)})</span>` : ""}
+          <span class="pinyin">${escapeHtml(dictionary.formatPinyin(entry))}</span>
+        </div>
+        <div class="definitions">
+          ${entry.definitions.slice(0, 3)
+            .map(def => `
+              <div class="definition">
+                ${def.part_of_speech ? `<span class="pos">${escapeHtml(def.part_of_speech)}</span>` : ""}
+                <span class="def-text">${escapeHtml(def.text)}</span>
+              </div>
+            `)
+            .join("")}
+        </div>
+      </div>
+    `;
+  }
+
+  for (const entry of result.user_entries.slice(0, 3)) {
+    html += `
+      <div class="entry user-entry">
+        <div class="entry-header">
+          <span class="traditional">${escapeHtml(entry.term)}</span>
+          ${entry.pinyin ? `<span class="pinyin">${escapeHtml(entry.pinyin)}</span>` : ""}
+        </div>
+        <div class="definitions">
+          <div class="definition">
+            <span class="def-text">${escapeHtml(entry.definition)}</span>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  sidebarContent.innerHTML = html;
+  setupLearningPrioritySidebarActions(sidebarContent);
+}
+
+function setupLearningPrioritySidebarActions(sidebarContent: HTMLElement) {
+  sidebarContent.querySelectorAll(".btn-mark-known-sidebar, .btn-mark-learning-sidebar").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const button = btn as HTMLButtonElement;
+      const word = button.dataset.word!;
+      const wordType = button.dataset.type!;
+      const status = button.classList.contains("btn-mark-known-sidebar") ? "known" : "learning";
+      const defaultText = status === "known" ? "Mark Known" : "Mark Learning";
+
+      button.textContent = status === "known" ? "Marked Known" : "Marked Learning";
+      button.disabled = true;
+      sidebarContent.querySelectorAll(".btn-mark-known-sidebar, .btn-mark-learning-sidebar").forEach((other) => {
+        (other as HTMLButtonElement).disabled = true;
+      });
+
+      try {
+        await library.addKnownWord(word, wordType, status);
+        if (status === "known") {
+          document.querySelectorAll(`.priority-item[data-term="${CSS.escape(word)}"]`).forEach((item) => {
+            item.remove();
+          });
+        } else {
+          document.querySelectorAll(`.priority-item[data-term="${CSS.escape(word)}"]`).forEach((item) => {
+            item.classList.remove("unknown");
+            item.classList.add("learning");
+            if (!item.querySelector(".learning-badge")) {
+              item.insertAdjacentHTML("beforeend", '<span class="learning-badge">Learning</span>');
+            }
+          });
+          button.textContent = "Marked Learning";
+        }
+      } catch (error) {
+        console.error(`Failed to mark as ${status}:`, error);
+        button.textContent = defaultText;
+        sidebarContent.querySelectorAll(".btn-mark-known-sidebar, .btn-mark-learning-sidebar").forEach((other) => {
+          (other as HTMLButtonElement).disabled = false;
+        });
+      }
     });
   });
 }
