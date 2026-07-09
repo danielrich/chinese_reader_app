@@ -5,16 +5,16 @@
 
 use jieba_rs::Jieba;
 use rusqlite::{params, Connection};
+use serde_json;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
-use serde_json;
 
 use super::error::{LibraryError, Result};
 use super::known_words;
 use super::models::{
     AnalysisReport, CharacterContext, CharacterFrequency, ContextSnippet, FrequencySort,
-    PreStudyCharacter, PreStudyResult, PreStudyWord, PreStudyWordResult,
-    ShelfAnalysis, TextAnalysis, TextSegment, WordFrequency,
+    PreStudyCharacter, PreStudyResult, PreStudyWord, PreStudyWordResult, ShelfAnalysis,
+    TextAnalysis, TextSegment, WordFrequency,
 };
 use super::text;
 
@@ -159,9 +159,6 @@ pub fn analyze_text(conn: &Connection, text_id: i64) -> Result<TextAnalysis> {
     // Get vocabulary sets - only status='known' counts as known for analysis
     let vocab = build_vocabulary_sets(conn)?;
 
-    let jieba = get_jieba();
-    let jieba = jieba.lock().unwrap();
-
     // Count character frequencies (CJK only)
     let mut char_freq: HashMap<char, i64> = HashMap::new();
     for c in text.content.chars() {
@@ -171,12 +168,16 @@ pub fn analyze_text(conn: &Connection, text_id: i64) -> Result<TextAnalysis> {
     }
 
     // Segment text and count word frequencies (2+ char CJK words)
-    let words = jieba.cut(&text.content, false);
     let mut word_freq: HashMap<String, i64> = HashMap::new();
-    for word in words {
-        let chars: Vec<char> = word.chars().collect();
-        if chars.len() >= 2 && chars.iter().all(|c| is_cjk_character(*c)) {
-            *word_freq.entry(word.to_string()).or_insert(0) += 1;
+    {
+        let jieba = get_jieba();
+        let jieba = jieba.lock().unwrap();
+        let words = jieba.cut(&text.content, false);
+        for word in words {
+            let chars: Vec<char> = word.chars().collect();
+            if chars.len() >= 2 && chars.iter().all(|c| is_cjk_character(*c)) {
+                *word_freq.entry(word.to_string()).or_insert(0) += 1;
+            }
         }
     }
 
@@ -207,16 +208,18 @@ pub fn analyze_text(conn: &Connection, text_id: i64) -> Result<TextAnalysis> {
     let total_chars: i64 = char_freq.values().sum();
     let total_words: i64 = word_freq.values().sum();
 
+    let tx = conn.unchecked_transaction()?;
+
     // Delete existing analysis if any
-    conn.execute("DELETE FROM text_analyses WHERE text_id = ?", [text_id])?;
-    conn.execute(
+    tx.execute("DELETE FROM text_analyses WHERE text_id = ?", [text_id])?;
+    tx.execute(
         "DELETE FROM text_character_freq WHERE text_id = ?",
         [text_id],
     )?;
-    conn.execute("DELETE FROM text_word_freq WHERE text_id = ?", [text_id])?;
+    tx.execute("DELETE FROM text_word_freq WHERE text_id = ?", [text_id])?;
 
     // Insert analysis summary
-    conn.execute(
+    tx.execute(
         "INSERT INTO text_analyses (text_id, total_characters, unique_characters, known_characters,
          known_character_occurrences, total_words, unique_words, known_words, known_word_occurrences)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -235,7 +238,7 @@ pub fn analyze_text(conn: &Connection, text_id: i64) -> Result<TextAnalysis> {
 
     // Insert character frequencies
     for (character, frequency) in &char_freq {
-        conn.execute(
+        tx.execute(
             "INSERT INTO text_character_freq (text_id, character, frequency) VALUES (?, ?, ?)",
             params![text_id, character.to_string(), frequency],
         )?;
@@ -243,11 +246,13 @@ pub fn analyze_text(conn: &Connection, text_id: i64) -> Result<TextAnalysis> {
 
     // Insert word frequencies
     for (word, frequency) in &word_freq {
-        conn.execute(
+        tx.execute(
             "INSERT INTO text_word_freq (text_id, word, frequency) VALUES (?, ?, ?)",
             params![text_id, word, frequency],
         )?;
     }
+
+    tx.commit()?;
 
     get_text_analysis(conn, text_id)
 }
@@ -294,9 +299,8 @@ pub fn get_character_frequencies(
     let vocab = build_vocabulary_sets(conn)?;
 
     // Get all character frequencies from the text
-    let mut stmt = conn.prepare(
-        "SELECT character, frequency FROM text_character_freq WHERE text_id = ?",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT character, frequency FROM text_character_freq WHERE text_id = ?")?;
 
     let frequencies: Vec<(String, i64)> = stmt
         .query_map([text_id], |row| {
@@ -361,8 +365,7 @@ pub fn get_word_frequencies(
     let vocab = build_vocabulary_sets(conn)?;
 
     // Get all word frequencies from the text
-    let mut stmt =
-        conn.prepare("SELECT word, frequency FROM text_word_freq WHERE text_id = ?")?;
+    let mut stmt = conn.prepare("SELECT word, frequency FROM text_word_freq WHERE text_id = ?")?;
 
     let frequencies: Vec<(String, i64)> = stmt
         .query_map([text_id], |row| {
@@ -396,14 +399,14 @@ pub fn get_word_frequencies(
             result.sort_by(|a, b| b.frequency.cmp(&a.frequency));
         }
         FrequencySort::GeneralFrequency => {
-            result.sort_by(|a, b| {
-                match (a.general_frequency_rank, b.general_frequency_rank) {
+            result.sort_by(
+                |a, b| match (a.general_frequency_rank, b.general_frequency_rank) {
                     (Some(ra), Some(rb)) => ra.cmp(&rb),
                     (Some(_), None) => std::cmp::Ordering::Less,
                     (None, Some(_)) => std::cmp::Ordering::Greater,
                     (None, None) => b.frequency.cmp(&a.frequency),
-                }
-            });
+                },
+            );
         }
     }
 
@@ -584,7 +587,10 @@ pub fn invalidate_shelf_analysis_cache(conn: &Connection) -> Result<()> {
 
 /// Invalidate the cache for a specific shelf (call when a text in that shelf changes)
 pub fn invalidate_shelf_analysis_cache_for_shelf(conn: &Connection, shelf_id: i64) -> Result<()> {
-    conn.execute("DELETE FROM shelf_analyses_cache WHERE shelf_id = ?", [shelf_id])?;
+    conn.execute(
+        "DELETE FROM shelf_analyses_cache WHERE shelf_id = ?",
+        [shelf_id],
+    )?;
     Ok(())
 }
 
@@ -640,7 +646,11 @@ pub fn get_shelf_analysis(conn: &Connection, shelf_id: i64) -> Result<ShelfAnaly
     let all_shelf_ids = get_all_descendant_shelf_ids(conn, shelf_id)?;
 
     // Get all text IDs in these shelves
-    let placeholders: String = all_shelf_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let placeholders: String = all_shelf_ids
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
     let query = format!("SELECT id FROM texts WHERE shelf_id IN ({})", placeholders);
     let mut stmt = conn.prepare(&query)?;
     let text_ids: Vec<i64> = stmt
@@ -660,9 +670,8 @@ pub fn get_shelf_analysis(conn: &Connection, shelf_id: i64) -> Result<ShelfAnaly
         }
 
         // Get character frequencies for this text
-        let mut char_stmt = conn.prepare(
-            "SELECT character, frequency FROM text_character_freq WHERE text_id = ?",
-        )?;
+        let mut char_stmt =
+            conn.prepare("SELECT character, frequency FROM text_character_freq WHERE text_id = ?")?;
         let char_rows = char_stmt.query_map([text_id], |row| {
             let character: String = row.get(0)?;
             let frequency: i64 = row.get(1)?;
@@ -873,7 +882,11 @@ pub fn get_prestudy_characters(
     let all_shelf_ids = get_all_descendant_shelf_ids(conn, shelf_id)?;
 
     // Get all text IDs in these shelves
-    let placeholders: String = all_shelf_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let placeholders: String = all_shelf_ids
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
     let query = format!("SELECT id FROM texts WHERE shelf_id IN ({})", placeholders);
     let mut stmt = conn.prepare(&query)?;
     let text_ids: Vec<i64> = stmt
@@ -891,9 +904,8 @@ pub fn get_prestudy_characters(
         }
 
         // Get character frequencies for this text
-        let mut char_stmt = conn.prepare(
-            "SELECT character, frequency FROM text_character_freq WHERE text_id = ?",
-        )?;
+        let mut char_stmt =
+            conn.prepare("SELECT character, frequency FROM text_character_freq WHERE text_id = ?")?;
         let char_rows = char_stmt.query_map([text_id], |row| {
             let character: String = row.get(0)?;
             let frequency: i64 = row.get(1)?;
@@ -934,7 +946,8 @@ pub fn get_prestudy_characters(
 
     // Both known and learning count toward the "familiar" rate
     let familiar_occurrences = known_occurrences + learning_occurrences;
-    let current_known_rate = (familiar_occurrences as f64 / total_character_occurrences as f64) * 100.0;
+    let current_known_rate =
+        (familiar_occurrences as f64 / total_character_occurrences as f64) * 100.0;
 
     // Check if already at target
     if current_known_rate >= target_rate {
@@ -962,7 +975,8 @@ pub fn get_prestudy_characters(
 
     // Calculate how many characters needed to reach target
     // Only count non-learning characters toward "characters needed"
-    let target_known_occurrences = (target_rate / 100.0 * total_character_occurrences as f64) as i64;
+    let target_known_occurrences =
+        (target_rate / 100.0 * total_character_occurrences as f64) as i64;
     let occurrences_needed = target_known_occurrences - familiar_occurrences;
 
     let mut cumulative_added: i64 = 0;
@@ -977,7 +991,8 @@ pub fn get_prestudy_characters(
             non_learning_count += 1;
         }
         let cumulative_known = familiar_occurrences + cumulative_added;
-        let cumulative_coverage = (cumulative_known as f64 / total_character_occurrences as f64) * 100.0;
+        let cumulative_coverage =
+            (cumulative_known as f64 / total_character_occurrences as f64) * 100.0;
         let coverage_contribution = (frequency as f64 / total_character_occurrences as f64) * 100.0;
 
         characters_to_study.push(PreStudyCharacter {
@@ -1053,17 +1068,15 @@ pub struct VocabCacheEntry {
 /// in the DB. This is what the PWA caches client-side for offline lookups.
 pub fn get_text_vocab_cache(conn: &Connection, text_id: i64) -> Result<TextVocabCache> {
     // Distinct words used in this text
-    let mut word_stmt = conn.prepare(
-        "SELECT DISTINCT word FROM text_word_freq WHERE text_id = ?",
-    )?;
+    let mut word_stmt =
+        conn.prepare("SELECT DISTINCT word FROM text_word_freq WHERE text_id = ?")?;
     let words_in_text: Vec<String> = word_stmt
         .query_map([text_id], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<_>>()?;
 
     // Distinct characters used in this text
-    let mut char_stmt = conn.prepare(
-        "SELECT DISTINCT character FROM text_character_freq WHERE text_id = ?",
-    )?;
+    let mut char_stmt =
+        conn.prepare("SELECT DISTINCT character FROM text_character_freq WHERE text_id = ?")?;
     let chars_in_text: Vec<String> = char_stmt
         .query_map([text_id], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<_>>()?;
@@ -1071,7 +1084,11 @@ pub fn get_text_vocab_cache(conn: &Connection, text_id: i64) -> Result<TextVocab
     let words = build_vocab_entries(conn, &words_in_text)?;
     let characters = build_vocab_entries(conn, &chars_in_text)?;
 
-    Ok(TextVocabCache { text_id, words, characters })
+    Ok(TextVocabCache {
+        text_id,
+        words,
+        characters,
+    })
 }
 
 fn build_vocab_entries(conn: &Connection, terms: &[String]) -> Result<Vec<VocabCacheEntry>> {
@@ -1094,10 +1111,10 @@ fn build_vocab_entries(conn: &Connection, terms: &[String]) -> Result<Vec<VocabC
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(params.as_slice(), |row| {
         Ok((
-            row.get::<_, String>(0)?,        // traditional
-            row.get::<_, String>(1)?,        // pinyin
-            row.get::<_, String>(2)?,        // definition text
-            row.get::<_, String>(3)?,        // source
+            row.get::<_, String>(0)?, // traditional
+            row.get::<_, String>(1)?, // pinyin
+            row.get::<_, String>(2)?, // definition text
+            row.get::<_, String>(3)?, // source
         ))
     })?;
 
@@ -1105,12 +1122,14 @@ fn build_vocab_entries(conn: &Connection, terms: &[String]) -> Result<Vec<VocabC
     let mut grouped: HashMap<String, VocabCacheEntry> = HashMap::new();
     for row in rows {
         let (term, pinyin, definition, source) = row?;
-        let entry = grouped.entry(term.clone()).or_insert_with(|| VocabCacheEntry {
-            term: term.clone(),
-            pinyin: pinyin.clone(),
-            definitions: Vec::new(),
-            source: source.clone(),
-        });
+        let entry = grouped
+            .entry(term.clone())
+            .or_insert_with(|| VocabCacheEntry {
+                term: term.clone(),
+                pinyin: pinyin.clone(),
+                definitions: Vec::new(),
+                source: source.clone(),
+            });
         entry.definitions.push(definition);
     }
 
@@ -1127,9 +1146,7 @@ pub fn get_word_context_all(
     // Get all texts
     let mut stmt = conn.prepare("SELECT id, title, content FROM texts ORDER BY title")?;
     let texts: Vec<(i64, String, String)> = stmt
-        .query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     let mut snippets: Vec<ContextSnippet> = vec![];
@@ -1188,7 +1205,11 @@ pub fn get_prestudy_words(
     let vocab = build_vocabulary_sets(conn)?;
     let all_shelf_ids = get_all_descendant_shelf_ids(conn, shelf_id)?;
 
-    let placeholders: String = all_shelf_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let placeholders: String = all_shelf_ids
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
     let query = format!("SELECT id FROM texts WHERE shelf_id IN ({})", placeholders);
     let mut stmt = conn.prepare(&query)?;
     let text_ids: Vec<i64> = stmt
@@ -1202,10 +1223,11 @@ pub fn get_prestudy_words(
         if get_text_analysis(conn, *text_id).is_err() {
             analyze_text(conn, *text_id)?;
         }
-        let mut wstmt = conn.prepare(
-            "SELECT word, frequency FROM text_word_freq WHERE text_id = ?",
-        )?;
-        for row in wstmt.query_map([text_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))? {
+        let mut wstmt =
+            conn.prepare("SELECT word, frequency FROM text_word_freq WHERE text_id = ?")?;
+        for row in wstmt.query_map([text_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        })? {
             let (word, freq) = row?;
             *word_freq.entry(word).or_insert(0) += freq;
             total_word_occurrences += freq;
@@ -1224,8 +1246,16 @@ pub fn get_prestudy_words(
         });
     }
 
-    let known_occ: i64 = word_freq.iter().filter(|(w, _)| vocab.known.contains(*w)).map(|(_, f)| f).sum();
-    let learning_occ: i64 = word_freq.iter().filter(|(w, _)| vocab.learning.contains(*w)).map(|(_, f)| f).sum();
+    let known_occ: i64 = word_freq
+        .iter()
+        .filter(|(w, _)| vocab.known.contains(*w))
+        .map(|(_, f)| f)
+        .sum();
+    let learning_occ: i64 = word_freq
+        .iter()
+        .filter(|(w, _)| vocab.learning.contains(*w))
+        .map(|(_, f)| f)
+        .sum();
     let familiar_occ = known_occ + learning_occ;
     let current_known_rate = (familiar_occ as f64 / total_word_occurrences as f64) * 100.0;
 
@@ -1305,7 +1335,11 @@ pub fn get_word_context(
 ) -> Result<CharacterContext> {
     let all_shelf_ids = get_all_descendant_shelf_ids(conn, shelf_id)?;
 
-    let placeholders: String = all_shelf_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let placeholders: String = all_shelf_ids
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
     let query = format!(
         "SELECT id, title, content FROM texts WHERE shelf_id IN ({}) ORDER BY title",
         placeholders
@@ -1347,7 +1381,10 @@ pub fn get_word_context(
         }
     }
 
-    Ok(CharacterContext { character: word.to_string(), snippets })
+    Ok(CharacterContext {
+        character: word.to_string(),
+        snippets,
+    })
 }
 
 fn get_character_context_from_shelves(
@@ -1489,20 +1526,24 @@ mod tests {
         assert_eq!(result1.total_characters, result2.total_characters);
 
         // Verify cache entry exists in DB
-        let cache_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM shelf_analyses_cache WHERE shelf_id = ?",
-            [shelf.id],
-            |row| row.get(0),
-        ).unwrap();
+        let cache_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM shelf_analyses_cache WHERE shelf_id = ?",
+                [shelf.id],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(cache_count, 1);
 
         // Invalidate and verify cache is cleared
         invalidate_shelf_analysis_cache(&conn).unwrap();
-        let cache_count_after: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM shelf_analyses_cache WHERE shelf_id = ?",
-            [shelf.id],
-            |row| row.get(0),
-        ).unwrap();
+        let cache_count_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM shelf_analyses_cache WHERE shelf_id = ?",
+                [shelf.id],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(cache_count_after, 0);
     }
 }

@@ -30,3 +30,8 @@ dist-ssr
 # Git worktrees
 .worktrees/
 *.pem
+
+# Local scraper/browser artifacts
+scripts/playwright-qidian-profile/
+scripts/playright-qidian-profile/
+scripts/study_texts/

@@ -21,8 +21,13 @@ use rusqlite::Connection;
 use serde_json::Value;
 use std::env;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
+
+const DB_PRAGMAS: &str =
+    "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=30000;";
+const WRITE_WAIT_LOG_THRESHOLD: Duration = Duration::from_millis(250);
 
 // ── Connection pool ───────────────────────────────────────────────────────────
 
@@ -31,6 +36,7 @@ use tower_http::services::{ServeDir, ServeFile};
 struct DbPool {
     conns: std::sync::Mutex<Vec<Connection>>,
     sem: Arc<tokio::sync::Semaphore>,
+    write_sem: Arc<tokio::sync::Semaphore>,
 }
 
 impl DbPool {
@@ -39,6 +45,7 @@ impl DbPool {
         Arc::new(DbPool {
             conns: std::sync::Mutex::new(conns),
             sem: Arc::new(tokio::sync::Semaphore::new(n)),
+            write_sem: Arc::new(tokio::sync::Semaphore::new(1)),
         })
     }
 
@@ -50,6 +57,10 @@ impl DbPool {
             conn: Some(conn),
             _permit: permit,
         }
+    }
+
+    async fn acquire_write_permit(self: &Arc<Self>) -> tokio::sync::OwnedSemaphorePermit {
+        Arc::clone(&self.write_sem).acquire_owned().await.unwrap()
     }
 }
 
@@ -138,7 +149,7 @@ async fn main() {
         std::process::exit(1);
     });
     first
-        .execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=10000;")
+        .execute_batch(DB_PRAGMAS)
         .unwrap_or_else(|e| eprintln!("Warning: could not enable WAL mode: {}", e));
 
     match library::analysis::load_user_segmentation_words(&first) {
@@ -151,9 +162,7 @@ async fn main() {
     for _ in 1..8 {
         match Connection::open(&db_path) {
             Ok(c) => {
-                let _ = c.execute_batch(
-                    "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=10000;",
-                );
+                let _ = c.execute_batch(DB_PRAGMAS);
                 conns.push(c);
             }
             Err(e) => eprintln!("Warning: could not open extra DB connection: {}", e),
@@ -221,6 +230,18 @@ async fn dispatch(
     Path(command): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, AppError> {
+    let _write_permit = if is_write_command(&command) {
+        let started = Instant::now();
+        let permit = db.acquire_write_permit().await;
+        let waited = started.elapsed();
+        if waited >= WRITE_WAIT_LOG_THRESHOLD {
+            eprintln!("Write command '{command}' waited {waited:?} for the SQLite write lane");
+        }
+        Some(permit)
+    } else {
+        None
+    };
+
     let conn = db.acquire().await;
     let result = tokio::task::spawn_blocking(move || dispatch_sync(&conn, &command, &body))
         .await
@@ -261,6 +282,13 @@ async fn sync_sessions_handler(
     State(db): State<Db>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, AppError> {
+    let started = Instant::now();
+    let _write_permit = db.acquire_write_permit().await;
+    let waited = started.elapsed();
+    if waited >= WRITE_WAIT_LOG_THRESHOLD {
+        eprintln!("Session sync waited {waited:?} for the SQLite write lane");
+    }
+
     let conn = db.acquire().await;
     let result = tokio::task::spawn_blocking(move || {
         let sessions: Vec<library::speed::UploadSession> = serde_json::from_value(
@@ -308,6 +336,49 @@ impl IntoResponse for AppError {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+fn is_write_command(command: &str) -> bool {
+    matches!(
+        command,
+        "create_user_dictionary"
+            | "delete_user_dictionary"
+            | "add_user_dictionary_entry"
+            | "update_user_dictionary_entry"
+            | "delete_user_dictionary_entry"
+            | "import_user_dictionary_entries"
+            | "create_shelf"
+            | "update_shelf"
+            | "delete_shelf"
+            | "move_shelf"
+            | "create_text"
+            | "update_text"
+            | "delete_text"
+            | "migrate_large_texts"
+            | "get_text_analysis"
+            | "get_analysis_report"
+            | "reanalyze_text"
+            | "get_shelf_analysis"
+            | "get_prestudy_characters"
+            | "get_prestudy_words"
+            | "add_known_word"
+            | "update_word_status"
+            | "remove_known_word"
+            | "import_known_words"
+            | "start_reading_session"
+            | "finish_reading_session"
+            | "discard_reading_session"
+            | "delete_reading_session"
+            | "update_session_auto_marked"
+            | "log_offline_read"
+            | "set_setting"
+            | "auto_mark_text_as_known"
+            | "import_frequency_data"
+            | "record_vocabulary_snapshot"
+            | "clear_frequency_source"
+            | "add_custom_segmentation_word"
+            | "define_custom_word"
+    )
+}
 
 fn field<T: serde::de::DeserializeOwned>(body: &Value, name: &str) -> Result<T, ApiError> {
     let val = body

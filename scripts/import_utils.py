@@ -59,7 +59,12 @@ def connect_db() -> sqlite3.Connection:
         print("Please run the app first to initialize the database.")
         sys.exit(1)
     print(f"Database: {db_path}")
-    return sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=30)
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA busy_timeout = 30000")
+    return conn
 
 
 def verify_parent_shelf(conn: sqlite3.Connection, parent_shelf_id: int) -> str:
