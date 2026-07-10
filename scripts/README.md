@@ -69,6 +69,48 @@ The remaining `import_*.py` scripts are source-specific importers used for
 particular corpora or book collections. Prefer running them with `--dry-run`
 when available and inspect the script arguments before writing to the database.
 
+## Qidian Web Novel Import
+
+`qidian_study_import.py` fetches a rendered Qidian chapter with Playwright,
+writes a local text/word-count snapshot, and can import the chapter through the
+running Chinese Reader daemon. By default it imports the first chapter URL in
+the script as traditional Chinese under:
+
+```text
+Chinese Web Novels / 凡人修仙傳 / 第一冊
+```
+
+Dry run:
+
+```bash
+uv run python qidian_study_import.py --import-app --dry-run
+```
+
+Import:
+
+```bash
+uv run python qidian_study_import.py --import-app
+```
+
+For purchased chapters, create or reuse a persistent Playwright profile:
+
+```bash
+uv run python qidian_study_import.py \
+  --profile-dir playwright-qidian-profile \
+  --headed \
+  --login \
+  --dry-run
+```
+
+After logging in once, later runs can reuse the same profile directory:
+
+```bash
+uv run python qidian_study_import.py \
+  --profile-dir playwright-qidian-profile \
+  --headed \
+  --import-app
+```
+
 ## Service Helpers
 
 - `install-service.sh` installs the Linux systemd service.

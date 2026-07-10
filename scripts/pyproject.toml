@@ -7,7 +7,9 @@ requires-python = ">=3.11"
 dependencies = [
     "beautifulsoup4>=4.14.3",
     "ebooklib>=0.18",
+    "jieba>=0.42.1",
     "opencc>=1.1.9",
+    "playwright>=1.57.0",
     "pymupdf>=1.26.7",
     "requests>=2.32.5",
 ]

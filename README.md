@@ -25,6 +25,7 @@ More detail:
 - [Style guide](docs/style-guide.md)
 - [Engineering notes and concerns](docs/engineering-notes.md)
 - [AppArmor/bubblewrap sandbox note](docs/operations/apparmor-bwrap-sandbox.md)
+- [Systemd service operations](docs/operations/systemd-service.md)
 - [Cross-device design spec](docs/superpowers/specs/2026-04-25-cross-device-reader-design.md)
 
 ## Features
@@ -142,6 +143,11 @@ sudo systemctl status chinese-reader
 sudo systemctl restart chinese-reader
 sudo journalctl -u chinese-reader -f
 ```
+
+For frontend-only changes, `npm run build` updates the served `dist/` directory;
+restart `chinese-reader` afterward so the daemon is explicitly running against
+the current build. See [systemd service operations](docs/operations/systemd-service.md)
+for the day-to-day deploy checklist.
 
 ## Database Migrations
 

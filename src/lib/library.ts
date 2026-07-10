@@ -441,8 +441,7 @@ interface RequestOptions {
  */
 export async function getTextVocabCache(textId: number, options?: RequestOptions): Promise<TextVocabCache> {
   const cache = await fetchJson<TextVocabCache>(`/api/texts/${textId}/vocab-cache`, options);
-  // Fire-and-forget: persist for offline lookup
-  ingestTextVocabCache(cache).catch((err) =>
+  await ingestTextVocabCache(cache).catch((err) =>
     console.warn("ingest vocab-cache failed:", err),
   );
   return cache;

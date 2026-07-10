@@ -11,6 +11,19 @@ export const STORE_NAV_CACHE = "nav_cache";
 export const STORE_TEXT_CACHE = "text_cache";
 export const STORE_TEXT_SEGMENTS = "text_segments";
 
+export interface CacheMetadata {
+  text_id: string | number;
+  last_cached_at?: number;
+  text_cached_at?: number;
+  segments_cached_at?: number;
+  vocab_cached_at?: number;
+  nav_cached_at?: number;
+  analysis_cached_at?: number;
+  text_count?: number;
+  shelf_count?: number;
+  complete_text_count?: number;
+}
+
 export function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(DB_NAME, DB_VERSION);
@@ -62,6 +75,103 @@ function txDone(tx: IDBTransaction): Promise<void> {
   });
 }
 
+function shelfMetaKey(shelfId: number): string {
+  return `shelf:${shelfId}`;
+}
+
+function touchMeta(meta: CacheMetadata, fields: Partial<CacheMetadata>): CacheMetadata {
+  const now = Date.now();
+  return {
+    ...meta,
+    ...fields,
+    last_cached_at: now,
+  };
+}
+
+async function updateMeta(
+  key: string | number,
+  fields: Partial<CacheMetadata>,
+): Promise<void> {
+  const db = await openDb();
+  const tx = db.transaction(STORE_TEXT_META, "readwrite");
+  const store = tx.objectStore(STORE_TEXT_META);
+  const getReq = store.get(key);
+  const existing = await new Promise<CacheMetadata | null>((resolve, reject) => {
+    getReq.onsuccess = () => resolve(getReq.result ?? null);
+    getReq.onerror = () => reject(getReq.error);
+  });
+  store.put(touchMeta(existing ?? { text_id: key as string }, fields));
+  await txDone(tx);
+  db.close();
+}
+
+export async function getCacheMetadata(key: string | number): Promise<CacheMetadata | null> {
+  const db = await openDb();
+  const result = await new Promise<CacheMetadata | null>((resolve, reject) => {
+    const req = db
+      .transaction(STORE_TEXT_META, "readonly")
+      .objectStore(STORE_TEXT_META)
+      .get(key);
+    req.onsuccess = () => resolve(req.result ?? null);
+    req.onerror = () => reject(req.error);
+  });
+  db.close();
+  return result;
+}
+
+export async function getShelfCacheMetadata(shelfId: number): Promise<CacheMetadata | null> {
+  return getCacheMetadata(shelfMetaKey(shelfId));
+}
+
+export async function getTextCacheMetadata(textId: number): Promise<CacheMetadata | null> {
+  return getCacheMetadata(textId);
+}
+
+export async function listTextCacheMetadata(textIds: number[]): Promise<Map<number, CacheMetadata>> {
+  const entries = await Promise.all(
+    textIds.map(async (id) => [id, await getTextCacheMetadata(id)] as const),
+  );
+  return new Map(
+    entries
+      .filter((entry): entry is readonly [number, CacheMetadata] => entry[1] !== null)
+      .map(([id, meta]) => [id, meta]),
+  );
+}
+
+export async function markShelfNavCached(
+  shelfId: number,
+  textCount: number,
+  shelfCount: number,
+): Promise<void> {
+  await updateMeta(shelfMetaKey(shelfId), {
+    nav_cached_at: Date.now(),
+    text_count: textCount,
+    shelf_count: shelfCount,
+  });
+}
+
+export async function markShelfAnalysisCached(shelfId: number): Promise<void> {
+  await updateMeta(shelfMetaKey(shelfId), {
+    analysis_cached_at: Date.now(),
+  });
+}
+
+export async function markShelfOfflineCacheComplete(
+  shelfId: number,
+  textCount: number,
+  shelfCount: number,
+  completeTextCount: number,
+): Promise<void> {
+  const now = Date.now();
+  await updateMeta(shelfMetaKey(shelfId), {
+    nav_cached_at: now,
+    analysis_cached_at: now,
+    text_count: textCount,
+    shelf_count: shelfCount,
+    complete_text_count: completeTextCount,
+  });
+}
+
 // ── Vocab cache ────────────────────────────────────────────────────────
 
 export async function ingestTextVocabCache(cache: TextVocabCache): Promise<void> {
@@ -72,6 +182,7 @@ export async function ingestTextVocabCache(cache: TextVocabCache): Promise<void>
   for (const e of cache.characters) store.put(e);
   await txDone(tx);
   db.close();
+  await updateMeta(cache.text_id, { vocab_cached_at: Date.now() });
 }
 
 export async function lookupOffline(term: string): Promise<VocabCacheEntry | null> {
@@ -283,6 +394,7 @@ export async function saveTextCache(text: Text): Promise<void> {
   tx.objectStore(STORE_TEXT_CACHE).put({ ...text, cached_at: Date.now() });
   await txDone(tx);
   db.close();
+  await updateMeta(text.id, { text_cached_at: Date.now() });
 }
 
 export async function getTextCache(id: number): Promise<Text | null> {
@@ -311,6 +423,7 @@ export async function saveTextSegments(textId: number, segments: TextSegment[]):
   });
   await txDone(tx);
   db.close();
+  await updateMeta(textId, { segments_cached_at: Date.now() });
 }
 
 export async function getTextSegments(textId: number): Promise<TextSegment[] | null> {

@@ -2,12 +2,20 @@ import * as dictionary from "../lib/dictionary";
 import * as library from "../lib/library";
 import * as speed from "../lib/speed";
 import {
+  type CacheMetadata,
   getInProgressSessionForText,
   deleteSession,
   saveNavCache,
   getNavCache,
+  getTextCache,
   saveTextSegments,
   getTextSegments,
+  getShelfCacheMetadata,
+  getTextCacheMetadata,
+  listTextCacheMetadata,
+  markShelfAnalysisCached,
+  markShelfNavCached,
+  markShelfOfflineCacheComplete,
 } from "../lib/idb";
 import { confirm } from "../lib/api";
 import {
@@ -40,12 +48,46 @@ let currentSort: library.FrequencySort = "text_frequency";
 let pendingShelfAnalysisTimer: number | null = null;
 let activeShelfAnalysisController: AbortController | null = null;
 
+const CACHED_PREVIEW_DELAY_MS = 250;
+
+type ShelfListState = "loading" | "cached" | "fresh" | "offline";
+type AnalysisState = "loading" | "cached" | "fresh" | "offline" | "unavailable";
+
 function textsCacheKey(shelfId: number): string {
   return `texts_in_shelf_${shelfId}`;
 }
 
 function shelfAnalysisCacheKey(shelfId: number): string {
   return `shelf_analysis_${shelfId}`;
+}
+
+function formatCacheAge(timestamp?: number): string {
+  if (!timestamp) return "";
+  const elapsedMs = Math.max(0, Date.now() - timestamp);
+  const minutes = Math.floor(elapsedMs / 60000);
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
+function isTextOfflineReady(meta?: CacheMetadata): boolean {
+  return Boolean(meta?.text_cached_at && meta.segments_cached_at && meta.vocab_cached_at);
+}
+
+function describeTextCache(meta?: CacheMetadata): string {
+  if (!meta) return "Not cached";
+  if (isTextOfflineReady(meta)) return `Offline ready, cached ${formatCacheAge(meta.last_cached_at)}`;
+
+  const parts = [];
+  if (meta.text_cached_at) parts.push("text");
+  if (meta.segments_cached_at) parts.push("segments");
+  if (meta.vocab_cached_at) parts.push("dictionary");
+  return parts.length > 0
+    ? `Partial cache: ${parts.join(", ")}`
+    : "Not cached";
 }
 
 export function setupLibraryView() {
@@ -133,13 +175,15 @@ function renderShelfNodes(nodes: library.ShelfTree[], depth: number): string {
     .map((node) => {
       const hasChildren = node.children.length > 0;
       const isSelected = node.shelf.id === selectedShelfId;
+      const containsSelectedShelf = shelfNodeContainsSelected(node);
+      const collapsedClass = hasChildren && !containsSelectedShelf ? "collapsed" : "";
       const textWord = node.text_count === 1 ? "text" : "texts";
       const countTitle = node.unread_count > 0
         ? `${node.text_count} ${textWord}, ${node.unread_count} unread`
         : `${node.text_count} ${textWord}`;
 
       return `
-        <div class="shelf-node" data-depth="${depth}">
+        <div class="shelf-node ${collapsedClass}" data-depth="${depth}">
           <div class="shelf-item ${isSelected ? "selected" : ""}" data-shelf-id="${node.shelf.id}" title="${escapeHtml(node.shelf.name)}">
             ${hasChildren ? '<span class="shelf-toggle">▶</span>' : '<span class="shelf-toggle-placeholder"></span>'}
             <span class="shelf-name">${escapeHtml(node.shelf.name)}</span>
@@ -154,6 +198,12 @@ function renderShelfNodes(nodes: library.ShelfTree[], depth: number): string {
       `;
     })
     .join("");
+}
+
+function shelfNodeContainsSelected(node: library.ShelfTree): boolean {
+  if (!selectedShelfId) return false;
+  if (node.shelf.id === selectedShelfId) return true;
+  return node.children.some(shelfNodeContainsSelected);
 }
 
 async function selectShelf(shelfId: number) {
@@ -178,26 +228,42 @@ async function loadTextsInShelf(shelfId: number) {
   activeShelfAnalysisController?.abort();
   activeShelfAnalysisController = null;
 
-  let texts: library.TextSummary[];
-  try {
-    texts = await library.listTextsInShelf(shelfId);
-    saveNavCache(textsCacheKey(shelfId), texts).catch(() => {});
-  } catch (networkError) {
-    console.warn("Failed to load texts from server, trying IDB cache:", networkError);
-    const cached = await getNavCache<library.TextSummary[]>(textsCacheKey(shelfId)).catch(() => null);
-    if (cached) {
-      texts = cached;
-    } else {
-      mainContainer.innerHTML = `<p class="error">Offline and no cached text list available for this shelf.</p>`;
-      return;
+  const renderLoadedShelf = async (
+    texts: library.TextSummary[],
+    listState: ShelfListState,
+  ) => {
+    if (pendingShelfAnalysisTimer !== null) {
+      window.clearTimeout(pendingShelfAnalysisTimer);
+      pendingShelfAnalysisTimer = null;
     }
-  }
+    activeShelfAnalysisController?.abort();
+    activeShelfAnalysisController = null;
 
-  try {
     setCurrentShelfTexts(texts);
     const shelf = findShelfById(shelfTree, shelfId);
-    const cachedAnalysis = await getNavCache<library.ShelfAnalysis>(shelfAnalysisCacheKey(shelfId)).catch(() => null);
-    renderShelfContents(mainContainer, shelfId, shelf?.shelf.name || "Shelf", texts, cachedAnalysis, cachedAnalysis ? "cached" : "loading");
+    const [cachedAnalysis, shelfCache, textCache] = await Promise.all([
+      getNavCache<library.ShelfAnalysis>(shelfAnalysisCacheKey(shelfId)).catch(() => null),
+      getShelfCacheMetadata(shelfId).catch(() => null),
+      listTextCacheMetadata(texts.map((text) => text.id)).catch(() => new Map<number, CacheMetadata>()),
+    ]);
+    const analysisState: AnalysisState = cachedAnalysis
+      ? "cached"
+      : listState === "offline"
+        ? "offline"
+        : "loading";
+    renderShelfContents(
+      mainContainer,
+      shelfId,
+      shelf?.shelf.name || "Shelf",
+      texts,
+      cachedAnalysis,
+      analysisState,
+      listState,
+      shelfCache,
+      textCache,
+    );
+
+    if (listState === "offline") return;
 
     pendingShelfAnalysisTimer = window.setTimeout(async () => {
       pendingShelfAnalysisTimer = null;
@@ -207,23 +273,87 @@ async function loadTextsInShelf(shelfId: number) {
       try {
         const freshAnalysis = await library.getShelfAnalysis(shelfId, { signal: controller.signal });
         saveNavCache(shelfAnalysisCacheKey(shelfId), freshAnalysis).catch(() => {});
+        markShelfAnalysisCached(shelfId).catch(() => {});
         if (selectedShelfId === shelfId) {
-          renderShelfContents(mainContainer, shelfId, shelf?.shelf.name || "Shelf", texts, freshAnalysis, "fresh");
+          const [freshShelfCache, freshTextCache] = await Promise.all([
+            getShelfCacheMetadata(shelfId).catch(() => null),
+            listTextCacheMetadata(texts.map((text) => text.id)).catch(() => new Map<number, CacheMetadata>()),
+          ]);
+          renderShelfContents(
+            mainContainer,
+            shelfId,
+            shelf?.shelf.name || "Shelf",
+            texts,
+            freshAnalysis,
+            "fresh",
+            "fresh",
+            freshShelfCache,
+            freshTextCache,
+          );
         }
       } catch (analysisError) {
         if ((analysisError as Error).name === "AbortError") return;
         if (cachedAnalysis || selectedShelfId !== shelfId) return;
         console.warn("Failed to load shelf analysis:", analysisError);
-        renderShelfContents(mainContainer, shelfId, shelf?.shelf.name || "Shelf", texts, null, navigator.onLine ? "unavailable" : "offline");
+        renderShelfContents(
+          mainContainer,
+          shelfId,
+          shelf?.shelf.name || "Shelf",
+          texts,
+          null,
+          navigator.onLine ? "unavailable" : "offline",
+          listState,
+          shelfCache,
+          textCache,
+        );
       } finally {
         if (activeShelfAnalysisController === controller) {
           activeShelfAnalysisController = null;
         }
       }
     }, cachedAnalysis ? 150 : 350);
+  };
 
-  } catch (error) {
-    mainContainer.innerHTML = `<p class="error">Failed to load texts: ${error}</p>`;
+  const cachedTexts = await getNavCache<library.TextSummary[]>(textsCacheKey(shelfId)).catch(() => null);
+
+  if (!navigator.onLine) {
+    if (cachedTexts) {
+      await renderLoadedShelf(cachedTexts, "offline");
+    } else {
+      mainContainer.innerHTML = `<p class="error">Offline and no cached text list available for this shelf.</p>`;
+    }
+    return;
+  }
+
+  let previewTimer: number | null = null;
+  let previewRendered = false;
+
+  if (cachedTexts) {
+    previewTimer = window.setTimeout(() => {
+      previewRendered = true;
+      renderLoadedShelf(cachedTexts, "cached").catch((error) => {
+        mainContainer.innerHTML = `<p class="error">Failed to load cached texts: ${error}</p>`;
+      });
+    }, CACHED_PREVIEW_DELAY_MS);
+  }
+
+  try {
+    const texts = await library.listTextsInShelf(shelfId);
+    if (previewTimer !== null) window.clearTimeout(previewTimer);
+    saveNavCache(textsCacheKey(shelfId), texts).catch(() => {});
+    const shelfCount = getShelfAndDescendantIds(shelfTree, shelfId).size;
+    markShelfNavCached(shelfId, texts.length, shelfCount).catch(() => {});
+    await renderLoadedShelf(texts, "fresh");
+  } catch (networkError) {
+    if (previewTimer !== null) window.clearTimeout(previewTimer);
+    console.warn("Failed to load texts from server, trying IDB cache:", networkError);
+    if (cachedTexts) {
+      if (!previewRendered) {
+        await renderLoadedShelf(cachedTexts, "cached");
+      }
+    } else {
+      mainContainer.innerHTML = `<p class="error">Offline and no cached text list available for this shelf.</p>`;
+    }
   }
 }
 
@@ -233,15 +363,35 @@ function renderShelfContents(
   shelfName: string,
   texts: library.TextSummary[],
   shelfAnalysis: library.ShelfAnalysis | null,
-  analysisState: "loading" | "cached" | "fresh" | "offline" | "unavailable",
+  analysisState: AnalysisState,
+  listState: ShelfListState,
+  shelfCache: CacheMetadata | null,
+  textCache: Map<number, CacheMetadata>,
 ) {
   const hasTexts = shelfAnalysis !== null && shelfAnalysis.text_count > 0;
+  const offlineReadyCount = texts.filter((text) => isTextOfflineReady(textCache.get(text.id))).length;
+  const cacheAge = formatCacheAge(shelfCache?.last_cached_at);
+  const listStatus = listState === "fresh"
+    ? "Live"
+    : listState === "offline"
+      ? "Offline cache"
+      : listState === "cached"
+        ? "Cached preview"
+        : "Loading";
+  const cacheSummary = shelfCache
+    ? `${listStatus}${cacheAge ? `, updated ${cacheAge}` : ""} · ${offlineReadyCount}/${texts.length} texts offline ready`
+    : `${listStatus} · ${offlineReadyCount}/${texts.length} texts offline ready`;
 
   let html = `
     <div class="shelf-view-layout ${hasTexts ? "has-analysis" : ""}">
       <div class="shelf-main">
         <div class="shelf-header">
-          <h2>${escapeHtml(shelfName)}</h2>
+          <div class="shelf-title-group">
+            <h2>${escapeHtml(shelfName)}</h2>
+            <div class="cache-status-row">
+              <span class="cache-pill ${offlineReadyCount === texts.length && texts.length > 0 ? "ready" : offlineReadyCount > 0 ? "partial" : "empty"}">${escapeHtml(cacheSummary)}</span>
+            </div>
+          </div>
           <div class="shelf-actions">
             <button id="add-text-btn" class="btn-primary">Add Text</button>
             <button id="split-large-texts-btn" class="btn-secondary">Split Large Texts</button>
@@ -269,6 +419,13 @@ function renderShelfContents(
           <div class="text-meta">
             <span class="text-chars">${library.formatCharacterCount(text.character_count)} chars</span>
             ${text.has_analysis ? '<span class="text-analyzed">Analyzed</span>' : ""}
+            <span class="text-cache-badge ${isTextOfflineReady(textCache.get(text.id)) ? "ready" : textCache.has(text.id) ? "partial" : "empty"}" title="${escapeHtml(describeTextCache(textCache.get(text.id)))}">${
+              isTextOfflineReady(textCache.get(text.id))
+                ? "Cached"
+                : textCache.has(text.id)
+                  ? "Partial"
+                  : "Not cached"
+            }</span>
           </div>
         </div>
       `;
@@ -299,7 +456,7 @@ function renderShelfContents(
 
 function renderShelfAnalysisSection(
   shelfAnalysis: library.ShelfAnalysis | null,
-  analysisState: "loading" | "cached" | "fresh" | "offline" | "unavailable",
+  analysisState: AnalysisState,
   hasAnyTexts: boolean,
 ): string {
   if (shelfAnalysis === null) {
@@ -496,7 +653,9 @@ async function loadTextView(textId: number) {
   }
 
   try {
-    const text = await library.getText(textId);
+    const cachedText = !navigator.onLine ? await getTextCache(textId).catch(() => null) : null;
+    const text = cachedText ?? await library.getText(textId);
+    const textCache = await getTextCacheMetadata(textId).catch(() => null);
     setCurrentTextCharacterCount(text.character_count);
 
     // Pre-warm the per-text vocab cache so the SW caches it for offline lookup
@@ -523,6 +682,9 @@ async function loadTextView(textId: number) {
           <div class="text-title-group">
             <h2>${escapeHtml(text.title)}</h2>
             ${text.author ? `<p class="text-author">by ${escapeHtml(text.author)}</p>` : ""}
+            <div class="cache-status-row">
+              <span class="cache-pill ${isTextOfflineReady(textCache ?? undefined) ? "ready" : textCache ? "partial" : "empty"}">${escapeHtml(describeTextCache(textCache ?? undefined))}</span>
+            </div>
           </div>
           <div class="reading-controls" id="reading-controls">
             ${activeSession
@@ -961,19 +1123,7 @@ async function loadInteractiveText(content: string, textId: number) {
 
   setCurrentTextId(textId);
 
-  try {
-    let segments: library.TextSegment[];
-    try {
-      segments = await library.segmentText(content);
-      saveTextSegments(textId, segments).catch((err) =>
-        console.warn("save text-segments failed:", err),
-      );
-    } catch (segmentError) {
-      const cachedSegments = await getTextSegments(textId).catch(() => null);
-      if (!cachedSegments) throw segmentError;
-      segments = cachedSegments;
-    }
-
+  const renderSegments = (segments: library.TextSegment[]) => {
     setCurrentTextSegments(segments);
 
     let html = "";
@@ -1005,7 +1155,30 @@ async function loadInteractiveText(content: string, textId: number) {
       });
     });
 
-    container.addEventListener("mouseup", handleTextSelection);
+    container.onmouseup = handleTextSelection;
+  };
+
+  try {
+    const cachedSegments = await getTextSegments(textId).catch(() => null);
+
+    if (!navigator.onLine && cachedSegments) {
+      renderSegments(cachedSegments);
+      return;
+    }
+
+    if (cachedSegments) {
+      renderSegments(cachedSegments);
+    }
+
+    try {
+      const segments = await library.segmentText(content);
+      saveTextSegments(textId, segments).catch((err) =>
+        console.warn("save text-segments failed:", err),
+      );
+      renderSegments(segments);
+    } catch (segmentError) {
+      if (!cachedSegments) throw segmentError;
+    }
   } catch (error) {
     container.innerHTML = `<p class="error">Failed to load text: ${error}</p>`;
   }
@@ -2354,12 +2527,18 @@ async function cacheShelfForOffline(shelfId: number, directTexts: library.TextSu
 
     btn.textContent = `Caching shelves 1/${shelfIds.length}...`;
     saveNavCache(textsCacheKey(shelfId), directTexts).catch(() => {});
+    markShelfNavCached(shelfId, directTexts.length, shelfIds.length).catch(() => {});
 
     for (let index = 0; index < shelfIds.length; index += 1) {
       const currentShelfId = shelfIds[index];
       if (currentShelfId !== shelfId) {
         const shelfTexts = await library.listTextsInShelf(currentShelfId);
         saveNavCache(textsCacheKey(currentShelfId), shelfTexts).catch(() => {});
+        markShelfNavCached(
+          currentShelfId,
+          shelfTexts.length,
+          getShelfAndDescendantIds(shelfTree, currentShelfId).size,
+        ).catch(() => {});
         for (const text of shelfTexts) {
           textMap.set(text.id, text);
         }
@@ -2381,29 +2560,38 @@ async function cacheShelfForOffline(shelfId: number, directTexts: library.TextSu
       try {
         const analysis = await library.getShelfAnalysis(currentShelfId);
         saveNavCache(shelfAnalysisCacheKey(currentShelfId), analysis).catch(() => {});
+        markShelfAnalysisCached(currentShelfId).catch(() => {});
       } catch (error) {
         console.warn(`Failed to cache shelf analysis for ${currentShelfId}:`, error);
       }
     }
 
+    let completeTextCount = 0;
     for (let index = 0; index < texts.length; index += 1) {
       const text = texts[index];
       btn.textContent = `Caching text ${index + 1}/${texts.length}...`;
       const fullText = await library.getText(text.id);
+      let hasSegments = false;
+      let hasVocab = false;
       try {
         const segments = await library.segmentText(fullText.content);
         await saveTextSegments(text.id, segments);
+        hasSegments = true;
       } catch (error) {
         console.warn(`Failed to cache segments for text ${text.id}:`, error);
       }
       try {
         await library.getTextVocabCache(text.id);
+        hasVocab = true;
       } catch (error) {
         console.warn(`Failed to cache vocab for text ${text.id}:`, error);
       }
+      if (hasSegments && hasVocab) completeTextCount += 1;
     }
 
+    await markShelfOfflineCacheComplete(shelfId, texts.length, shelfIds.length, completeTextCount);
     btn.textContent = `Cached ${texts.length} texts ✓`;
+    await loadTextsInShelf(shelfId);
     setTimeout(() => { btn.textContent = "Cache for Offline"; btn.disabled = false; }, 3000);
   } catch (error) {
     console.error("Failed to cache shelf for offline use:", error);
