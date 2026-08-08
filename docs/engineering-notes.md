@@ -140,3 +140,20 @@ The project has several implementation plans under `docs/superpowers/plans/`.
 They are useful history, but some tasks describe intended behavior that is only
 partially implemented. Prefer `docs/architecture/current-architecture.md` for
 current state and use the plan files as design background.
+# Offline reliability handoff (2026-08-08)
+
+The observed update failure was consistent with shell release metadata being removed during activation: the content cache and metadata cache shared the `shell-release-` cleanup prefix. The worker now uses a disjoint content-cache namespace, stages and verifies critical build assets before readiness, selects a verified release before cleanup, and retains older ready releases.
+
+Production headers observed before deployment on `chasmfiend.local`:
+
+| Path | Content-Type | Cache-Control |
+| --- | --- | --- |
+| `/sw.js` | `text/javascript` | absent |
+| `/index.html` | `text/html` | absent |
+| `/assets/main-BIQSKHwV.js` | `text/javascript` | absent |
+
+The server header policy test verifies the post-change values: `no-cache` for `/sw.js` and HTML/SPA fallback responses, and `public, max-age=31536000, immutable` for `/assets/*`. Capture deployed headers again after explicit deployment approval.
+
+Automated browser coverage currently exercises verified readiness, cold offline query launch, optional icon failure, no service-worker caching for text APIs, copyable recovery diagnostics, and IndexedDB-first text opening without `/api/texts/:id`. Physical Android force-stop, reboot, interrupted deployment, and storage-eviction acceptance remain manual gates and must not be reported as passed until run on the original device.
+
+Storage limitations remain: uninstalling the PWA, clearing site data, or browser/OS eviction can remove shell caches and downloaded text bundles. The app requests persistent storage after a completed shelf download and reports the browser decision, but persistence is not an absolute guarantee.

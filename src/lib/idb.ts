@@ -1,7 +1,8 @@
-import type { Text, TextSegment, TextVocabCache, VocabCacheEntry } from "./library";
+import type { Text, TextSegment, TextSummary, TextVocabCache, VocabCacheEntry } from "./library";
 
 const DB_NAME = "chinese-reader";
-const DB_VERSION = 4;
+const DB_VERSION = 5;
+const OFFLINE_BUNDLE_SCHEMA_VERSION = 1;
 
 export const STORE_VOCAB_CACHE = "vocab_cache";
 export const STORE_SESSIONS = "sessions";
@@ -10,6 +11,27 @@ export const STORE_TEXT_META = "text_meta";
 export const STORE_NAV_CACHE = "nav_cache";
 export const STORE_TEXT_CACHE = "text_cache";
 export const STORE_TEXT_SEGMENTS = "text_segments";
+export const STORE_OFFLINE_BUNDLES = "offline_text_bundles";
+
+export type OfflineTextBundleStatus = "missing" | "partial" | "complete";
+
+export interface OfflineTextBundle {
+  text: Text;
+  segments: TextSegment[];
+  vocab: TextVocabCache;
+  summary: TextSummary;
+}
+
+interface OfflineTextBundleMarker {
+  text_id: number;
+  schema_version: number;
+  status: "complete";
+  downloaded_at: number;
+  segment_count: number;
+  vocab_entry_count: number;
+  vocab_terms: string[];
+  summary: TextSummary;
+}
 
 export interface CacheMetadata {
   text_id: string | number;
@@ -61,6 +83,9 @@ export function openDb(): Promise<IDBDatabase> {
         db.createObjectStore(STORE_TEXT_CACHE, { keyPath: "id" });
         db.createObjectStore(STORE_TEXT_SEGMENTS, { keyPath: "text_id" });
       }
+      if (oldVersion < 5) {
+        db.createObjectStore(STORE_OFFLINE_BUNDLES, { keyPath: "text_id" });
+      }
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -75,6 +100,13 @@ function txDone(tx: IDBTransaction): Promise<void> {
   });
 }
 
+function requestAsPromise<T>(request: IDBRequest<T>): Promise<T> {
+  return new Promise((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
 function shelfMetaKey(shelfId: number): string {
   return `shelf:${shelfId}`;
 }
@@ -85,6 +117,14 @@ function touchMeta(meta: CacheMetadata, fields: Partial<CacheMetadata>): CacheMe
     ...meta,
     ...fields,
     last_cached_at: now,
+  };
+}
+
+function bundleCompleteMetaFields(now = Date.now()): Partial<CacheMetadata> {
+  return {
+    text_cached_at: now,
+    segments_cached_at: now,
+    vocab_cached_at: now,
   };
 }
 
@@ -138,6 +178,15 @@ export async function listTextCacheMetadata(textIds: number[]): Promise<Map<numb
   );
 }
 
+export async function listOfflineTextBundleStatuses(
+  textIds: number[],
+): Promise<Map<number, OfflineTextBundleStatus>> {
+  const entries = await Promise.all(
+    textIds.map(async (id) => [id, await getOfflineTextBundleStatus(id)] as const),
+  );
+  return new Map(entries);
+}
+
 export async function markShelfNavCached(
   shelfId: number,
   textCount: number,
@@ -172,6 +221,24 @@ export async function markShelfOfflineCacheComplete(
   });
 }
 
+export async function markShelfOfflineCacheVerified(
+  shelfId: number,
+  textCount: number,
+  shelfCount: number,
+  expectedTextIds: number[],
+): Promise<void> {
+  const statuses = await listOfflineTextBundleStatuses(expectedTextIds);
+  const completeTextCount = expectedTextIds.filter((id) => statuses.get(id) === "complete").length;
+  const now = Date.now();
+  await updateMeta(shelfMetaKey(shelfId), {
+    nav_cached_at: now,
+    analysis_cached_at: now,
+    text_count: textCount,
+    shelf_count: shelfCount,
+    complete_text_count: completeTextCount,
+  });
+}
+
 // ── Vocab cache ────────────────────────────────────────────────────────
 
 export async function ingestTextVocabCache(cache: TextVocabCache): Promise<void> {
@@ -183,6 +250,107 @@ export async function ingestTextVocabCache(cache: TextVocabCache): Promise<void>
   await txDone(tx);
   db.close();
   await updateMeta(cache.text_id, { vocab_cached_at: Date.now() });
+}
+
+export async function saveOfflineTextBundle(bundle: OfflineTextBundle): Promise<void> {
+  const db = await openDb();
+  const now = Date.now();
+  const vocabTerms = Array.from(new Set([
+    ...bundle.vocab.words.map((entry) => entry.term),
+    ...bundle.vocab.characters.map((entry) => entry.term),
+  ]));
+  const tx = db.transaction(
+    [
+      STORE_TEXT_CACHE,
+      STORE_TEXT_SEGMENTS,
+      STORE_VOCAB_CACHE,
+      STORE_TEXT_META,
+      STORE_OFFLINE_BUNDLES,
+    ],
+    "readwrite",
+  );
+  const vocabStore = tx.objectStore(STORE_VOCAB_CACHE);
+  for (const entry of bundle.vocab.words) vocabStore.put(entry);
+  for (const entry of bundle.vocab.characters) vocabStore.put(entry);
+
+  tx.objectStore(STORE_TEXT_CACHE).put({ ...bundle.text, cached_at: now });
+  tx.objectStore(STORE_TEXT_SEGMENTS).put({
+    text_id: bundle.text.id,
+    segments: bundle.segments,
+    cached_at: now,
+  });
+
+  tx.objectStore(STORE_TEXT_META).put(
+    touchMeta({ text_id: bundle.text.id }, bundleCompleteMetaFields(now)),
+  );
+
+  const marker: OfflineTextBundleMarker = {
+    text_id: bundle.text.id,
+    schema_version: OFFLINE_BUNDLE_SCHEMA_VERSION,
+    status: "complete",
+    downloaded_at: now,
+    segment_count: bundle.segments.length,
+    vocab_entry_count: vocabTerms.length,
+    vocab_terms: vocabTerms,
+    summary: bundle.summary,
+  };
+  tx.objectStore(STORE_OFFLINE_BUNDLES).put(marker);
+
+  await txDone(tx);
+  db.close();
+
+  const status = await getOfflineTextBundleStatus(bundle.text.id);
+  if (status !== "complete") {
+    throw new Error(`Offline bundle validation failed for text ${bundle.text.id}: ${status}`);
+  }
+}
+
+export async function getOfflineTextBundleStatus(textId: number): Promise<OfflineTextBundleStatus> {
+  const db = await openDb();
+  const tx = db.transaction(
+    [STORE_TEXT_CACHE, STORE_TEXT_SEGMENTS, STORE_VOCAB_CACHE, STORE_TEXT_META, STORE_OFFLINE_BUNDLES],
+    "readonly",
+  );
+
+  const [marker, text, segments, meta] = await Promise.all([
+    requestAsPromise<OfflineTextBundleMarker | undefined>(
+      tx.objectStore(STORE_OFFLINE_BUNDLES).get(textId),
+    ),
+    requestAsPromise<Text | undefined>(tx.objectStore(STORE_TEXT_CACHE).get(textId)),
+    requestAsPromise<{ text_id: number; segments: TextSegment[] } | undefined>(
+      tx.objectStore(STORE_TEXT_SEGMENTS).get(textId),
+    ),
+    requestAsPromise<CacheMetadata | undefined>(tx.objectStore(STORE_TEXT_META).get(textId)),
+  ]);
+  await txDone(tx);
+
+  const hasAnyLocalData = Boolean(marker || text || segments || meta);
+  if (!hasAnyLocalData) {
+    db.close();
+    return "missing";
+  }
+  const vocabTerms = marker?.vocab_terms ?? [];
+  const vocabEntries = await Promise.all(
+    vocabTerms.map((term) => requestAsPromise<VocabCacheEntry | undefined>(
+      db.transaction(STORE_VOCAB_CACHE, "readonly").objectStore(STORE_VOCAB_CACHE).get(term),
+    )),
+  );
+  db.close();
+  if (
+    marker?.status === "complete" &&
+    marker.schema_version === OFFLINE_BUNDLE_SCHEMA_VERSION &&
+    text &&
+    marker.summary?.id === textId &&
+    segments?.segments?.length === marker.segment_count &&
+    marker.vocab_entry_count === vocabTerms.length &&
+    vocabEntries.every(Boolean) &&
+    meta?.text_cached_at &&
+    meta.segments_cached_at &&
+    meta.vocab_cached_at
+  ) {
+    return "complete";
+  }
+  return "partial";
 }
 
 export async function lookupOffline(term: string): Promise<VocabCacheEntry | null> {

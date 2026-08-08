@@ -404,15 +404,14 @@ export async function createText(
  * Get a text by ID
  */
 export async function getText(id: number): Promise<Text> {
+  const cached = await getTextCache(id).catch(() => null);
+  if (cached) return cached;
+
   try {
     const text = await fetchJson<Text>(`/api/texts/${id}`);
-    saveTextCache(text).catch((err) =>
-      console.warn("save text-cache failed:", err),
-    );
+    await saveTextCache(text);
     return text;
   } catch (error) {
-    const cached = await getTextCache(id).catch(() => null);
-    if (cached) return cached;
     throw error;
   }
 }

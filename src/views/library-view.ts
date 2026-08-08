@@ -3,6 +3,7 @@ import * as library from "../lib/library";
 import * as speed from "../lib/speed";
 import {
   type CacheMetadata,
+  type OfflineTextBundleStatus,
   getInProgressSessionForText,
   deleteSession,
   saveNavCache,
@@ -13,11 +14,14 @@ import {
   getShelfCacheMetadata,
   getTextCacheMetadata,
   listTextCacheMetadata,
+  listOfflineTextBundleStatuses,
   markShelfAnalysisCached,
   markShelfNavCached,
-  markShelfOfflineCacheComplete,
+  markShelfOfflineCacheVerified,
+  saveOfflineTextBundle,
 } from "../lib/idb";
 import { confirm } from "../lib/api";
+import { requestOfflineStoragePersistence } from "../lib/offline-status";
 import {
   escapeHtml,
   createModal,
@@ -77,6 +81,10 @@ function isTextOfflineReady(meta?: CacheMetadata): boolean {
   return Boolean(meta?.text_cached_at && meta.segments_cached_at && meta.vocab_cached_at);
 }
 
+function isBundleOfflineReady(status?: OfflineTextBundleStatus): boolean {
+  return status === "complete";
+}
+
 function describeTextCache(meta?: CacheMetadata): string {
   if (!meta) return "Not cached";
   if (isTextOfflineReady(meta)) return `Offline ready, cached ${formatCacheAge(meta.last_cached_at)}`;
@@ -88,6 +96,12 @@ function describeTextCache(meta?: CacheMetadata): string {
   return parts.length > 0
     ? `Partial cache: ${parts.join(", ")}`
     : "Not cached";
+}
+
+function describeBundleStatus(status?: OfflineTextBundleStatus): string {
+  if (status === "complete") return "Available offline";
+  if (status === "partial") return "Partially downloaded";
+  return "Not available offline";
 }
 
 export function setupLibraryView() {
@@ -241,10 +255,11 @@ async function loadTextsInShelf(shelfId: number) {
 
     setCurrentShelfTexts(texts);
     const shelf = findShelfById(shelfTree, shelfId);
-    const [cachedAnalysis, shelfCache, textCache] = await Promise.all([
+    const [cachedAnalysis, shelfCache, textCache, bundleStatuses] = await Promise.all([
       getNavCache<library.ShelfAnalysis>(shelfAnalysisCacheKey(shelfId)).catch(() => null),
       getShelfCacheMetadata(shelfId).catch(() => null),
       listTextCacheMetadata(texts.map((text) => text.id)).catch(() => new Map<number, CacheMetadata>()),
+      listOfflineTextBundleStatuses(texts.map((text) => text.id)).catch(() => new Map<number, OfflineTextBundleStatus>()),
     ]);
     const analysisState: AnalysisState = cachedAnalysis
       ? "cached"
@@ -261,6 +276,7 @@ async function loadTextsInShelf(shelfId: number) {
       listState,
       shelfCache,
       textCache,
+      bundleStatuses,
     );
 
     if (listState === "offline") return;
@@ -275,9 +291,10 @@ async function loadTextsInShelf(shelfId: number) {
         saveNavCache(shelfAnalysisCacheKey(shelfId), freshAnalysis).catch(() => {});
         markShelfAnalysisCached(shelfId).catch(() => {});
         if (selectedShelfId === shelfId) {
-          const [freshShelfCache, freshTextCache] = await Promise.all([
+          const [freshShelfCache, freshTextCache, freshBundleStatuses] = await Promise.all([
             getShelfCacheMetadata(shelfId).catch(() => null),
             listTextCacheMetadata(texts.map((text) => text.id)).catch(() => new Map<number, CacheMetadata>()),
+            listOfflineTextBundleStatuses(texts.map((text) => text.id)).catch(() => new Map<number, OfflineTextBundleStatus>()),
           ]);
           renderShelfContents(
             mainContainer,
@@ -289,6 +306,7 @@ async function loadTextsInShelf(shelfId: number) {
             "fresh",
             freshShelfCache,
             freshTextCache,
+            freshBundleStatuses,
           );
         }
       } catch (analysisError) {
@@ -305,6 +323,7 @@ async function loadTextsInShelf(shelfId: number) {
           listState,
           shelfCache,
           textCache,
+          bundleStatuses,
         );
       } finally {
         if (activeShelfAnalysisController === controller) {
@@ -367,9 +386,10 @@ function renderShelfContents(
   listState: ShelfListState,
   shelfCache: CacheMetadata | null,
   textCache: Map<number, CacheMetadata>,
+  bundleStatuses: Map<number, OfflineTextBundleStatus>,
 ) {
   const hasTexts = shelfAnalysis !== null && shelfAnalysis.text_count > 0;
-  const offlineReadyCount = texts.filter((text) => isTextOfflineReady(textCache.get(text.id))).length;
+  const offlineReadyCount = texts.filter((text) => isBundleOfflineReady(bundleStatuses.get(text.id))).length;
   const cacheAge = formatCacheAge(shelfCache?.last_cached_at);
   const listStatus = listState === "fresh"
     ? "Live"
@@ -419,12 +439,12 @@ function renderShelfContents(
           <div class="text-meta">
             <span class="text-chars">${library.formatCharacterCount(text.character_count)} chars</span>
             ${text.has_analysis ? '<span class="text-analyzed">Analyzed</span>' : ""}
-            <span class="text-cache-badge ${isTextOfflineReady(textCache.get(text.id)) ? "ready" : textCache.has(text.id) ? "partial" : "empty"}" title="${escapeHtml(describeTextCache(textCache.get(text.id)))}">${
-              isTextOfflineReady(textCache.get(text.id))
-                ? "Cached"
-                : textCache.has(text.id)
+            <span class="text-cache-badge ${isBundleOfflineReady(bundleStatuses.get(text.id)) ? "ready" : bundleStatuses.get(text.id) === "partial" || textCache.has(text.id) ? "partial" : "empty"}" title="${escapeHtml(`${describeBundleStatus(bundleStatuses.get(text.id))}; ${describeTextCache(textCache.get(text.id))}`)}">${
+              isBundleOfflineReady(bundleStatuses.get(text.id))
+                ? "Available offline"
+                : bundleStatuses.get(text.id) === "partial" || textCache.has(text.id)
                   ? "Partial"
-                  : "Not cached"
+                  : "Not offline"
             }</span>
           </div>
         </div>
@@ -2566,30 +2586,24 @@ async function cacheShelfForOffline(shelfId: number, directTexts: library.TextSu
       }
     }
 
-    let completeTextCount = 0;
     for (let index = 0; index < texts.length; index += 1) {
       const text = texts[index];
       btn.textContent = `Caching text ${index + 1}/${texts.length}...`;
       const fullText = await library.getText(text.id);
-      let hasSegments = false;
-      let hasVocab = false;
-      try {
-        const segments = await library.segmentText(fullText.content);
-        await saveTextSegments(text.id, segments);
-        hasSegments = true;
-      } catch (error) {
-        console.warn(`Failed to cache segments for text ${text.id}:`, error);
-      }
-      try {
-        await library.getTextVocabCache(text.id);
-        hasVocab = true;
-      } catch (error) {
-        console.warn(`Failed to cache vocab for text ${text.id}:`, error);
-      }
-      if (hasSegments && hasVocab) completeTextCount += 1;
+      const [segments, vocab] = await Promise.all([
+        library.segmentText(fullText.content),
+        library.getTextVocabCache(text.id),
+      ]);
+      await saveOfflineTextBundle({ text: fullText, segments, vocab, summary: text });
     }
 
-    await markShelfOfflineCacheComplete(shelfId, texts.length, shelfIds.length, completeTextCount);
+    await markShelfOfflineCacheVerified(
+      shelfId,
+      texts.length,
+      shelfIds.length,
+      texts.map((text) => text.id),
+    );
+    await requestOfflineStoragePersistence().catch(() => null);
     btn.textContent = `Cached ${texts.length} texts ✓`;
     await loadTextsInShelf(shelfId);
     setTimeout(() => { btn.textContent = "Cache for Offline"; btn.disabled = false; }, 3000);

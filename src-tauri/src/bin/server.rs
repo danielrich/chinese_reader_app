@@ -10,9 +10,10 @@
 //!   ./server --cert chasmfiend.local.pem --key chasmfiend.local-key.pem
 
 use axum::{
-    extract::{Path, State},
-    http::StatusCode,
-    response::IntoResponse,
+    extract::{Path, Request, State},
+    http::{header, HeaderValue, StatusCode},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
@@ -28,6 +29,45 @@ use tower_http::services::{ServeDir, ServeFile};
 const DB_PRAGMAS: &str =
     "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=30000;";
 const WRITE_WAIT_LOG_THRESHOLD: Duration = Duration::from_millis(250);
+
+fn cache_control_for_static_response(path: &str, content_type: Option<&str>) -> Option<&'static str> {
+    if path.starts_with("/api/") || path == "/health" {
+        return None;
+    }
+    if path == "/sw.js" || content_type.is_some_and(|value| value.starts_with("text/html")) {
+        return Some("no-cache");
+    }
+    if path.starts_with("/assets/") {
+        return Some("public, max-age=31536000, immutable");
+    }
+    None
+}
+
+async fn add_static_cache_headers(request: Request, next: Next) -> Response {
+    let path = request.uri().path().to_owned();
+    let mut response = next.run(request).await;
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    if let Some(policy) = cache_control_for_static_response(&path, content_type) {
+        response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static(policy));
+    }
+    response
+}
+
+#[cfg(test)]
+mod static_header_tests {
+    use super::cache_control_for_static_response;
+
+    #[test]
+    fn assigns_release_safe_cache_policies() {
+        assert_eq!(cache_control_for_static_response("/sw.js", Some("text/javascript")), Some("no-cache"));
+        assert_eq!(cache_control_for_static_response("/index.html", Some("text/html; charset=utf-8")), Some("no-cache"));
+        assert_eq!(cache_control_for_static_response("/assets/main-abc123.js", Some("text/javascript")), Some("public, max-age=31536000, immutable"));
+        assert_eq!(cache_control_for_static_response("/api/texts/1", Some("application/json")), None);
+    }
+}
 
 // ── Connection pool ───────────────────────────────────────────────────────────
 
@@ -191,6 +231,7 @@ async fn main() {
         .route("/api/sync/sessions", post(sync_sessions_handler))
         .fallback_service(serve_static)
         .with_state(db)
+        .layer(middleware::from_fn(add_static_cache_headers))
         .layer(cors);
 
     let addr: std::net::SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();

@@ -5,6 +5,7 @@ import { loadSpeedView } from "./views/speed-view";
 import { loadStatsView } from "./views/stats-view";
 import { loadPrestudyView } from "./views/prestudy-view";
 import { loadLearningView } from "./views/learning-view";
+import { initializeOfflineStatus } from "./lib/offline-status";
 
 // Global Error Handler
 function showError(message: string): void {
@@ -114,6 +115,8 @@ async function initApp() {
         </button>
       </nav>
 
+      <section id="offline-status" class="offline-status" aria-label="Offline status"></section>
+
       <div id="dictionary-view" class="view active">
         <div class="search-box">
           <input
@@ -191,6 +194,7 @@ async function initApp() {
   // Set up navigation
   setupNavigation();
   setupAppRefresh();
+  initializeOfflineStatus(document.getElementById("offline-status")!);
 
   // Set up dictionary view
   setupDictionaryView();

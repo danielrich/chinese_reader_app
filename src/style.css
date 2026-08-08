@@ -4744,3 +4744,46 @@ h3 {
     color: #555;
   }
 }
+.offline-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin: 0.75rem 0 1rem;
+  padding: 0.75rem 0.9rem;
+  border: 1px solid color-mix(in srgb, currentColor 18%, transparent);
+  border-radius: 0.65rem;
+  background: color-mix(in srgb, currentColor 4%, transparent);
+}
+
+.offline-status[data-status="ready"] {
+  border-color: #2f9e44;
+}
+
+.offline-status[data-status="unavailable"] {
+  border-color: #e03131;
+}
+
+.offline-status-copy {
+  display: grid;
+  gap: 0.15rem;
+  min-width: 0;
+}
+
+.offline-status-copy span {
+  font-size: 0.82rem;
+  opacity: 0.78;
+}
+
+.offline-status-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+@media (max-width: 640px) {
+  .offline-status {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}
