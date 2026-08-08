@@ -51,6 +51,7 @@ import {
 let currentSort: library.FrequencySort = "text_frequency";
 let pendingShelfAnalysisTimer: number | null = null;
 let activeShelfAnalysisController: AbortController | null = null;
+const offlineDownloadErrors = new Map<number, string>();
 
 const CACHED_PREVIEW_DELAY_MS = 250;
 
@@ -388,6 +389,7 @@ function renderShelfContents(
   textCache: Map<number, CacheMetadata>,
   bundleStatuses: Map<number, OfflineTextBundleStatus>,
 ) {
+  const offlineDownloadError = offlineDownloadErrors.get(shelfId);
   const hasTexts = shelfAnalysis !== null && shelfAnalysis.text_count > 0;
   const offlineReadyCount = texts.filter((text) => isBundleOfflineReady(bundleStatuses.get(text.id))).length;
   const cacheAge = formatCacheAge(shelfCache?.last_cached_at);
@@ -415,7 +417,7 @@ function renderShelfContents(
           <div class="shelf-actions">
             <button id="add-text-btn" class="btn-primary">Add Text</button>
             <button id="split-large-texts-btn" class="btn-secondary">Split Large Texts</button>
-            <button id="cache-shelf-btn" class="btn-secondary">Cache for Offline</button>
+            <button id="cache-shelf-btn" class="btn-secondary">${escapeHtml(offlineDownloadError ?? "Cache for Offline")}</button>
             <button id="edit-shelf-btn" class="btn-secondary">Edit</button>
             <button id="move-shelf-btn" class="btn-secondary">Move</button>
             <button id="delete-shelf-btn" class="btn-danger">Delete</button>
@@ -2533,6 +2535,7 @@ async function splitLargeTextsInShelf(shelfId: number) {
 async function cacheShelfForOffline(shelfId: number, directTexts: library.TextSummary[], btn: HTMLButtonElement) {
   if (!shelfTree) return;
 
+  offlineDownloadErrors.delete(shelfId);
   btn.disabled = true;
   btn.textContent = "Collecting...";
 
@@ -2589,12 +2592,17 @@ async function cacheShelfForOffline(shelfId: number, directTexts: library.TextSu
     for (let index = 0; index < texts.length; index += 1) {
       const text = texts[index];
       btn.textContent = `Caching text ${index + 1}/${texts.length}...`;
-      const fullText = await library.getText(text.id);
-      const [segments, vocab] = await Promise.all([
-        library.segmentText(fullText.content),
-        library.getTextVocabCache(text.id),
-      ]);
-      await saveOfflineTextBundle({ text: fullText, segments, vocab, summary: text });
+      try {
+        const fullText = await library.getText(text.id);
+        const [segments, vocab] = await Promise.all([
+          library.segmentText(fullText.content),
+          library.getTextVocabCache(text.id),
+        ]);
+        await saveOfflineTextBundle({ text: fullText, segments, vocab, summary: text });
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new Error(`Failed: ${text.title} (${detail})`);
+      }
     }
 
     await markShelfOfflineCacheVerified(
@@ -2604,12 +2612,17 @@ async function cacheShelfForOffline(shelfId: number, directTexts: library.TextSu
       texts.map((text) => text.id),
     );
     await requestOfflineStoragePersistence().catch(() => null);
+    offlineDownloadErrors.delete(shelfId);
     btn.textContent = `Cached ${texts.length} texts ✓`;
     await loadTextsInShelf(shelfId);
     setTimeout(() => { btn.textContent = "Cache for Offline"; btn.disabled = false; }, 3000);
   } catch (error) {
     console.error("Failed to cache shelf for offline use:", error);
-    btn.textContent = "Cache for Offline";
+    const message = error instanceof Error && error.message.startsWith("Failed:")
+      ? error.message
+      : "Offline download failed";
+    offlineDownloadErrors.set(shelfId, message);
+    btn.textContent = message;
     btn.disabled = false;
   }
 }
