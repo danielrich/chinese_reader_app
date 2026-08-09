@@ -294,19 +294,28 @@ async function fetchWithTimeout(request: Request, timeoutMs: number): Promise<Re
 }
 
 async function cacheFirstShellAsset(request: Request): Promise<Response> {
+  const path = normalizeSameOriginPath(new URL(request.url).pathname);
   const release = await getSelectedRelease();
   if (release) {
     const cache = await caches.open(cacheNameForRelease(release.id));
-    const cached = await cache.match(normalizeSameOriginPath(new URL(request.url).pathname));
+    const cached = await cache.match(path);
     if (cached) return cached;
   }
 
-  const response = await fetch(request);
-  if (response.ok && release) {
-    const cache = await caches.open(cacheNameForRelease(release.id));
-    await cache.put(request, response.clone());
+  const releases = await readReadyReleases();
+  for (const retained of releases) {
+    if (retained.id === release?.id) continue;
+    try {
+      await verifyReleaseAssets(retained);
+      const cache = await caches.open(cacheNameForRelease(retained.id));
+      const cached = await cache.match(path);
+      if (cached) return cached;
+    } catch {
+      // Ignore releases whose content was partially evicted.
+    }
   }
-  return response;
+
+  return fetch(request);
 }
 
 async function networkFirst(request: Request): Promise<Response> {
@@ -380,16 +389,24 @@ async function getDiagnostics(): Promise<Diagnostics> {
 }
 
 async function updateDiagnostics(fields: Partial<Diagnostics>): Promise<void> {
-  const cache = await caches.open(DIAGNOSTIC_CACHE);
-  const diagnostics = await getDiagnostics();
-  await cache.put(DIAGNOSTIC_KEY, jsonResponse({ ...diagnostics, ...fields, buildId: BUILD_ID }));
+  try {
+    const cache = await caches.open(DIAGNOSTIC_CACHE);
+    const diagnostics = await getDiagnostics();
+    await cache.put(DIAGNOSTIC_KEY, jsonResponse({ ...diagnostics, ...fields, buildId: BUILD_ID }));
+  } catch (error) {
+    console.warn("Failed to update service-worker diagnostics:", error);
+  }
 }
 
 async function recordEvent(type: string, detail?: string): Promise<void> {
-  const cache = await caches.open(DIAGNOSTIC_CACHE);
-  const diagnostics = await getDiagnostics();
-  const events = [...diagnostics.events, { at: Date.now(), type, detail }].slice(-50);
-  await cache.put(DIAGNOSTIC_KEY, jsonResponse({ ...diagnostics, buildId: BUILD_ID, events }));
+  try {
+    const cache = await caches.open(DIAGNOSTIC_CACHE);
+    const diagnostics = await getDiagnostics();
+    const events = [...diagnostics.events, { at: Date.now(), type, detail }].slice(-50);
+    await cache.put(DIAGNOSTIC_KEY, jsonResponse({ ...diagnostics, buildId: BUILD_ID, events }));
+  } catch (error) {
+    console.warn("Failed to record service-worker diagnostic event:", error);
+  }
 }
 
 function diagnosticFallbackResponse(): Response {

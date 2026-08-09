@@ -435,3 +435,52 @@ test("offline status reports a storage persistence decision", async ({ page }) =
 
   await expect(page.locator("#offline-storage-state")).toContainText(/Persistent storage granted|Persistence not granted|unsupported/i);
 });
+
+test("diagnostic storage failure cannot block cached navigation fallback", async ({ page, context }) => {
+  await bootstrapControlledApp(page);
+  const worker = context.serviceWorkers()[0];
+  if (!worker) throw new Error("service worker missing");
+  await worker.evaluate(() => {
+    const originalOpen = caches.open.bind(caches);
+    Object.defineProperty(caches, "open", {
+      configurable: true,
+      value: (name: string) => name === "shell-diagnostics-v1"
+        ? Promise.reject(new DOMException("quota exhausted", "QuotaExceededError"))
+        : originalOpen(name),
+    });
+  });
+  await context.setOffline(true);
+
+  await page.goto("/?diagnostics-storage-failed=1", { waitUntil: "domcontentloaded" });
+
+  await expect(page.getByRole("heading", { name: "Chinese Reader" })).toBeVisible();
+});
+
+test("an old controlled client can load an asset from a retained verified release", async ({ page, context }) => {
+  await bootstrapControlledApp(page);
+  const selected = await workerMessage<{ activeReleaseId: string }>(page, "VERIFY_SHELL");
+  await page.evaluate(async (selectedId) => {
+    const selectedCache = await caches.open(`shell-content-release-${selectedId}`);
+    const oldCache = await caches.open("shell-content-release-old-client");
+    const index = await selectedCache.match("/index.html");
+    if (!index) throw new Error("selected index missing");
+    await oldCache.put("/index.html", index);
+    await oldCache.put("/assets/old-client.js", new Response("old-client-asset", {
+      status: 200,
+      headers: { "Content-Type": "text/javascript" },
+    }));
+    const meta = await caches.open("shell-release-meta-v1");
+    await meta.put("/release-old-client.json", new Response(JSON.stringify({
+      id: "old-client",
+      entryUrl: "/index.html",
+      criticalUrls: ["/index.html", "/assets/old-client.js"],
+      ready: true,
+      cachedAt: Date.now() - 10_000,
+    }), { headers: { "Content-Type": "application/json" } }));
+  }, selected.activeReleaseId);
+  await context.route("**/assets/old-client.js", (route) => route.abort("connectionrefused"));
+
+  const body = await page.evaluate(async () => (await fetch("/assets/old-client.js")).text());
+
+  expect(body).toBe("old-client-asset");
+});
