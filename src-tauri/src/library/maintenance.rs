@@ -18,6 +18,10 @@ pub struct MaintenanceSnapshot {
 
 /// Marks the task and supplied shelf jobs dirty, retaining the earliest dirty time.
 pub fn mark_analysis_dirty(conn: &Connection, shelf_ids: &[i64], at: DateTime<Utc>) -> Result<()> {
+    if shelf_ids.is_empty() {
+        return Ok(());
+    }
+
     let at = at.to_rfc3339();
     let tx = conn.unchecked_transaction()?;
 
@@ -252,6 +256,19 @@ mod tests {
             .unwrap();
         }
         conn
+    }
+
+    #[test]
+    fn empty_dirty_shelf_ids_leave_maintenance_clean() {
+        let conn = setup_test_db();
+
+        mark_analysis_dirty(&conn, &[], utc("2026-08-20T05:05:00Z")).unwrap();
+
+        let snapshot = maintenance_snapshot(&conn).unwrap();
+        assert_eq!(snapshot.dirty_at, None);
+        assert!(claim_due_jobs(&conn, utc("2026-08-20T05:05:00Z"))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
