@@ -4,7 +4,7 @@
 //! so the app can be accessed from any browser on the local network.
 //!
 //! Usage:
-//!   cargo run --bin server -- [--db-path <path>] [--port <port>] [--dist <path>] [--cert <pem>] [--key <pem>]
+//!   cargo run --bin server -- [--db-path <path>] [--port <port>] [--dist <path>] [--cert <pem>] [--key <pem>] [--run-analysis-maintenance]
 //!
 //! HTTPS example (generate certs with mkcert first):
 //!   ./server --cert chasmfiend.local.pem --key chasmfiend.local-key.pem
@@ -18,6 +18,7 @@ use axum::{
     Json, Router,
 };
 use chinese_reader_lib::{dictionary, library};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, NaiveDate, TimeZone, Utc};
 use rusqlite::Connection;
 use serde_json::Value;
 use std::env;
@@ -30,7 +31,107 @@ const DB_PRAGMAS: &str =
     "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=30000;";
 const WRITE_WAIT_LOG_THRESHOLD: Duration = Duration::from_millis(250);
 
-fn cache_control_for_static_response(path: &str, content_type: Option<&str>) -> Option<&'static str> {
+fn local_maintenance_cutoff(date: NaiveDate) -> DateTime<Local> {
+    Local
+        .with_ymd_and_hms(date.year(), date.month(), date.day(), 0, 5, 0)
+        .single()
+        .expect("00:05 must be an unambiguous local time")
+}
+
+/// Select the scheduler cutoff, retaining a five-minute post-cutoff grace window.
+fn next_maintenance_cutoff(now: DateTime<Local>) -> DateTime<Local> {
+    let today = local_maintenance_cutoff(now.date_naive());
+    if now < today || now < today + ChronoDuration::minutes(5) {
+        today
+    } else {
+        local_maintenance_cutoff(
+            now.date_naive()
+                .succ_opt()
+                .expect("next maintenance date must exist"),
+        )
+    }
+}
+
+fn most_recent_maintenance_cutoff(now: DateTime<Local>) -> DateTime<Local> {
+    let today = local_maintenance_cutoff(now.date_naive());
+    if now >= today {
+        today
+    } else {
+        local_maintenance_cutoff(
+            now.date_naive()
+                .pred_opt()
+                .expect("previous maintenance date must exist"),
+        )
+    }
+}
+
+fn scheduled_cutoff_after_last_run(
+    now: DateTime<Local>,
+    last_run: DateTime<Local>,
+) -> DateTime<Local> {
+    let latest_due = most_recent_maintenance_cutoff(now);
+    if latest_due > last_run {
+        return latest_due;
+    }
+
+    let candidate = next_maintenance_cutoff(now);
+    if candidate > now {
+        candidate
+    } else {
+        local_maintenance_cutoff(
+            now.date_naive()
+                .succ_opt()
+                .expect("next maintenance date must exist"),
+        )
+    }
+}
+
+async fn execute_scheduled_maintenance(db_path: std::path::PathBuf, cutoff: DateTime<Local>) {
+    let cutoff_utc = cutoff.with_timezone(&Utc);
+    let started = Instant::now();
+    match tokio::task::spawn_blocking(move || {
+        library::maintenance::run_due_analysis_maintenance(&db_path, cutoff_utc)
+    })
+    .await
+    {
+        Ok(report) => eprintln!(
+            "Shelf analysis maintenance cutoff={} claimed={} succeeded={} failed={} still_dirty={} elapsed={:?} fatal_error={:?}",
+            report.cutoff,
+            report.claimed,
+            report.succeeded,
+            report.failed,
+            report.still_dirty,
+            started.elapsed(),
+            report.fatal_error
+        ),
+        Err(error) => eprintln!(
+            "Shelf analysis maintenance worker failed cutoff={} elapsed={:?}: {}",
+            cutoff, started.elapsed(), error
+        ),
+    }
+}
+
+fn spawn_analysis_maintenance_scheduler(db_path: std::path::PathBuf) {
+    tokio::spawn(async move {
+        let startup_now = Local::now();
+        let mut last_cutoff = most_recent_maintenance_cutoff(startup_now);
+        execute_scheduled_maintenance(db_path.clone(), last_cutoff).await;
+
+        loop {
+            let now = Local::now();
+            let cutoff = scheduled_cutoff_after_last_run(now, last_cutoff);
+            let sleep_for = (cutoff - now).to_std().unwrap_or_default();
+            tokio::time::sleep(sleep_for).await;
+            execute_scheduled_maintenance(db_path.clone(), cutoff).await;
+            last_cutoff = cutoff;
+        }
+    });
+}
+
+fn cache_control_for_static_response(
+    path: &str,
+    content_type: Option<&str>,
+) -> Option<&'static str> {
     if path.starts_with("/api/") || path == "/health" {
         return None;
     }
@@ -51,7 +152,9 @@ async fn add_static_cache_headers(request: Request, next: Next) -> Response {
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok());
     if let Some(policy) = cache_control_for_static_response(&path, content_type) {
-        response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static(policy));
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static(policy));
     }
     response
 }
@@ -62,10 +165,69 @@ mod static_header_tests {
 
     #[test]
     fn assigns_release_safe_cache_policies() {
-        assert_eq!(cache_control_for_static_response("/sw.js", Some("text/javascript")), Some("no-cache"));
-        assert_eq!(cache_control_for_static_response("/index.html", Some("text/html; charset=utf-8")), Some("no-cache"));
-        assert_eq!(cache_control_for_static_response("/assets/main-abc123.js", Some("text/javascript")), Some("public, max-age=31536000, immutable"));
-        assert_eq!(cache_control_for_static_response("/api/texts/1", Some("application/json")), None);
+        assert_eq!(
+            cache_control_for_static_response("/sw.js", Some("text/javascript")),
+            Some("no-cache")
+        );
+        assert_eq!(
+            cache_control_for_static_response("/index.html", Some("text/html; charset=utf-8")),
+            Some("no-cache")
+        );
+        assert_eq!(
+            cache_control_for_static_response("/assets/main-abc123.js", Some("text/javascript")),
+            Some("public, max-age=31536000, immutable")
+        );
+        assert_eq!(
+            cache_control_for_static_response("/api/texts/1", Some("application/json")),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod maintenance_schedule_tests {
+    use super::{next_maintenance_cutoff, scheduled_cutoff_after_last_run};
+    use chrono::{Local, TimeZone};
+
+    fn local(hour: u32, minute: u32, second: u32) -> chrono::DateTime<Local> {
+        Local
+            .with_ymd_and_hms(2026, 8, 20, hour, minute, second)
+            .single()
+            .unwrap()
+    }
+
+    #[test]
+    fn next_maintenance_cutoff_honors_grace_window_boundaries() {
+        assert_eq!(next_maintenance_cutoff(local(0, 4, 59)), local(0, 5, 0));
+        assert_eq!(next_maintenance_cutoff(local(0, 5, 0)), local(0, 5, 0));
+        assert_eq!(next_maintenance_cutoff(local(0, 9, 59)), local(0, 5, 0));
+        assert_eq!(
+            next_maintenance_cutoff(local(0, 10, 0)),
+            Local
+                .with_ymd_and_hms(2026, 8, 21, 0, 5, 0)
+                .single()
+                .unwrap()
+        );
+        assert_eq!(
+            next_maintenance_cutoff(local(23, 0, 0)),
+            Local
+                .with_ymd_and_hms(2026, 8, 21, 0, 5, 0)
+                .single()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn scheduler_runs_a_cutoff_crossed_during_startup_catch_up() {
+        let last_run = Local
+            .with_ymd_and_hms(2026, 8, 19, 0, 5, 0)
+            .single()
+            .unwrap();
+
+        assert_eq!(
+            scheduled_cutoff_after_last_run(local(0, 10, 0), last_run),
+            local(0, 5, 0)
+        );
     }
 }
 
@@ -182,6 +344,19 @@ async fn main() {
 
     println!("Database: {:?}", db_path);
 
+    if args.iter().any(|arg| arg == "--run-analysis-maintenance") {
+        let report = library::maintenance::run_due_analysis_maintenance(&db_path, Utc::now());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report)
+                .unwrap_or_else(|error| format!("failed to serialize report: {error}"))
+        );
+        if report.fatal_error.is_some() || report.failed > 0 {
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // Run schema migrations on the first connection, then build an 8-connection
     // WAL-mode pool so reads can run in parallel without blocking each other.
     let first = dictionary::init_connection(&db_path).unwrap_or_else(|e| {
@@ -211,6 +386,7 @@ async fn main() {
     println!("Connection pool: {} connections", conns.len());
 
     let db: Db = DbPool::new(conns);
+    spawn_analysis_maintenance_scheduler(db_path.clone());
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -398,7 +574,6 @@ fn is_write_command(command: &str) -> bool {
             | "get_text_analysis"
             | "get_analysis_report"
             | "reanalyze_text"
-            | "get_shelf_analysis"
             | "get_prestudy_characters"
             | "get_prestudy_words"
             | "add_known_word"
@@ -744,7 +919,10 @@ fn dispatch_sync(conn: &Connection, command: &str, body: &Value) -> Result<Value
 
         "get_shelf_analysis" => {
             let shelf_id: i64 = field(body, "shelf_id")?;
-            serialize(library::analysis::get_shelf_analysis(conn, shelf_id).map_err(db_err)?)
+            serialize(
+                library::analysis::get_shelf_analysis_status(conn, shelf_id, Utc::now())
+                    .map_err(db_err)?,
+            )
         }
 
         "segment_text" => {

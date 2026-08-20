@@ -2,7 +2,13 @@
 
 use chrono::{DateTime, Utc};
 use rusqlite::{params, types::Type, Connection};
+use std::path::Path;
 
+use crate::dictionary;
+use crate::library::analysis::{
+    compute_shelf_analysis, load_user_segmentation_words, publish_shelf_analysis,
+};
+use crate::library::models::{MaintenanceJobFailure, MaintenanceRunReport};
 use crate::library::Result;
 
 const TASK: &str = "shelf_analysis";
@@ -173,6 +179,81 @@ pub fn fail_shelf_job(conn: &Connection, shelf_id: i64, error: &str) -> Result<(
     Ok(())
 }
 
+/// Run all shelf-analysis jobs dirty at or before a fixed cutoff.
+///
+/// The connection is dedicated to maintenance, computation is sequential, and
+/// each cache publication is a separate short transaction.
+pub fn run_due_analysis_maintenance(db_path: &Path, cutoff: DateTime<Utc>) -> MaintenanceRunReport {
+    let mut report = MaintenanceRunReport {
+        cutoff,
+        claimed: 0,
+        succeeded: 0,
+        failed: 0,
+        failures: Vec::new(),
+        fatal_error: None,
+        still_dirty: false,
+    };
+
+    let mut conn = match dictionary::init_connection(db_path) {
+        Ok(conn) => conn,
+        Err(error) => {
+            report.fatal_error = Some(error.to_string());
+            return report;
+        }
+    };
+    if let Err(error) = conn.execute_batch(
+        "PRAGMA foreign_keys=ON;
+         PRAGMA journal_mode=WAL;
+         PRAGMA synchronous=NORMAL;
+         PRAGMA busy_timeout=30000;",
+    ) {
+        report.fatal_error = Some(error.to_string());
+        return report;
+    }
+    if let Err(error) = load_user_segmentation_words(&conn) {
+        report.fatal_error = Some(error.to_string());
+        return report;
+    }
+    let jobs = match claim_due_jobs(&conn, cutoff) {
+        Ok(jobs) => jobs,
+        Err(error) => {
+            report.fatal_error = Some(error.to_string());
+            return report;
+        }
+    };
+    report.claimed = jobs.len();
+
+    for shelf_id in jobs {
+        let result = compute_shelf_analysis(&conn, shelf_id).and_then(|analysis| {
+            publish_shelf_analysis(&mut conn, shelf_id, &analysis, cutoff)?;
+            complete_shelf_job(&conn, shelf_id, cutoff)
+        });
+
+        match result {
+            Ok(()) => report.succeeded += 1,
+            Err(error) => {
+                let error = error.to_string();
+                report.failed += 1;
+                report.failures.push(MaintenanceJobFailure {
+                    shelf_id,
+                    error: error.clone(),
+                });
+                if let Err(record_error) = fail_shelf_job(&conn, shelf_id, &error) {
+                    report.fatal_error = Some(format!(
+                        "failed to record shelf {shelf_id} maintenance error: {record_error}"
+                    ));
+                }
+            }
+        }
+    }
+
+    match maintenance_snapshot(&conn) {
+        Ok(snapshot) => report.still_dirty = snapshot.dirty_at.is_some(),
+        Err(error) => report.fatal_error = Some(error.to_string()),
+    }
+    report
+}
+
 fn update_task_dirty(tx: &rusqlite::Transaction<'_>, at: &str) -> rusqlite::Result<()> {
     tx.execute(
         "UPDATE analysis_maintenance
@@ -238,7 +319,13 @@ fn parse_timestamp(
 mod tests {
     use super::*;
     use crate::dictionary;
+    use crate::library::analysis::get_shelf_analysis_status;
+    use crate::library::models::{ShelfAnalysis, ShelfAnalysisStatus};
     use rusqlite::Connection;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_DB: AtomicU64 = AtomicU64::new(0);
 
     fn utc(value: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(value)
@@ -256,6 +343,109 @@ mod tests {
             .unwrap();
         }
         conn
+    }
+
+    fn temporary_db_path() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "chinese-reader-maintenance-{}-{}.sqlite3",
+            std::process::id(),
+            NEXT_TEST_DB.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    fn empty_analysis(shelf_id: i64) -> ShelfAnalysis {
+        ShelfAnalysis {
+            shelf_id,
+            text_count: 0,
+            total_characters: 0,
+            unique_characters: 0,
+            known_characters_count: 0,
+            total_words: 0,
+            unique_words: 0,
+            known_words_count: 0,
+            unknown_characters: vec![],
+            known_characters: vec![],
+            unknown_words: vec![],
+            known_words: vec![],
+        }
+    }
+
+    #[test]
+    fn shelf_analysis_status_failed_rebuild_preserves_old_json_while_later_jobs_continue() {
+        let path = temporary_db_path();
+        let conn = dictionary::init_connection(&path).unwrap();
+        conn.execute("INSERT INTO shelves (id, name) VALUES (4, 'Shelf 4')", [])
+            .unwrap();
+        conn.execute("INSERT INTO shelves (id, name) VALUES (5, 'Shelf 5')", [])
+            .unwrap();
+        let old_json = serde_json::to_string(&empty_analysis(4)).unwrap();
+        conn.execute(
+            "INSERT INTO shelf_analyses_cache (shelf_id, data, cached_at)
+             VALUES (4, ?1, '2026-08-19 00:05:00')",
+            [&old_json],
+        )
+        .unwrap();
+        mark_analysis_dirty(&conn, &[4, 5], utc("2026-08-20T01:00:00Z")).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER force_shelf_cache_publish_failure
+             BEFORE UPDATE OF data ON shelf_analyses_cache
+             WHEN OLD.shelf_id = 4
+             BEGIN
+                 SELECT RAISE(FAIL, 'forced publish failure');
+             END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let report = run_due_analysis_maintenance(&path, utc("2026-08-20T05:05:00Z"));
+
+        assert_eq!(report.succeeded, 1);
+        assert_eq!(report.failed, 1);
+        assert!(report.fatal_error.is_none());
+        let conn = Connection::open(&path).unwrap();
+        let preserved_json: String = conn
+            .query_row(
+                "SELECT data FROM shelf_analyses_cache WHERE shelf_id = 4",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(preserved_json, old_json);
+        let dirty_at: Option<String> = conn
+            .query_row(
+                "SELECT dirty_at FROM analysis_shelf_jobs WHERE shelf_id = 4",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(dirty_at.is_some());
+        let status = get_shelf_analysis_status(&conn, 4, utc("2026-08-20T06:00:00Z")).unwrap();
+        assert!(matches!(
+            status,
+            ShelfAnalysisStatus::Ready {
+                is_stale: true,
+                last_error: Some(error),
+                ..
+            } if error.contains("forced publish failure")
+        ));
+        let later_job_dirty_at: Option<String> = conn
+            .query_row(
+                "SELECT dirty_at FROM analysis_shelf_jobs WHERE shelf_id = 5",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(later_job_dirty_at.is_none());
+        let later_cache_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM shelf_analyses_cache WHERE shelf_id = 5",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(later_cache_count, 1);
+        drop(conn);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

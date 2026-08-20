@@ -3,18 +3,20 @@
 //! Provides character and word frequency analysis for texts.
 //! Learning words (status='learning') are treated as unknown for analysis purposes.
 
+use chrono::{DateTime, Utc};
 use jieba_rs::Jieba;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
 use super::error::{LibraryError, Result};
 use super::known_words;
+use super::maintenance;
 use super::models::{
     AnalysisReport, CharacterContext, CharacterFrequency, ContextSnippet, FrequencySort,
     PreStudyCharacter, PreStudyResult, PreStudyWord, PreStudyWordResult, ShelfAnalysis,
-    TextAnalysis, TextSegment, WordFrequency,
+    ShelfAnalysisStatus, TextAnalysis, TextSegment, WordFrequency,
 };
 use super::text;
 
@@ -614,31 +616,59 @@ fn get_all_descendant_shelf_ids(conn: &Connection, shelf_id: i64) -> Result<Vec<
     Ok(all_ids)
 }
 
-/// Get aggregated analysis for all texts in a shelf and its sub-shelves
-pub fn get_shelf_analysis(conn: &Connection, shelf_id: i64) -> Result<ShelfAnalysis> {
-    // Check cache first
-    let cached: std::result::Result<Option<ShelfAnalysis>, _> = {
-        let result = conn.query_row(
-            "SELECT data FROM shelf_analyses_cache WHERE shelf_id = ?",
+/// Return cached shelf analysis state without performing analysis work.
+pub fn get_shelf_analysis_status(
+    conn: &Connection,
+    shelf_id: i64,
+    now: DateTime<Utc>,
+) -> Result<ShelfAnalysisStatus> {
+    let cached = conn
+        .query_row(
+            "SELECT cache.data, cache.cached_at, jobs.dirty_at, jobs.last_error
+             FROM shelf_analyses_cache AS cache
+             LEFT JOIN analysis_shelf_jobs AS jobs ON jobs.shelf_id = cache.shelf_id
+             WHERE cache.shelf_id = ?1",
             [shelf_id],
-            |row| row.get::<_, String>(0),
-        );
-        match result {
-            Ok(data) => {
-                let parsed = serde_json::from_str(&data);
-                if parsed.is_err() {
-                    log::warn!("shelf_analyses_cache: failed to deserialize cached entry for shelf {shelf_id}, recomputing");
-                }
-                Ok(parsed.ok())
-            }
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(e),
-        }
-    };
-    if let Ok(Some(analysis)) = cached {
-        return Ok(analysis);
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+
+    if let Some((data, cached_at, dirty_at, last_error)) = cached {
+        let analysis = serde_json::from_str(&data).map_err(|error| {
+            LibraryError::InvalidInput(format!(
+                "invalid cached shelf analysis for shelf {shelf_id}: {error}"
+            ))
+        })?;
+        return Ok(ShelfAnalysisStatus::Ready {
+            analysis,
+            cached_at,
+            is_stale: dirty_at.is_some(),
+            last_error,
+        });
     }
 
+    maintenance::request_shelf_analysis(conn, shelf_id, now)?;
+    let (requested_at, last_error) = conn.query_row(
+        "SELECT requested_at, last_error FROM analysis_shelf_jobs WHERE shelf_id = ?1",
+        [shelf_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(ShelfAnalysisStatus::Pending {
+        requested_at,
+        last_error,
+    })
+}
+
+/// Compute aggregated analysis for all texts in a shelf and its sub-shelves.
+/// This performs no shelf-cache publication.
+pub fn compute_shelf_analysis(conn: &Connection, shelf_id: i64) -> Result<ShelfAnalysis> {
     // Get vocabulary sets - only status='known' counts as known
     let vocab = build_vocabulary_sets(conn)?;
 
@@ -766,7 +796,7 @@ pub fn get_shelf_analysis(conn: &Connection, shelf_id: i64) -> Result<ShelfAnaly
         .cloned()
         .collect();
 
-    let analysis = ShelfAnalysis {
+    Ok(ShelfAnalysis {
         shelf_id,
         text_count: text_ids.len() as i64,
         total_characters,
@@ -779,17 +809,32 @@ pub fn get_shelf_analysis(conn: &Connection, shelf_id: i64) -> Result<ShelfAnaly
         known_characters,
         unknown_words,
         known_words: known_words_list,
-    };
+    })
+}
 
-    // Cache the result
-    if let Ok(json) = serde_json::to_string(&analysis) {
-        let _ = conn.execute(
-            "INSERT OR REPLACE INTO shelf_analyses_cache (shelf_id, data, cached_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
-            params![shelf_id, json],
-        );
-    }
-
-    Ok(analysis)
+/// Atomically replace one shelf's cached analysis after computation completes.
+pub fn publish_shelf_analysis(
+    conn: &mut Connection,
+    shelf_id: i64,
+    analysis: &ShelfAnalysis,
+    cutoff: DateTime<Utc>,
+) -> Result<()> {
+    let data = serde_json::to_string(analysis).map_err(|error| {
+        LibraryError::InvalidInput(format!(
+            "failed to serialize shelf analysis for shelf {shelf_id}: {error}"
+        ))
+    })?;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "INSERT INTO shelf_analyses_cache (shelf_id, data, cached_at)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(shelf_id) DO UPDATE SET
+             data = excluded.data,
+             cached_at = excluded.cached_at",
+        params![shelf_id, data, cutoff.to_rfc3339()],
+    )?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// Statistics about auto-marking unknown words
@@ -1449,13 +1494,103 @@ fn get_character_context_from_shelves(
 mod tests {
     use super::*;
     use crate::dictionary::schema::init_database;
+    use crate::library::maintenance::mark_analysis_dirty;
+    use crate::library::models::ShelfAnalysisStatus;
     use crate::library::shelf::create_shelf;
     use crate::library::text::create_text;
+    use chrono::{DateTime, Utc};
 
     fn setup_test_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         init_database(&conn).unwrap();
         conn
+    }
+
+    fn utc(value: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(value)
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn cached_analysis(shelf_id: i64, text_count: i64) -> ShelfAnalysis {
+        ShelfAnalysis {
+            shelf_id,
+            text_count,
+            total_characters: 0,
+            unique_characters: 0,
+            known_characters_count: 0,
+            total_words: 0,
+            unique_words: 0,
+            known_words_count: 0,
+            unknown_characters: vec![],
+            known_characters: vec![],
+            unknown_words: vec![],
+            known_words: vec![],
+        }
+    }
+
+    fn seed_cached_analysis(conn: &Connection, shelf_id: i64, cached_at: &str) {
+        let analysis = cached_analysis(shelf_id, 37);
+        conn.execute(
+            "INSERT INTO shelf_analyses_cache (shelf_id, data, cached_at) VALUES (?1, ?2, ?3)",
+            params![
+                shelf_id,
+                serde_json::to_string(&analysis).unwrap(),
+                cached_at
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn shelf_analysis_status_returns_stale_cache_without_recomputation() {
+        let conn = setup_test_db();
+        let shelf = create_shelf(&conn, "Test", None, None).unwrap();
+        create_text(&conn, shelf.id, "Text", "中文", None, "paste").unwrap();
+        seed_cached_analysis(&conn, shelf.id, "2026-08-19 00:05:00");
+        mark_analysis_dirty(&conn, &[shelf.id], utc("2026-08-20T01:00:00Z")).unwrap();
+
+        let status =
+            get_shelf_analysis_status(&conn, shelf.id, utc("2026-08-20T02:00:00Z")).unwrap();
+
+        assert!(matches!(
+            status,
+            ShelfAnalysisStatus::Ready {
+                analysis: ShelfAnalysis { text_count: 37, .. },
+                is_stale: true,
+                ..
+            }
+        ));
+        let text_analysis_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM text_analyses", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(text_analysis_count, 0);
+    }
+
+    #[test]
+    fn shelf_analysis_status_missing_cache_creates_pending_job() {
+        let conn = setup_test_db();
+        let shelf = create_shelf(&conn, "Test", None, None).unwrap();
+        let now = utc("2026-08-20T02:00:00Z");
+
+        let status = get_shelf_analysis_status(&conn, shelf.id, now).unwrap();
+
+        assert!(matches!(
+            status,
+            ShelfAnalysisStatus::Pending {
+                requested_at,
+                last_error: None,
+            } if requested_at == "2026-08-20T02:00:00+00:00"
+        ));
+        let job: (String, String) = conn
+            .query_row(
+                "SELECT requested_at, dirty_at FROM analysis_shelf_jobs WHERE shelf_id = ?1",
+                [shelf.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(job.0, "2026-08-20T02:00:00+00:00");
+        assert_eq!(job.1, "2026-08-20T02:00:00+00:00");
     }
 
     #[test]
@@ -1510,20 +1645,17 @@ mod tests {
     }
 
     #[test]
-    fn test_shelf_analysis_cache() {
+    fn test_shelf_analysis_computation_and_publication() {
         let conn = setup_test_db();
         let shelf = create_shelf(&conn, "Test", None, None).unwrap();
         create_text(&conn, shelf.id, "Text1", "我喜欢学习中文", None, "paste").unwrap();
         create_text(&conn, shelf.id, "Text2", "今天天气很好", None, "paste").unwrap();
 
-        // First call - computes and caches
-        let result1 = get_shelf_analysis(&conn, shelf.id).unwrap();
+        let result1 = compute_shelf_analysis(&conn, shelf.id).unwrap();
         assert!(result1.text_count == 2);
 
-        // Second call - should hit cache (same result)
-        let result2 = get_shelf_analysis(&conn, shelf.id).unwrap();
-        assert_eq!(result1.text_count, result2.text_count);
-        assert_eq!(result1.total_characters, result2.total_characters);
+        let mut conn = conn;
+        publish_shelf_analysis(&mut conn, shelf.id, &result1, utc("2026-08-20T05:05:00Z")).unwrap();
 
         // Verify cache entry exists in DB
         let cache_count: i64 = conn
