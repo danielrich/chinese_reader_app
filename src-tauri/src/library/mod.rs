@@ -11,6 +11,7 @@ pub mod analysis;
 pub mod error;
 pub mod known_words;
 pub mod learning;
+pub mod maintenance;
 pub mod models;
 pub mod settings;
 pub mod shelf;
