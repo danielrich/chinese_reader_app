@@ -1,0 +1,17 @@
+{
+  "name": "chinese-reader",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "test:offline": "npm run build && playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.62.1",
+    "typescript": "~5.9.3",
+    "vite": "^7.2.4"
+  }
+}
