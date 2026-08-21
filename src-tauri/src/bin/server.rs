@@ -56,10 +56,28 @@ fn slow_request_log(command: &str, timings: &RequestTimings) -> Option<String> {
     })
 }
 
-fn emit_slow_request(command: &str, timings: RequestTimings) {
-    if let Some(line) = slow_request_log(command, &timings) {
+fn finalize_timed_request<T>(
+    command: &str,
+    total_started: Instant,
+    mut timings: RequestTimings,
+    result: Result<T, ApiError>,
+) -> (Result<T, ApiError>, Option<String>) {
+    timings.total = total_started.elapsed();
+    let line = slow_request_log(command, &timings);
+    (result, line)
+}
+
+fn emit_finalized_request<T>(
+    command: &str,
+    total_started: Instant,
+    timings: RequestTimings,
+    result: Result<T, ApiError>,
+) -> Result<T, ApiError> {
+    let (result, line) = finalize_timed_request(command, total_started, timings, result);
+    if let Some(line) = line {
         eprintln!("{line}");
     }
+    result
 }
 
 // These timings cover handler work through JSON byte serialization and response
@@ -561,15 +579,23 @@ async fn dispatch(
     let result =
         tokio::task::spawn_blocking(move || dispatch_sync(&conn, &work_command, &body)).await;
     timings.blocking = blocking_started.elapsed();
-    let result = result.map_err(|e| ApiError::Internal(e.to_string()))??;
-    let serialized = serialize_json_bytes_with(|| serde_json::to_vec(&result));
-    if let Ok((_, elapsed)) = &serialized {
-        timings.serialization = *elapsed;
-    }
-    let response = serialized.and_then(|(bytes, _)| json_response(bytes));
-    timings.total = total_started.elapsed();
-    emit_slow_request(&command, timings);
-    Ok(response?)
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => Err(ApiError::Internal(error.to_string())),
+    };
+    let response = result.and_then(|value| {
+        let serialized = serialize_json_bytes_with(|| serde_json::to_vec(&value));
+        if let Ok((_, elapsed)) = &serialized {
+            timings.serialization = *elapsed;
+        }
+        serialized.and_then(|(bytes, _)| json_response(bytes))
+    });
+    Ok(emit_finalized_request(
+        &command,
+        total_started,
+        timings,
+        response,
+    )?)
 }
 
 async fn get_text_handler(State(db): State<Db>, Path(id): Path<i64>) -> Result<Response, AppError> {
@@ -586,20 +612,28 @@ async fn get_text_handler(State(db): State<Db>, Path(id): Path<i64>) -> Result<R
     })
     .await;
     let blocking = blocking_started.elapsed();
-    let result = result.map_err(|e| ApiError::Internal(e.to_string()))??;
-    let (bytes, serialization) = serialize_json_bytes_with(|| serde_json::to_vec(&result))?;
-    let response = json_response(bytes)?;
-    emit_slow_request(
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => Err(ApiError::Internal(error.to_string())),
+    };
+    let mut timings = RequestTimings {
+        pool_wait,
+        blocking,
+        ..Default::default()
+    };
+    let response = result.and_then(|value| {
+        let serialized = serialize_json_bytes_with(|| serde_json::to_vec(&value));
+        if let Ok((_, elapsed)) = &serialized {
+            timings.serialization = *elapsed;
+        }
+        serialized.and_then(|(bytes, _)| json_response(bytes))
+    });
+    Ok(emit_finalized_request(
         "get_text",
-        RequestTimings {
-            pool_wait,
-            blocking,
-            serialization,
-            total: total_started.elapsed(),
-            ..Default::default()
-        },
-    );
-    Ok(response)
+        total_started,
+        timings,
+        response,
+    )?)
 }
 
 async fn get_text_vocab_cache_handler_with_headers(
@@ -619,37 +653,47 @@ async fn get_text_vocab_cache_handler_with_headers(
     })
     .await;
     let blocking = blocking_started.elapsed();
-    let result = result.map_err(|e| ApiError::Internal(e.to_string()))??;
-    let (version, value) = result;
-    let (bytes, serialization) = serialize_json_bytes_with(|| serde_json::to_vec(&value))?;
-    let etag = text_vocab_etag(&version, &bytes);
-    let mut response = if weak_etag_matches(headers.get(header::IF_NONE_MATCH), &etag) {
-        StatusCode::NOT_MODIFIED.into_response()
-    } else {
-        json_response(bytes)?
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => Err(ApiError::Internal(error.to_string())),
     };
-    response.headers_mut().insert(
-        header::ETAG,
-        HeaderValue::from_str(&etag).map_err(|e| ApiError::Internal(e.to_string()))?,
-    );
-    emit_slow_request(
+    let mut timings = RequestTimings {
+        pool_wait,
+        blocking,
+        ..Default::default()
+    };
+    let response = result.and_then(|(version, value)| {
+        let serialized = serialize_json_bytes_with(|| serde_json::to_vec(&value));
+        if let Ok((_, elapsed)) = &serialized {
+            timings.serialization = *elapsed;
+        }
+        let (bytes, _) = serialized?;
+        let etag = text_vocab_etag(&version, &bytes);
+        let mut response = if weak_etag_matches(headers.get(header::IF_NONE_MATCH), &etag) {
+            StatusCode::NOT_MODIFIED.into_response()
+        } else {
+            json_response(bytes)?
+        };
+        response.headers_mut().insert(
+            header::ETAG,
+            HeaderValue::from_str(&etag).map_err(|e| ApiError::Internal(e.to_string()))?,
+        );
+        Ok(response)
+    });
+    Ok(emit_finalized_request(
         "get_text_vocab_cache",
-        RequestTimings {
-            pool_wait,
-            blocking,
-            serialization,
-            total: total_started.elapsed(),
-            ..Default::default()
-        },
-    );
-    Ok(response)
+        total_started,
+        timings,
+        response,
+    )?)
 }
 
 #[cfg(test)]
 mod server_performance_tests {
     use super::{
-        get_text_vocab_cache_handler_with_headers, serialize_json_bytes_with, slow_request_log,
-        text_vocab_etag, text_vocab_version, weak_etag_matches, DbPool, RequestTimings,
+        finalize_timed_request, get_text_vocab_cache_handler_with_headers,
+        serialize_json_bytes_with, slow_request_log, text_vocab_etag, text_vocab_version,
+        weak_etag_matches, ApiError, AppError, DbPool, RequestTimings,
     };
     use axum::{
         body::{to_bytes, Body, HttpBody},
@@ -660,7 +704,7 @@ mod server_performance_tests {
         Router,
     };
     use rusqlite::Connection;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tower::ServiceExt;
     use tower_http::compression::CompressionLayer;
 
@@ -783,6 +827,31 @@ mod server_performance_tests {
         assert!(serialization > Duration::from_millis(250));
     }
 
+    #[test]
+    fn slow_failed_request_logs_all_fields_and_preserves_error_status() {
+        let started = Instant::now();
+        std::thread::sleep(Duration::from_millis(251));
+        let timings = RequestTimings {
+            blocking: started.elapsed(),
+            ..Default::default()
+        };
+        let (result, line) = finalize_timed_request(
+            "get_text",
+            started,
+            timings,
+            Err::<(), ApiError>(ApiError::Internal("controlled failure".to_string())),
+        );
+        let line = line.expect("slow failed request must be logged");
+        assert!(line.contains("command=get_text"));
+        assert!(line.contains("pool_wait_ms=0"));
+        assert!(line.contains("write_wait_ms=0"));
+        assert!(line.contains("blocking_ms="));
+        assert!(line.contains("serialization_ms=0"));
+        assert!(line.contains("total_ms="));
+        let response = AppError::from(result.unwrap_err()).into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
     #[tokio::test]
     async fn matching_vocab_etag_returns_304_with_no_body() {
         let conn = Connection::open_in_memory().unwrap();
@@ -886,20 +955,29 @@ async fn sync_sessions_handler(
     })
     .await;
     let blocking = blocking_started.elapsed();
-    let result = result.map_err(|e| ApiError::Internal(e.to_string()))??;
-    let (bytes, serialization) = serialize_json_bytes_with(|| serde_json::to_vec(&result))?;
-    let response = json_response(bytes)?;
-    emit_slow_request(
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => Err(ApiError::Internal(error.to_string())),
+    };
+    let mut timings = RequestTimings {
+        pool_wait,
+        write_wait,
+        blocking,
+        ..Default::default()
+    };
+    let response = result.and_then(|value| {
+        let serialized = serialize_json_bytes_with(|| serde_json::to_vec(&value));
+        if let Ok((_, elapsed)) = &serialized {
+            timings.serialization = *elapsed;
+        }
+        serialized.and_then(|(bytes, _)| json_response(bytes))
+    });
+    Ok(emit_finalized_request(
         "sync_sessions",
-        RequestTimings {
-            pool_wait,
-            write_wait,
-            blocking,
-            serialization,
-            total: total_started.elapsed(),
-        },
-    );
-    Ok(response)
+        total_started,
+        timings,
+        response,
+    )?)
 }
 
 // ── Error types ──────────────────────────────────────────────────────────────
