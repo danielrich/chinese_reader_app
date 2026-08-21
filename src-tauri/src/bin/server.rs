@@ -10,6 +10,7 @@
 //!   ./server --cert chasmfiend.local.pem --key chasmfiend.local-key.pem
 
 use axum::{
+    body::Body,
     extract::{Path, Request, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
@@ -37,17 +38,19 @@ struct RequestTimings {
     pool_wait: Duration,
     write_wait: Duration,
     blocking: Duration,
+    serialization: Duration,
     total: Duration,
 }
 
 fn slow_request_log(command: &str, timings: &RequestTimings) -> Option<String> {
     (timings.total > SLOW_REQUEST_THRESHOLD).then(|| {
         format!(
-            "slow_request command={} pool_wait_ms={} write_wait_ms={} blocking_ms={} total_ms={}",
+            "slow_request command={} pool_wait_ms={} write_wait_ms={} blocking_ms={} serialization_ms={} total_ms={}",
             command,
             timings.pool_wait.as_millis(),
             timings.write_wait.as_millis(),
             timings.blocking.as_millis(),
+            timings.serialization.as_millis(),
             timings.total.as_millis()
         )
     })
@@ -59,6 +62,10 @@ fn emit_slow_request(command: &str, timings: RequestTimings) {
     }
 }
 
+// These timings cover handler work through JSON byte serialization and response
+// construction. Streaming gzip is applied later by Tower middleware and is not
+// included in handler timing.
+
 fn weak_etag_matches(if_none_match: Option<&HeaderValue>, etag: &str) -> bool {
     let Some(value) = if_none_match.and_then(|value| value.to_str().ok()) else {
         return false;
@@ -69,7 +76,7 @@ fn weak_etag_matches(if_none_match: Option<&HeaderValue>, etag: &str) -> bool {
     })
 }
 
-fn text_vocab_etag(conn: &Connection, text_id: i64) -> Result<String, ApiError> {
+fn text_vocab_version(conn: &Connection, text_id: i64) -> Result<String, ApiError> {
     let version: (String, Option<i64>, Option<String>) = conn
         .query_row(
             "SELECT texts.updated_at, text_analyses.id, text_analyses.analyzed_at
@@ -82,18 +89,38 @@ fn text_vocab_etag(conn: &Connection, text_id: i64) -> Result<String, ApiError> 
             rusqlite::Error::QueryReturnedNoRows => not_found(format!("Text {text_id} not found")),
             other => db_err(other),
         })?;
-    let source = format!(
+    Ok(format!(
         "{text_id}\0{}\0{}\0{}",
         version.0,
         version.1.unwrap_or_default(),
         version.2.unwrap_or_default()
-    );
+    ))
+}
+
+fn text_vocab_etag(version: &str, representation: &[u8]) -> String {
     let mut hash = 0xcbf29ce484222325_u64;
-    for byte in source.as_bytes() {
+    for byte in version.as_bytes().iter().chain(representation) {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    Ok(format!("\"text-vocab-{text_id}-{hash:016x}\""))
+    format!("\"text-vocab-{hash:016x}\"")
+}
+
+fn serialize_json_bytes_with<F>(serializer: F) -> Result<(Vec<u8>, Duration), ApiError>
+where
+    F: FnOnce() -> serde_json::Result<Vec<u8>>,
+{
+    let started = Instant::now();
+    let bytes = serializer().map_err(|error| ApiError::Internal(error.to_string()))?;
+    Ok((bytes, started.elapsed()))
+}
+
+fn json_response(bytes: Vec<u8>) -> Result<Response, ApiError> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(bytes))
+        .map_err(|error| ApiError::Internal(error.to_string()))
 }
 
 fn local_maintenance_cutoff(date: NaiveDate) -> DateTime<Local> {
@@ -514,7 +541,7 @@ async fn dispatch(
     State(db): State<Db>,
     Path(command): Path<String>,
     Json(body): Json<Value>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Response, AppError> {
     let total_started = Instant::now();
     let mut timings = RequestTimings::default();
     let _write_permit = if is_write_command(&command) {
@@ -534,16 +561,18 @@ async fn dispatch(
     let result =
         tokio::task::spawn_blocking(move || dispatch_sync(&conn, &work_command, &body)).await;
     timings.blocking = blocking_started.elapsed();
+    let result = result.map_err(|e| ApiError::Internal(e.to_string()))??;
+    let serialized = serialize_json_bytes_with(|| serde_json::to_vec(&result));
+    if let Ok((_, elapsed)) = &serialized {
+        timings.serialization = *elapsed;
+    }
+    let response = serialized.and_then(|(bytes, _)| json_response(bytes));
     timings.total = total_started.elapsed();
     emit_slow_request(&command, timings);
-    let result = result.map_err(|e| ApiError::Internal(e.to_string()))??;
-    Ok(Json(result))
+    Ok(response?)
 }
 
-async fn get_text_handler(
-    State(db): State<Db>,
-    Path(id): Path<i64>,
-) -> Result<Json<Value>, AppError> {
+async fn get_text_handler(State(db): State<Db>, Path(id): Path<i64>) -> Result<Response, AppError> {
     let total_started = Instant::now();
     let pool_started = Instant::now();
     let conn = db.acquire().await;
@@ -556,17 +585,21 @@ async fn get_text_handler(
         serialize(text)
     })
     .await;
+    let blocking = blocking_started.elapsed();
+    let result = result.map_err(|e| ApiError::Internal(e.to_string()))??;
+    let (bytes, serialization) = serialize_json_bytes_with(|| serde_json::to_vec(&result))?;
+    let response = json_response(bytes)?;
     emit_slow_request(
         "get_text",
         RequestTimings {
             pool_wait,
-            blocking: blocking_started.elapsed(),
+            blocking,
+            serialization,
             total: total_started.elapsed(),
             ..Default::default()
         },
     );
-    let result = result.map_err(|e| ApiError::Internal(e.to_string()))??;
-    Ok(Json(result))
+    Ok(response)
 }
 
 async fn get_text_vocab_cache_handler_with_headers(
@@ -579,35 +612,35 @@ async fn get_text_vocab_cache_handler_with_headers(
     let conn = db.acquire().await;
     let pool_wait = pool_started.elapsed();
     let blocking_started = Instant::now();
-    let result =
-        tokio::task::spawn_blocking(move || -> Result<(String, Option<Value>), ApiError> {
-            let etag = text_vocab_etag(&conn, id)?;
-            if weak_etag_matches(headers.get(header::IF_NONE_MATCH), &etag) {
-                return Ok((etag, None));
-            }
-            let value =
-                serialize(library::analysis::get_text_vocab_cache(&conn, id).map_err(db_err)?)?;
-            Ok((etag, Some(value)))
-        })
-        .await;
-    emit_slow_request(
-        "get_text_vocab_cache",
-        RequestTimings {
-            pool_wait,
-            blocking: blocking_started.elapsed(),
-            total: total_started.elapsed(),
-            ..Default::default()
-        },
-    );
+    let result = tokio::task::spawn_blocking(move || -> Result<(String, Value), ApiError> {
+        let version = text_vocab_version(&conn, id)?;
+        let value = serialize(library::analysis::get_text_vocab_cache(&conn, id).map_err(db_err)?)?;
+        Ok((version, value))
+    })
+    .await;
+    let blocking = blocking_started.elapsed();
     let result = result.map_err(|e| ApiError::Internal(e.to_string()))??;
-    let (etag, value) = result;
-    let mut response = match value {
-        Some(value) => Json(value).into_response(),
-        None => StatusCode::NOT_MODIFIED.into_response(),
+    let (version, value) = result;
+    let (bytes, serialization) = serialize_json_bytes_with(|| serde_json::to_vec(&value))?;
+    let etag = text_vocab_etag(&version, &bytes);
+    let mut response = if weak_etag_matches(headers.get(header::IF_NONE_MATCH), &etag) {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        json_response(bytes)?
     };
     response.headers_mut().insert(
         header::ETAG,
         HeaderValue::from_str(&etag).map_err(|e| ApiError::Internal(e.to_string()))?,
+    );
+    emit_slow_request(
+        "get_text_vocab_cache",
+        RequestTimings {
+            pool_wait,
+            blocking,
+            serialization,
+            total: total_started.elapsed(),
+            ..Default::default()
+        },
     );
     Ok(response)
 }
@@ -615,8 +648,8 @@ async fn get_text_vocab_cache_handler_with_headers(
 #[cfg(test)]
 mod server_performance_tests {
     use super::{
-        get_text_vocab_cache_handler_with_headers, slow_request_log, text_vocab_etag,
-        weak_etag_matches, DbPool, RequestTimings,
+        get_text_vocab_cache_handler_with_headers, serialize_json_bytes_with, slow_request_log,
+        text_vocab_etag, text_vocab_version, weak_etag_matches, DbPool, RequestTimings,
     };
     use axum::{
         body::{to_bytes, Body, HttpBody},
@@ -681,21 +714,36 @@ mod server_performance_tests {
     }
 
     #[test]
-    fn vocabulary_etag_is_quoted_and_tracks_text_and_analysis_versions() {
+    fn vocabulary_etag_is_quoted_and_tracks_text_analysis_and_representation() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("CREATE TABLE texts (id INTEGER PRIMARY KEY, updated_at TEXT NOT NULL); CREATE TABLE text_analyses (id INTEGER PRIMARY KEY, text_id INTEGER UNIQUE, analyzed_at TEXT); INSERT INTO texts VALUES (7, 'v1'); INSERT INTO text_analyses VALUES (1, 7, 'a1');").unwrap();
-        let first = text_vocab_etag(&conn, 7).unwrap();
+        let first_version = text_vocab_version(&conn, 7).unwrap();
+        let first = text_vocab_etag(&first_version, br#"{"definition":"old"}"#);
         assert!(first.starts_with('"') && first.ends_with('"'));
         conn.execute("UPDATE texts SET updated_at = 'v2' WHERE id = 7", [])
             .unwrap();
-        let text_changed = text_vocab_etag(&conn, 7).unwrap();
+        let text_changed = text_vocab_etag(
+            &text_vocab_version(&conn, 7).unwrap(),
+            br#"{"definition":"old"}"#,
+        );
         assert_ne!(first, text_changed);
         conn.execute(
             "UPDATE text_analyses SET id = 2, analyzed_at = 'a2' WHERE text_id = 7",
             [],
         )
         .unwrap();
-        assert_ne!(text_changed, text_vocab_etag(&conn, 7).unwrap());
+        let analysis_changed = text_vocab_etag(
+            &text_vocab_version(&conn, 7).unwrap(),
+            br#"{"definition":"old"}"#,
+        );
+        assert_ne!(text_changed, analysis_changed);
+        assert_ne!(
+            analysis_changed,
+            text_vocab_etag(
+                &text_vocab_version(&conn, 7).unwrap(),
+                br#"{"definition":"new"}"#
+            )
+        );
     }
 
     #[test]
@@ -709,18 +757,42 @@ mod server_performance_tests {
             pool_wait: Duration::from_millis(1),
             write_wait: Duration::from_millis(2),
             blocking: Duration::from_millis(248),
+            serialization: Duration::from_millis(3),
             total: Duration::from_millis(251),
         };
         let line = slow_request_log("dictionary_lookup", &slow).unwrap();
-        assert_eq!(line, "slow_request command=dictionary_lookup pool_wait_ms=1 write_wait_ms=2 blocking_ms=248 total_ms=251");
+        assert_eq!(line, "slow_request command=dictionary_lookup pool_wait_ms=1 write_wait_ms=2 blocking_ms=248 serialization_ms=3 total_ms=251");
         assert!(!line.contains("query") && !line.contains("content"));
+    }
+
+    #[test]
+    fn large_controlled_serialization_contributes_to_slow_threshold() {
+        let value = serde_json::json!({ "data": "x".repeat(1_000_000) });
+        let (_, serialization) = serialize_json_bytes_with(|| {
+            std::thread::sleep(Duration::from_millis(251));
+            serde_json::to_vec(&value)
+        })
+        .unwrap();
+        let timings = RequestTimings {
+            serialization,
+            total: serialization,
+            ..Default::default()
+        };
+        let line = slow_request_log("large_response", &timings).unwrap();
+        assert!(line.contains("serialization_ms="));
+        assert!(serialization > Duration::from_millis(250));
     }
 
     #[tokio::test]
     async fn matching_vocab_etag_returns_304_with_no_body() {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch("CREATE TABLE texts (id INTEGER PRIMARY KEY, updated_at TEXT NOT NULL); CREATE TABLE text_analyses (id INTEGER PRIMARY KEY, text_id INTEGER UNIQUE, analyzed_at TEXT); INSERT INTO texts VALUES (7, 'v1'); INSERT INTO text_analyses VALUES (1, 7, 'a1');").unwrap();
-        let etag = text_vocab_etag(&conn, 7).unwrap();
+        seed_vocab_schema(&conn);
+        let version = text_vocab_version(&conn, 7).unwrap();
+        let value = super::serialize(
+            chinese_reader_lib::library::analysis::get_text_vocab_cache(&conn, 7).unwrap(),
+        )
+        .unwrap();
+        let etag = text_vocab_etag(&version, &serde_json::to_vec(&value).unwrap());
         let db = DbPool::new(vec![conn]);
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -734,12 +806,62 @@ mod server_performance_tests {
         assert_eq!(response.headers().get(header::ETAG).unwrap(), etag.as_str());
         assert_eq!(response.body().size_hint().lower(), 0);
     }
+
+    fn seed_vocab_schema(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE texts (id INTEGER PRIMARY KEY, updated_at TEXT NOT NULL);
+             CREATE TABLE text_analyses (id INTEGER PRIMARY KEY, text_id INTEGER UNIQUE, analyzed_at TEXT);
+             CREATE TABLE text_word_freq (text_id INTEGER, word TEXT);
+             CREATE TABLE text_character_freq (text_id INTEGER, character TEXT);
+             CREATE TABLE dictionary_entries (id INTEGER PRIMARY KEY, traditional TEXT, pinyin TEXT, source TEXT);
+             CREATE TABLE definitions (entry_id INTEGER, text TEXT, sort_order INTEGER);
+             INSERT INTO texts VALUES (7, 'v1');
+             INSERT INTO text_analyses VALUES (1, 7, 'a1');
+             INSERT INTO text_word_freq VALUES (7, '中國');
+             INSERT INTO dictionary_entries VALUES (10, '中國', 'zhong1 guo2', 'test');
+             INSERT INTO definitions VALUES (10, 'old definition', 0);",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dictionary_definition_change_invalidates_old_vocab_etag() {
+        let conn = Connection::open_in_memory().unwrap();
+        seed_vocab_schema(&conn);
+        let db = DbPool::new(vec![conn]);
+        let first =
+            get_text_vocab_cache_handler_with_headers(State(db.clone()), Path(7), HeaderMap::new())
+                .await
+                .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let old_etag = first.headers().get(header::ETAG).unwrap().clone();
+        let old_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&old_body).contains("old definition"));
+
+        {
+            let conn = db.acquire().await;
+            conn.execute(
+                "UPDATE definitions SET text = 'new definition' WHERE entry_id = 10",
+                [],
+            )
+            .unwrap();
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_NONE_MATCH, old_etag.clone());
+        let second = get_text_vocab_cache_handler_with_headers(State(db), Path(7), headers)
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_ne!(second.headers().get(header::ETAG).unwrap(), &old_etag);
+        let new_body = to_bytes(second.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&new_body).contains("new definition"));
+    }
 }
 
 async fn sync_sessions_handler(
     State(db): State<Db>,
     Json(body): Json<Value>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Response, AppError> {
     let total_started = Instant::now();
     let started = Instant::now();
     let _write_permit = db.acquire_write_permit().await;
@@ -763,17 +885,21 @@ async fn sync_sessions_handler(
         serialize(serde_json::json!({ "session_ids": ids }))
     })
     .await;
+    let blocking = blocking_started.elapsed();
+    let result = result.map_err(|e| ApiError::Internal(e.to_string()))??;
+    let (bytes, serialization) = serialize_json_bytes_with(|| serde_json::to_vec(&result))?;
+    let response = json_response(bytes)?;
     emit_slow_request(
         "sync_sessions",
         RequestTimings {
             pool_wait,
             write_wait,
-            blocking: blocking_started.elapsed(),
+            blocking,
+            serialization,
             total: total_started.elapsed(),
         },
     );
-    let result = result.map_err(|e| ApiError::Internal(e.to_string()))??;
-    Ok(Json(result))
+    Ok(response)
 }
 
 // ── Error types ──────────────────────────────────────────────────────────────
