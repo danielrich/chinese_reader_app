@@ -1222,12 +1222,12 @@ async function loadReadingHistory(textId: number) {
       ...pendingSessions.filter((pending) => !freshHistory.some((fresh) => sameSession(pending, fresh))),
       ...freshHistory,
     ];
-    const saved = await saveCachedReadingHistoryIfCurrent(
+    const cacheOutcome = await saveCachedReadingHistoryIfCurrent(
       textId,
       history,
       historyGeneration,
-    ).catch(() => false);
-    if (!saved || !isCurrentView()) return;
+    ).catch(() => "storage-error" as const);
+    if (cacheOutcome === "superseded" || !isCurrentView()) return;
     renderReadingHistory(container, textId, history);
   } catch (error) {
     if (!isCurrentView()) return;

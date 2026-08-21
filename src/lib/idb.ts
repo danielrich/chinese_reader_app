@@ -591,11 +591,11 @@ export async function saveCachedReadingHistoryIfCurrent(
   textId: number,
   sessions: ReadingSession[],
   generation: number,
-): Promise<boolean> {
+): Promise<"saved" | "superseded"> {
   const db = await openDb();
   if (getReadingHistoryGeneration(textId) !== generation) {
     db.close();
-    return false;
+    return "superseded";
   }
   const tx = db.transaction(STORE_NAV_CACHE, "readwrite");
   tx.objectStore(STORE_NAV_CACHE).put({
@@ -604,7 +604,7 @@ export async function saveCachedReadingHistoryIfCurrent(
   });
   await txDone(tx);
   db.close();
-  return true;
+  return "saved";
 }
 
 export async function invalidateCachedReadingHistory(textId: number): Promise<void> {

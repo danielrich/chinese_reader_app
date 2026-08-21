@@ -591,6 +591,38 @@ test("fresh reading history deduplicates an equivalent pending local session", a
   await expect(page.locator('.history-item[data-session-id="150"]')).toBeVisible();
 });
 
+test("fresh reading history renders when its best-effort cache write fails", async ({ page }) => {
+  await mockLibraryApi(page);
+  await bootstrapControlledApp(page);
+  await seedCachedTextAndHistory(page, [readingSession(16, 1616)]);
+  await page.evaluate(() => {
+    const originalPut = IDBObjectStore.prototype.put;
+    Object.defineProperty(IDBObjectStore.prototype, "put", {
+      configurable: true,
+      value(this: IDBObjectStore, value: unknown, key?: IDBValidKey) {
+        if ((value as { key?: string })?.key === "reading_history:1") {
+          throw new DOMException("quota exhausted", "QuotaExceededError");
+        }
+        return key === undefined
+          ? originalPut.call(this, value)
+          : originalPut.call(this, value, key);
+      },
+    });
+  });
+  await page.route("**/api/invoke/get_text_reading_history", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify([readingSession(17, 1717)]),
+    });
+  });
+
+  await openReadingHistory(page);
+
+  await expect(page.locator("#history-container")).toContainText("1717");
+  await expect(page.locator("#history-container")).not.toContainText("1616");
+});
+
 test("late reading history refresh cannot resurrect a deleted session", async ({ page }) => {
   await mockLibraryApi(page);
   await bootstrapControlledApp(page);
