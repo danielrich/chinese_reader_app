@@ -138,7 +138,7 @@ staged on the application filesystem before the daemon is stopped:
 
 ```bash
 sudo bash -s -- /home/daniel/backups/chinese-reader/EXACT_DEPLOYMENT_BACKUP <<'ROLLBACK'
-set -euo pipefail
+set -Eeuo pipefail
 
 readonly CR_ROLLBACK="$1"
 readonly CR_APP=/home/daniel/exper/chinese_reader_app
@@ -150,23 +150,59 @@ test -d "$CR_ROLLBACK/dist"
 test -f "$CR_ROLLBACK/dist/index.html"
 test -x "$CR_LIVE_SERVER"
 test -d "$CR_LIVE_DIST"
+test -f "$CR_LIVE_DIST/index.html"
 
 readonly CR_STAGE="$(mktemp -d "$CR_APP/.rollback-stage.XXXXXX")"
-readonly CR_FAILED="$(mktemp -d /home/daniel/backups/chinese-reader/failed-deployment.XXXXXX)"
+readonly CR_HOLD="$(mktemp -d "$CR_APP/.rollback-hold.XXXXXX")"
+readonly CR_FAILED="$(mktemp -d "$CR_APP/.rollback-failed.XXXXXX")"
 install -m 0755 "$CR_ROLLBACK/server" "$CR_STAGE/server"
 cp -a "$CR_ROLLBACK/dist" "$CR_STAGE/dist"
 test -x "$CR_STAGE/server"
 test -f "$CR_STAGE/dist/index.html"
 
+readonly CR_APP_DEVICE="$(stat -c %d "$CR_APP")"
+test "$(stat -c %d "$CR_STAGE")" = "$CR_APP_DEVICE"
+test "$(stat -c %d "$CR_HOLD")" = "$CR_APP_DEVICE"
+test "$(stat -c %d "$CR_FAILED")" = "$CR_APP_DEVICE"
+test "$(stat -c %d "$(dirname "$CR_LIVE_SERVER")")" = "$CR_APP_DEVICE"
+test "$(stat -c %d "$CR_LIVE_DIST")" = "$CR_APP_DEVICE"
+
+CR_SERVICE_TOUCHED=0
+recover_original_deployment() {
+  readonly failure_status="$?"
+  trap - ERR EXIT INT TERM
+  set +e
+  if (( CR_SERVICE_TOUCHED )); then
+    systemctl stop chinese-reader
+    if test -e "$CR_HOLD/server"; then
+      test ! -e "$CR_LIVE_SERVER" || mv "$CR_LIVE_SERVER" "$CR_FAILED/server.partial"
+      mv "$CR_HOLD/server" "$CR_LIVE_SERVER"
+    fi
+    if test -e "$CR_HOLD/dist"; then
+      test ! -e "$CR_LIVE_DIST" || mv "$CR_LIVE_DIST" "$CR_FAILED/dist.partial"
+      mv "$CR_HOLD/dist" "$CR_LIVE_DIST"
+    fi
+    systemctl start chinese-reader
+  fi
+  echo "Rollback swap failed; originals restored. Partial replacements: $CR_FAILED" >&2
+  exit "$failure_status"
+}
+trap recover_original_deployment ERR EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+CR_SERVICE_TOUCHED=1
 systemctl stop chinese-reader
-mv "$CR_LIVE_SERVER" "$CR_FAILED/server"
-mv "$CR_LIVE_DIST" "$CR_FAILED/dist"
+mv "$CR_LIVE_SERVER" "$CR_HOLD/server"
+mv "$CR_LIVE_DIST" "$CR_HOLD/dist"
 mv "$CR_STAGE/server" "$CR_LIVE_SERVER"
 mv "$CR_STAGE/dist" "$CR_LIVE_DIST"
 systemctl start chinese-reader
 curl --fail --silent --show-error --insecure https://localhost/health
 systemctl show chinese-reader -p MainPID -p ActiveEnterTimestamp --no-pager
-echo "Displaced deployment retained at $CR_FAILED"
+trap - ERR EXIT INT TERM
+rmdir "$CR_STAGE" "$CR_FAILED"
+echo "Displaced deployment retained at $CR_HOLD"
 ROLLBACK
 ```
 
