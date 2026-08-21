@@ -1,7 +1,7 @@
 //! Durable state for deferred shelf-analysis maintenance.
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, params_from_iter, types::Type, Connection};
+use rusqlite::{params, params_from_iter, types::Type, Connection, Transaction};
 use std::path::Path;
 
 use crate::dictionary;
@@ -28,10 +28,24 @@ pub fn mark_analysis_dirty(conn: &Connection, shelf_ids: &[i64], at: DateTime<Ut
         return Ok(());
     }
 
-    let at = at.to_rfc3339();
     let tx = conn.unchecked_transaction()?;
+    mark_analysis_dirty_in_transaction(&tx, shelf_ids, at)?;
+    tx.commit()?;
+    Ok(())
+}
 
-    update_task_dirty(&tx, &at)?;
+/// Marks analysis dirty as part of an existing domain-mutation transaction.
+pub fn mark_analysis_dirty_in_transaction(
+    tx: &Transaction<'_>,
+    shelf_ids: &[i64],
+    at: DateTime<Utc>,
+) -> Result<()> {
+    if shelf_ids.is_empty() {
+        return Ok(());
+    }
+
+    let at = at.to_rfc3339();
+    update_task_dirty(tx, &at)?;
     for shelf_id in shelf_ids {
         tx.execute(
             "INSERT INTO analysis_shelf_jobs (shelf_id, dirty_at, requested_at)
@@ -59,7 +73,6 @@ pub fn mark_analysis_dirty(conn: &Connection, shelf_ids: &[i64], at: DateTime<Ut
         )?;
     }
 
-    tx.commit()?;
     Ok(())
 }
 
@@ -275,8 +288,8 @@ pub fn run_due_analysis_maintenance(db_path: &Path, cutoff: DateTime<Utc>) -> Ma
     report
 }
 
-fn update_task_dirty(tx: &rusqlite::Transaction<'_>, at: &str) -> rusqlite::Result<()> {
-    tx.execute(
+fn update_task_dirty(conn: &Connection, at: &str) -> rusqlite::Result<()> {
+    conn.execute(
         "UPDATE analysis_maintenance
          SET dirty_at = CASE
              WHEN dirty_at IS NULL
@@ -340,7 +353,9 @@ fn parse_timestamp(
 mod tests {
     use super::*;
     use crate::dictionary;
-    use crate::library::analysis::{auto_mark_text_as_known, get_shelf_analysis_status};
+    use crate::library::analysis::{
+        auto_mark_text_as_known, get_shelf_analysis_status, reanalyze_text,
+    };
     use crate::library::models::{ShelfAnalysis, ShelfAnalysisStatus};
     use crate::library::{known_words, shelf, speed, text};
     use rusqlite::Connection;
@@ -415,6 +430,161 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap()
+    }
+
+    fn install_dirty_marker_failure(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TRIGGER fail_analysis_job_insert
+             BEFORE INSERT ON analysis_shelf_jobs
+             BEGIN
+                 SELECT RAISE(FAIL, 'forced dirty marker failure');
+             END;
+             CREATE TRIGGER fail_analysis_job_update
+             BEFORE UPDATE ON analysis_shelf_jobs
+             BEGIN
+                 SELECT RAISE(FAIL, 'forced dirty marker failure');
+             END;",
+        )
+        .unwrap();
+    }
+
+    fn install_dirty_generation_counter(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE dirty_generation_updates (id INTEGER PRIMARY KEY);
+             CREATE TRIGGER count_dirty_generation_update
+             AFTER UPDATE ON analysis_maintenance
+             BEGIN
+                 INSERT INTO dirty_generation_updates (id) VALUES (NULL);
+             END;",
+        )
+        .unwrap();
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum AtomicMutationCase {
+        CreateText,
+        FinishSession,
+        ChangeKnownWord,
+        MoveShelf,
+        ReanalyzeText,
+    }
+
+    #[test]
+    fn marks_analysis_dirty_atomically_with_domain_mutations() {
+        for case in [
+            AtomicMutationCase::CreateText,
+            AtomicMutationCase::FinishSession,
+            AtomicMutationCase::ChangeKnownWord,
+            AtomicMutationCase::MoveShelf,
+            AtomicMutationCase::ReanalyzeText,
+        ] {
+            let conn = setup_mutation_test_db();
+            let session_id = if matches!(case, AtomicMutationCase::FinishSession) {
+                Some(speed::start_reading_session(&conn, 11).unwrap().id)
+            } else {
+                None
+            };
+            if matches!(case, AtomicMutationCase::ChangeKnownWord) {
+                conn.execute(
+                    "INSERT INTO known_words (word, word_type, status)
+                     VALUES ('中', 'character', 'learning')",
+                    [],
+                )
+                .unwrap();
+            }
+            install_dirty_marker_failure(&conn);
+
+            let failed = match case {
+                AtomicMutationCase::CreateText => {
+                    text::create_text(&conn, 3, "Rolled back", "新內容", None, "paste")
+                        .is_err()
+                }
+                AtomicMutationCase::FinishSession => {
+                    speed::finish_reading_session(&conn, session_id.unwrap()).is_err()
+                }
+                AtomicMutationCase::ChangeKnownWord => {
+                    known_words::update_word_status(&conn, "中", "known").is_err()
+                }
+                AtomicMutationCase::MoveShelf => shelf::move_shelf(&conn, 3, Some(5)).is_err(),
+                AtomicMutationCase::ReanalyzeText => reanalyze_text(&conn, 11).is_err(),
+            };
+            assert!(failed, "{case:?}");
+
+            let text_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM texts", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(text_count, 1, "{case:?}");
+            let analysis_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM text_analyses", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(analysis_count, 0, "{case:?}");
+            if let Some(session_id) = session_id {
+                let is_complete: i64 = conn
+                    .query_row(
+                        "SELECT is_complete FROM reading_sessions WHERE id = ?",
+                        [session_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(is_complete, 0, "{case:?}");
+            }
+            if matches!(case, AtomicMutationCase::ChangeKnownWord) {
+                assert_eq!(
+                    known_words::get_word_status(&conn, "中").unwrap().as_deref(),
+                    Some("learning"),
+                    "{case:?}"
+                );
+            }
+            let parent_id: Option<i64> = conn
+                .query_row("SELECT parent_id FROM shelves WHERE id = 3", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(parent_id, Some(2), "{case:?}");
+            assert!(job_ids(&conn, true).is_empty(), "{case:?}");
+            assert_eq!(maintenance_snapshot(&conn).unwrap().dirty_at, None, "{case:?}");
+        }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum VocabularyBatchCase {
+        Import,
+        AutoMark,
+    }
+
+    #[test]
+    fn marks_analysis_dirty_once_for_vocabulary_batch() {
+        for case in [VocabularyBatchCase::Import, VocabularyBatchCase::AutoMark] {
+            let conn = setup_mutation_test_db();
+            install_dirty_generation_counter(&conn);
+
+            let changed_terms = match case {
+                VocabularyBatchCase::Import => {
+                    let stats = known_words::import_known_words(&conn, "中\n文\n學\n", "character")
+                        .unwrap();
+                    assert_eq!(stats.words_added, 3);
+                    stats.words_added as i64
+                }
+                VocabularyBatchCase::AutoMark => {
+                    let stats = auto_mark_text_as_known(&conn, 11).unwrap();
+                    stats.characters_marked + stats.words_marked
+                }
+            };
+
+            assert!(changed_terms > 1, "{case:?}");
+            let generation_updates: i64 = conn
+                .query_row("SELECT COUNT(*) FROM dirty_generation_updates", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(generation_updates, 1, "{case:?}");
+            let known_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM known_words", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(known_count, changed_terms, "{case:?}");
+            assert_eq!(job_ids(&conn, true), vec![1, 2, 4, 5], "{case:?}");
+            assert_eq!(cached_rows(&conn).len(), 3, "{case:?}");
+        }
     }
 
     #[derive(Clone, Copy, Debug)]

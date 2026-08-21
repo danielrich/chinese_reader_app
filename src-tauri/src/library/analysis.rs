@@ -5,7 +5,7 @@
 
 use chrono::{DateTime, Utc};
 use jieba_rs::Jieba;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde_json;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
@@ -155,6 +155,17 @@ fn build_frequency_rank_map(conn: &Connection, terms: &[String]) -> HashMap<Stri
 
 /// Analyze a text and store the results
 pub fn analyze_text(conn: &Connection, text_id: i64) -> Result<TextAnalysis> {
+    let tx = conn.unchecked_transaction()?;
+    let analysis = analyze_text_in_transaction(&tx, text_id)?;
+    tx.commit()?;
+    Ok(analysis)
+}
+
+fn analyze_text_in_transaction(
+    tx: &Transaction<'_>,
+    text_id: i64,
+) -> Result<TextAnalysis> {
+    let conn: &Connection = tx;
     // Get the text
     let text = text::get_text(conn, text_id)?.ok_or(LibraryError::TextNotFound(text_id))?;
 
@@ -210,8 +221,6 @@ pub fn analyze_text(conn: &Connection, text_id: i64) -> Result<TextAnalysis> {
     let total_chars: i64 = char_freq.values().sum();
     let total_words: i64 = word_freq.values().sum();
 
-    let tx = conn.unchecked_transaction()?;
-
     // Delete existing analysis if any
     tx.execute("DELETE FROM text_analyses WHERE text_id = ?", [text_id])?;
     tx.execute(
@@ -253,8 +262,6 @@ pub fn analyze_text(conn: &Connection, text_id: i64) -> Result<TextAnalysis> {
             params![text_id, word, frequency],
         )?;
     }
-
-    tx.commit()?;
 
     get_text_analysis(conn, text_id)
 }
@@ -524,9 +531,12 @@ pub fn get_analysis_report(
 
 /// Re-analyze a text (useful after vocabulary changes)
 pub fn reanalyze_text(conn: &Connection, text_id: i64) -> Result<TextAnalysis> {
-    let text = text::get_text(conn, text_id)?.ok_or(LibraryError::TextNotFound(text_id))?;
-    let analysis = analyze_text(conn, text_id)?;
-    invalidate_shelf_analysis_cache_for_shelf(conn, text.shelf_id)?;
+    let tx = conn.unchecked_transaction()?;
+    let text = text::get_text(&tx, text_id)?.ok_or(LibraryError::TextNotFound(text_id))?;
+    let analysis = analyze_text_in_transaction(&tx, text_id)?;
+    let shelf_ids = maintenance::cached_or_requested_ancestor_ids(&tx, &[text.shelf_id])?;
+    maintenance::mark_analysis_dirty_in_transaction(&tx, &shelf_ids, Utc::now())?;
+    tx.commit()?;
     Ok(analysis)
 }
 
@@ -907,6 +917,9 @@ pub fn auto_mark_text_as_known(conn: &Connection, text_id: i64) -> Result<AutoMa
         })
         .map(|s| s.to_string())
         .collect();
+    drop(jieba);
+
+    let tx = conn.unchecked_transaction()?;
 
     let mut characters_marked: i64 = 0;
     let mut words_marked: i64 = 0;
@@ -915,7 +928,13 @@ pub fn auto_mark_text_as_known(conn: &Connection, text_id: i64) -> Result<AutoMa
     for c in unique_chars {
         let c_str = c.to_string();
         if !vocab.known.contains(&c_str) && !vocab.learning.contains(&c_str) {
-            known_words::add_known_word(conn, &c_str, "character", Some("known"), None)?;
+            known_words::add_known_word_unscheduled(
+                &tx,
+                &c_str,
+                "character",
+                Some("known"),
+                None,
+            )?;
             characters_marked += 1;
         }
     }
@@ -923,15 +942,23 @@ pub fn auto_mark_text_as_known(conn: &Connection, text_id: i64) -> Result<AutoMa
     // Mark unknown words as known (skip if already known or learning)
     for word in unique_words {
         if !vocab.known.contains(&word) && !vocab.learning.contains(&word) {
-            known_words::add_known_word(conn, &word, "word", Some("known"), None)?;
+            known_words::add_known_word_unscheduled(
+                &tx,
+                &word,
+                "word",
+                Some("known"),
+                None,
+            )?;
             words_marked += 1;
         }
     }
 
     // Invalidate the analysis cache since vocabulary changed
     if characters_marked > 0 || words_marked > 0 {
-        conn.execute("DELETE FROM text_analyses WHERE text_id = ?", [text_id])?;
+        tx.execute("DELETE FROM text_analyses WHERE text_id = ?", [text_id])?;
+        known_words::mark_all_analysis_dirty_in_transaction(&tx)?;
     }
+    tx.commit()?;
 
     Ok(AutoMarkStats {
         characters_marked,

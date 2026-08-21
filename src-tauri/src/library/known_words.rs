@@ -5,26 +5,49 @@
 //! Learning words are highlighted differently and count as unknown for analysis.
 
 use chrono::Utc;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, Transaction};
 
 use super::error::Result;
-use super::maintenance::mark_analysis_dirty;
+use super::maintenance::mark_analysis_dirty_in_transaction;
 use super::models::{ImportStats, KnownWord};
 
-fn mark_all_cached_or_requested_analysis_dirty(conn: &Connection) -> Result<()> {
-    let shelf_ids = {
-        let mut statement = conn.prepare(
-            "SELECT shelf_id FROM shelf_analyses_cache
-             UNION
-             SELECT shelf_id FROM analysis_shelf_jobs
-             ORDER BY shelf_id",
-        )?;
-        let shelf_ids = statement
-            .query_map([], |row| row.get(0))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        shelf_ids
-    };
-    mark_analysis_dirty(conn, &shelf_ids, Utc::now())
+fn all_cached_or_requested_shelf_ids(conn: &Connection) -> Result<Vec<i64>> {
+    let mut statement = conn.prepare(
+        "SELECT shelf_id FROM shelf_analyses_cache
+         UNION
+         SELECT shelf_id FROM analysis_shelf_jobs
+         ORDER BY shelf_id",
+    )?;
+    let shelf_ids = statement
+        .query_map([], |row| row.get(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(shelf_ids)
+}
+
+pub(crate) fn mark_all_analysis_dirty_in_transaction(tx: &Transaction<'_>) -> Result<()> {
+    let shelf_ids = all_cached_or_requested_shelf_ids(tx)?;
+    mark_analysis_dirty_in_transaction(tx, &shelf_ids, Utc::now())
+}
+
+pub(crate) fn add_known_word_unscheduled(
+    tx: &Transaction<'_>,
+    word: &str,
+    word_type: &str,
+    status: Option<&str>,
+    proficiency: Option<i64>,
+) -> Result<KnownWord> {
+    let status = status.unwrap_or("known");
+    let proficiency = proficiency.unwrap_or(1);
+
+    tx.execute(
+        "INSERT OR REPLACE INTO known_words (word, word_type, status, proficiency)
+         VALUES (?, ?, ?, ?)",
+        params![word, word_type, status, proficiency],
+    )?;
+
+    get_known_word(tx, word)?.ok_or_else(|| {
+        super::error::LibraryError::InvalidInput(format!("Failed to add word: {}", word))
+    })
 }
 
 /// Add a word to the known vocabulary
@@ -35,19 +58,11 @@ pub fn add_known_word(
     status: Option<&str>,
     proficiency: Option<i64>,
 ) -> Result<KnownWord> {
-    let status = status.unwrap_or("known");
-    let proficiency = proficiency.unwrap_or(1);
-
-    conn.execute(
-        "INSERT OR REPLACE INTO known_words (word, word_type, status, proficiency)
-         VALUES (?, ?, ?, ?)",
-        params![word, word_type, status, proficiency],
-    )?;
-    mark_all_cached_or_requested_analysis_dirty(conn)?;
-
-    get_known_word(conn, word)?.ok_or_else(|| {
-        super::error::LibraryError::InvalidInput(format!("Failed to add word: {}", word))
-    })
+    let tx = conn.unchecked_transaction()?;
+    let known_word = add_known_word_unscheduled(&tx, word, word_type, status, proficiency)?;
+    mark_all_analysis_dirty_in_transaction(&tx)?;
+    tx.commit()?;
+    Ok(known_word)
 }
 
 /// Get a known word by word string
@@ -76,13 +91,15 @@ pub fn get_known_word(conn: &Connection, word: &str) -> Result<Option<KnownWord>
 
 /// Update the status of a known word
 pub fn update_word_status(conn: &Connection, word: &str, status: &str) -> Result<()> {
-    let changed = conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    let changed = tx.execute(
         "UPDATE known_words SET status = ? WHERE word = ?",
         params![status, word],
     )?;
     if changed > 0 {
-        mark_all_cached_or_requested_analysis_dirty(conn)?;
+        mark_all_analysis_dirty_in_transaction(&tx)?;
     }
+    tx.commit()?;
     Ok(())
 }
 
@@ -103,10 +120,12 @@ pub fn get_word_status(conn: &Connection, word: &str) -> Result<Option<String>> 
 
 /// Remove a word from known vocabulary
 pub fn remove_known_word(conn: &Connection, word: &str) -> Result<()> {
-    let changed = conn.execute("DELETE FROM known_words WHERE word = ?", [word])?;
+    let tx = conn.unchecked_transaction()?;
+    let changed = tx.execute("DELETE FROM known_words WHERE word = ?", [word])?;
     if changed > 0 {
-        mark_all_cached_or_requested_analysis_dirty(conn)?;
+        mark_all_analysis_dirty_in_transaction(&tx)?;
     }
+    tx.commit()?;
     Ok(())
 }
 
@@ -192,6 +211,7 @@ pub fn import_known_words(
     content: &str,
     word_type: &str,
 ) -> Result<ImportStats> {
+    let tx = conn.unchecked_transaction()?;
     let mut words_added = 0;
     let mut words_skipped = 0;
     let mut errors = 0;
@@ -203,16 +223,21 @@ pub fn import_known_words(
         }
 
         // Check if word already exists
-        if get_known_word(conn, word)?.is_some() {
+        if get_known_word(&tx, word)?.is_some() {
             words_skipped += 1;
             continue;
         }
 
-        match add_known_word(conn, word, word_type, None, None) {
+        match add_known_word_unscheduled(&tx, word, word_type, None, None) {
             Ok(_) => words_added += 1,
             Err(_) => errors += 1,
         }
     }
+
+    if words_added > 0 {
+        mark_all_analysis_dirty_in_transaction(&tx)?;
+    }
+    tx.commit()?;
 
     Ok(ImportStats {
         words_added,
