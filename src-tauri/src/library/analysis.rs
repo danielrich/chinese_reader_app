@@ -161,10 +161,7 @@ pub fn analyze_text(conn: &Connection, text_id: i64) -> Result<TextAnalysis> {
     Ok(analysis)
 }
 
-fn analyze_text_in_transaction(
-    tx: &Transaction<'_>,
-    text_id: i64,
-) -> Result<TextAnalysis> {
+fn analyze_text_in_transaction(tx: &Transaction<'_>, text_id: i64) -> Result<TextAnalysis> {
     let conn: &Connection = tx;
     // Get the text
     let text = text::get_text(conn, text_id)?.ok_or(LibraryError::TextNotFound(text_id))?;
@@ -928,13 +925,7 @@ pub fn auto_mark_text_as_known(conn: &Connection, text_id: i64) -> Result<AutoMa
     for c in unique_chars {
         let c_str = c.to_string();
         if !vocab.known.contains(&c_str) && !vocab.learning.contains(&c_str) {
-            known_words::add_known_word_unscheduled(
-                &tx,
-                &c_str,
-                "character",
-                Some("known"),
-                None,
-            )?;
+            known_words::add_known_word_unscheduled(&tx, &c_str, "character", Some("known"), None)?;
             characters_marked += 1;
         }
     }
@@ -942,13 +933,7 @@ pub fn auto_mark_text_as_known(conn: &Connection, text_id: i64) -> Result<AutoMa
     // Mark unknown words as known (skip if already known or learning)
     for word in unique_words {
         if !vocab.known.contains(&word) && !vocab.learning.contains(&word) {
-            known_words::add_known_word_unscheduled(
-                &tx,
-                &word,
-                "word",
-                Some("known"),
-                None,
-            )?;
+            known_words::add_known_word_unscheduled(&tx, &word, "word", Some("known"), None)?;
             words_marked += 1;
         }
     }

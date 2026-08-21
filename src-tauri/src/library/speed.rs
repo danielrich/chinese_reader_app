@@ -10,9 +10,7 @@ use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row, Tra
 use serde::{Deserialize, Serialize};
 
 use super::error::{LibraryError, Result};
-use super::maintenance::{
-    cached_or_requested_ancestor_ids, mark_analysis_dirty_in_transaction,
-};
+use super::maintenance::{cached_or_requested_ancestor_ids, mark_analysis_dirty_in_transaction};
 
 // =============================================================================
 // Models
@@ -169,10 +167,7 @@ fn cached_or_requested_text_ancestor_ids(conn: &Connection, text_ids: &[i64]) ->
     cached_or_requested_ancestor_ids(conn, &shelf_ids)
 }
 
-fn mark_text_analysis_dirty_in_transaction(
-    tx: &Transaction<'_>,
-    text_ids: &[i64],
-) -> Result<()> {
+fn mark_text_analysis_dirty_in_transaction(tx: &Transaction<'_>, text_ids: &[i64]) -> Result<()> {
     let shelf_ids = cached_or_requested_text_ancestor_ids(tx, text_ids)?;
     mark_analysis_dirty_in_transaction(tx, &shelf_ids, Utc::now())
 }
@@ -895,10 +890,7 @@ pub fn upload_completed_session(conn: &Connection, s: &UploadSession) -> Result<
     Ok(session_id)
 }
 
-fn upload_completed_session_in_transaction(
-    tx: &Transaction<'_>,
-    s: &UploadSession,
-) -> Result<i64> {
+fn upload_completed_session_in_transaction(tx: &Transaction<'_>, s: &UploadSession) -> Result<i64> {
     let conn: &Connection = tx;
     // Idempotent: return existing server ID if already uploaded
     let existing: Option<i64> = conn

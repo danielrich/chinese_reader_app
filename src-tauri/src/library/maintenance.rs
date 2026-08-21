@@ -514,8 +514,7 @@ mod tests {
 
             let failed = match case {
                 AtomicMutationCase::CreateText => {
-                    text::create_text(&conn, 3, "Rolled back", "新內容", None, "paste")
-                        .is_err()
+                    text::create_text(&conn, 3, "Rolled back", "新內容", None, "paste").is_err()
                 }
                 AtomicMutationCase::FinishSession => {
                     speed::finish_reading_session(&conn, session_id.unwrap()).is_err()
@@ -548,7 +547,9 @@ mod tests {
             }
             if matches!(case, AtomicMutationCase::ChangeKnownWord) {
                 assert_eq!(
-                    known_words::get_word_status(&conn, "中").unwrap().as_deref(),
+                    known_words::get_word_status(&conn, "中")
+                        .unwrap()
+                        .as_deref(),
                     Some("learning"),
                     "{case:?}"
                 );
@@ -560,7 +561,11 @@ mod tests {
                 .unwrap();
             assert_eq!(parent_id, Some(2), "{case:?}");
             assert!(job_ids(&conn, true).is_empty(), "{case:?}");
-            assert_eq!(maintenance_snapshot(&conn).unwrap().dirty_at, None, "{case:?}");
+            assert_eq!(
+                maintenance_snapshot(&conn).unwrap().dirty_at,
+                None,
+                "{case:?}"
+            );
         }
     }
 

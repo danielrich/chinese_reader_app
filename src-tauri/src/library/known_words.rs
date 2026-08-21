@@ -170,10 +170,8 @@ pub fn list_known_words(
 
     let mut stmt = conn.prepare(&sql)?;
 
-    let param_refs: Vec<&dyn rusqlite::ToSql> = params
-        .iter()
-        .map(|s| s as &dyn rusqlite::ToSql)
-        .collect();
+    let param_refs: Vec<&dyn rusqlite::ToSql> =
+        params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
 
     let known_words = stmt
         .query_map(param_refs.as_slice(), |row| {

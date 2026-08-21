@@ -156,7 +156,11 @@ struct EntryRow {
     tocfl_level: Option<i32>,
 }
 
-fn build_entry(conn: &Connection, row: EntryRow, include_examples: bool) -> Result<DictionaryEntry> {
+fn build_entry(
+    conn: &Connection,
+    row: EntryRow,
+    include_examples: bool,
+) -> Result<DictionaryEntry> {
     // Get definitions
     let definitions = get_definitions(conn, row.id)?;
 
@@ -268,9 +272,7 @@ fn lookup_character(conn: &Connection, character: &str) -> Result<Option<Charact
 }
 
 fn get_character_variants(conn: &Connection, character: &str) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(
-        r#"SELECT variant FROM character_variants WHERE character = ?"#,
-    )?;
+    let mut stmt = conn.prepare(r#"SELECT variant FROM character_variants WHERE character = ?"#)?;
 
     let rows = stmt.query_map([character], |row| row.get(0))?;
     rows.collect()
@@ -328,9 +330,7 @@ fn lookup_user_entries(
 }
 
 fn get_user_entry_tags(conn: &Connection, entry_id: i64) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(
-        r#"SELECT tag FROM user_entry_tags WHERE entry_id = ?"#,
-    )?;
+    let mut stmt = conn.prepare(r#"SELECT tag FROM user_entry_tags WHERE entry_id = ?"#)?;
 
     let rows = stmt.query_map([entry_id], |row| row.get(0))?;
     rows.collect()
@@ -423,7 +423,14 @@ mod tests {
                 r#"INSERT INTO dictionary_entries
                    (traditional, simplified, pinyin, pinyin_display, source, frequency_rank)
                    VALUES (?, ?, ?, ?, ?, ?)"#,
-                (traditional, simplified, pinyin, pinyin, source, frequency_rank),
+                (
+                    traditional,
+                    simplified,
+                    pinyin,
+                    pinyin,
+                    source,
+                    frequency_rank,
+                ),
             )
             .unwrap();
             conn.last_insert_rowid()
@@ -438,7 +445,8 @@ mod tests {
         conn.execute(
             r#"INSERT INTO definitions (entry_id, text, language) VALUES (?, 'test', 'en')"#,
             [entry_id],
-        ).unwrap();
+        )
+        .unwrap();
 
         conn.execute(
             r#"INSERT INTO usage_examples (entry_id, text, translation, sort_order)
