@@ -50,6 +50,7 @@ import {
 // Track current sort mode (local to library view)
 let currentSort: library.FrequencySort = "text_frequency";
 let activeShelfAnalysisController: AbortController | null = null;
+let libraryViewToken = 0;
 const offlineDownloadErrors = new Map<number, string>();
 
 const CACHED_PREVIEW_DELAY_MS = 250;
@@ -234,6 +235,7 @@ async function selectShelf(shelfId: number) {
 async function loadTextsInShelf(shelfId: number) {
   const mainContainer = document.getElementById("library-main");
   if (!mainContainer) return;
+  const viewToken = ++libraryViewToken;
 
   activeShelfAnalysisController?.abort();
   activeShelfAnalysisController = null;
@@ -252,6 +254,7 @@ async function loadTextsInShelf(shelfId: number) {
       listTextCacheMetadata(texts.map((text) => text.id)).catch(() => new Map<number, CacheMetadata>()),
       listOfflineTextBundleStatuses(texts.map((text) => text.id)).catch(() => new Map<number, OfflineTextBundleStatus>()),
     ]);
+    if (viewToken !== libraryViewToken || selectedShelfId !== shelfId) return;
     renderShelfContents(
       mainContainer,
       shelfId,
@@ -299,6 +302,7 @@ async function loadTextsInShelf(shelfId: number) {
     await renderLoadedShelf(texts, "fresh");
   } catch (networkError) {
     if (previewTimer !== null) window.clearTimeout(previewTimer);
+    if (viewToken !== libraryViewToken) return;
     console.warn("Failed to load texts from server, trying IDB cache:", networkError);
     if (cachedTexts) {
       if (!previewRendered) {
@@ -562,6 +566,7 @@ function bindShelfContents(
   textCache: Map<number, CacheMetadata>,
   bundleStatuses: Map<number, OfflineTextBundleStatus>,
 ) {
+  const originatingViewToken = libraryViewToken;
   const analysisDetails = mainContainer.querySelector<HTMLDetailsElement>(".shelf-analysis-details");
   analysisDetails?.querySelector(".shelf-analysis-summary")?.addEventListener("click", async () => {
     if (analysisDetails.dataset.analysisState !== "idle") return;
@@ -571,7 +576,7 @@ function bindShelfContents(
 
     if (!navigator.onLine) {
       const cachedAnalysis = await getNavCache<library.ShelfAnalysis>(shelfAnalysisCacheKey(shelfId)).catch(() => null);
-      if (selectedShelfId !== shelfId || !mainContainer.isConnected) return;
+      if (originatingViewToken !== libraryViewToken || selectedShelfId !== shelfId || !mainContainer.isConnected) return;
       renderShelfContents(
         mainContainer,
         shelfId,
@@ -600,7 +605,7 @@ function bindShelfContents(
     activeShelfAnalysisController = controller;
     try {
       const status = await library.getShelfAnalysisStatus(shelfId, { signal: controller.signal });
-      if (controller.signal.aborted || selectedShelfId !== shelfId || !mainContainer.isConnected) return;
+      if (controller.signal.aborted || originatingViewToken !== libraryViewToken || selectedShelfId !== shelfId || !mainContainer.isConnected) return;
       if (status.status === "ready") {
         saveNavCache(shelfAnalysisCacheKey(shelfId), status.analysis).catch(() => {});
         markShelfAnalysisCached(shelfId).catch(() => {});
@@ -618,7 +623,7 @@ function bindShelfContents(
         bundleStatuses,
       );
     } catch (error) {
-      if ((error as Error).name === "AbortError" || selectedShelfId !== shelfId) return;
+      if ((error as Error).name === "AbortError" || originatingViewToken !== libraryViewToken || selectedShelfId !== shelfId) return;
       console.warn("Failed to load shelf analysis status:", error);
       renderShelfContents(
         mainContainer,
@@ -708,6 +713,9 @@ function bindShelfContents(
 async function loadTextView(textId: number) {
   const mainContainer = document.getElementById("library-main");
   if (!mainContainer) return;
+  const viewToken = ++libraryViewToken;
+  activeShelfAnalysisController?.abort();
+  activeShelfAnalysisController = null;
 
   if (sessionTimerInterval) {
     clearInterval(sessionTimerInterval);
@@ -721,6 +729,7 @@ async function loadTextView(textId: number) {
     setCurrentTextCharacterCount(text.character_count);
 
     setActiveSession(await getInProgressSessionForText(textId));
+    if (viewToken !== libraryViewToken) return;
 
     const currentTextIndex = currentShelfTexts.findIndex(t => t.id === textId);
     const hasPrevSection = currentTextIndex > 0;
@@ -888,6 +897,7 @@ async function loadTextView(textId: number) {
       document.querySelectorAll(".text-segment.selected").forEach(el => el.classList.remove("selected"));
     });
   } catch (error) {
+    if (viewToken !== libraryViewToken) return;
     mainContainer.innerHTML = `<p class="error">Failed to load text: ${error}</p>`;
   }
 }

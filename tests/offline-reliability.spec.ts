@@ -227,6 +227,52 @@ test("lazy analysis renders stale cached data with its timestamp", async ({ page
   await expect(page.locator(".shelf-stats")).toContainText("4");
 });
 
+test("lazy analysis response cannot replace a newly opened text", async ({ page }) => {
+  await mockLibraryApi(page);
+  let releaseAnalysis!: () => void;
+  const analysisGate = new Promise<void>((resolve) => { releaseAnalysis = resolve; });
+  let analysisRequests = 0;
+  let analysisFulfilled = false;
+  await page.route("**/api/invoke/get_shelf_analysis", async (route) => {
+    analysisRequests += 1;
+    await analysisGate;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        status: "pending",
+        requested_at: "2026-08-20T19:00:00Z",
+        last_error: null,
+      }),
+    });
+    analysisFulfilled = true;
+  });
+  await page.context().route("**/api/texts/1", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ ...textSummary, content: "中文测试", source_type: "paste", created_at: "2026-01-01", updated_at: "2026-01-01" }),
+    });
+  });
+
+  await bootstrapControlledApp(page);
+  await page.getByRole("button", { name: "Library" }).click();
+  await page.locator('.shelf-item[data-shelf-id="1"]').click();
+  await expect(page.locator(".cache-pill")).toContainText("Live");
+  await page.locator(".shelf-analysis-summary").click();
+  await expect.poll(() => analysisRequests).toBe(1);
+
+  await page.locator('.text-item[data-text-id="1"]').click();
+  await expect(page.getByRole("heading", { name: "Offline Test" })).toBeVisible();
+  releaseAnalysis();
+  await expect.poll(() => analysisFulfilled).toBe(true);
+  await page.waitForTimeout(250);
+
+  await expect(page.getByRole("heading", { name: "Offline Test" })).toBeVisible();
+  await expect(page.locator(".text-view")).toBeVisible();
+  await expect(page.locator(".shelf-view-layout")).toHaveCount(0);
+});
+
 test("vocab prefetch does not run when opening a text", async ({ page }) => {
   await mockLibraryApi(page);
   let vocabRequests = 0;
