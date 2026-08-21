@@ -110,6 +110,7 @@ CREATE TABLE IF NOT EXISTS dictionary_metadata (
 CREATE INDEX IF NOT EXISTS idx_entries_traditional ON dictionary_entries(traditional);
 CREATE INDEX IF NOT EXISTS idx_entries_simplified ON dictionary_entries(simplified);
 CREATE INDEX IF NOT EXISTS idx_entries_pinyin ON dictionary_entries(pinyin);
+CREATE INDEX IF NOT EXISTS idx_entries_pinyin_nocase ON dictionary_entries(pinyin COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS idx_entries_source ON dictionary_entries(source);
 CREATE INDEX IF NOT EXISTS idx_definitions_entry ON definitions(entry_id);
 CREATE INDEX IF NOT EXISTS idx_examples_entry ON usage_examples(entry_id);

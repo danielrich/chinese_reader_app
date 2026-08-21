@@ -53,40 +53,19 @@ fn lookup_entries(
 
     let limit = options.max_results.unwrap_or(100);
 
-    // Search by traditional, simplified, or pinyin
-    let sql = format!(
-        r#"SELECT id, traditional, simplified, pinyin, pinyin_display, zhuyin,
-                  source, frequency_rank, hsk_level, tocfl_level
-           FROM dictionary_entries
-           WHERE (traditional = ? OR simplified = ? OR pinyin LIKE ?)
-           {}
-           ORDER BY
-               CASE WHEN traditional = ? THEN 0 ELSE 1 END,
-               frequency_rank NULLS LAST
-           LIMIT ?"#,
-        source_filter
-    );
-
-    let pinyin_pattern = format!("{}%", query.to_lowercase());
+    // Search by exact Han forms or case-insensitive pinyin prefix.
+    let sql = lookup_entries_sql(query, &source_filter);
 
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(
-        (&query, &query, &pinyin_pattern, &query, limit as i64),
-        |row| {
-            Ok(EntryRow {
-                id: row.get(0)?,
-                traditional: row.get(1)?,
-                simplified: row.get(2)?,
-                pinyin: row.get(3)?,
-                pinyin_display: row.get(4)?,
-                zhuyin: row.get(5)?,
-                source: row.get(6)?,
-                frequency_rank: row.get(7)?,
-                hsk_level: row.get(8)?,
-                tocfl_level: row.get(9)?,
-            })
-        },
-    )?;
+    let rows = if contains_han(query) {
+        stmt.query_map((query, query, query, limit as i64), entry_row)?
+    } else {
+        let pinyin_upper_bound = format!("{query}\u{10FFFF}");
+        stmt.query_map(
+            (query, &pinyin_upper_bound, query, query, limit as i64),
+            entry_row,
+        )?
+    };
 
     for row in rows {
         let row = row?;
@@ -95,6 +74,64 @@ fn lookup_entries(
     }
 
     Ok(entries)
+}
+
+/// Returns whether a query contains a Han ideograph.
+pub fn contains_han(query: &str) -> bool {
+    query.chars().any(|character| {
+        matches!(
+            character,
+            '\u{3400}'..='\u{4DBF}'
+                | '\u{4E00}'..='\u{9FFF}'
+                | '\u{F900}'..='\u{FAFF}'
+                | '\u{20000}'..='\u{2EBEF}'
+                | '\u{2EBF0}'..='\u{2EE5D}'
+                | '\u{2F800}'..='\u{2FA1F}'
+        )
+    })
+}
+
+fn lookup_entries_sql(query: &str, source_filter: &str) -> String {
+    let select = r#"SELECT id, traditional, simplified, pinyin, pinyin_display, zhuyin,
+                  source, frequency_rank, hsk_level, tocfl_level
+           FROM dictionary_entries"#;
+    let ordering = r#"ORDER BY
+               CASE WHEN traditional = ? THEN 0 ELSE 1 END,
+               frequency_rank NULLS LAST
+           LIMIT ?"#;
+
+    if contains_han(query) {
+        format!(
+            r#"{select}
+           WHERE (traditional = ? OR simplified = ?)
+           {source_filter}
+           {ordering}"#
+        )
+    } else {
+        format!(
+            r#"{select}
+           WHERE pinyin COLLATE NOCASE >= ?
+             AND pinyin COLLATE NOCASE < ?
+             AND pinyin LIKE (? || '%') COLLATE NOCASE
+           {source_filter}
+           {ordering}"#
+        )
+    }
+}
+
+fn entry_row(row: &rusqlite::Row<'_>) -> Result<EntryRow> {
+    Ok(EntryRow {
+        id: row.get(0)?,
+        traditional: row.get(1)?,
+        simplified: row.get(2)?,
+        pinyin: row.get(3)?,
+        pinyin_display: row.get(4)?,
+        zhuyin: row.get(5)?,
+        source: row.get(6)?,
+        frequency_rank: row.get(7)?,
+        hsk_level: row.get(8)?,
+        tocfl_level: row.get(9)?,
+    })
 }
 
 struct EntryRow {
@@ -337,24 +374,79 @@ pub fn search_fulltext(
 mod tests {
     use super::*;
     use crate::dictionary::schema::init_database;
+    fn dictionary_entries_query_plan(
+        conn: &Connection,
+        query: &str,
+        source_filter: &str,
+    ) -> Vec<String> {
+        let sql = lookup_entries_sql(query, source_filter);
+        let explain_sql = format!("EXPLAIN QUERY PLAN {sql}");
+        let mut stmt = conn.prepare(&explain_sql).unwrap();
+
+        if contains_han(query) {
+            stmt.query_map((query, query, query, 100_i64), |row| row.get(3))
+                .unwrap()
+                .collect::<Result<Vec<String>, _>>()
+                .unwrap()
+        } else {
+            let upper_bound = format!("{query}\u{10FFFF}");
+            stmt.query_map((query, &upper_bound, query, query, 100_i64), |row| row.get(3))
+                .unwrap()
+                .collect::<Result<Vec<String>, _>>()
+                .unwrap()
+        }
+    }
 
     fn setup_test_db() -> Connection {
+        fn insert_entry(
+            conn: &Connection,
+            traditional: &str,
+            simplified: &str,
+            pinyin: &str,
+            source: &str,
+            frequency_rank: i32,
+        ) -> i64 {
+            conn.execute(
+                r#"INSERT INTO dictionary_entries
+                   (traditional, simplified, pinyin, pinyin_display, source, frequency_rank)
+                   VALUES (?, ?, ?, ?, ?, ?)"#,
+                (traditional, simplified, pinyin, pinyin, source, frequency_rank),
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        }
+
         let conn = Connection::open_in_memory().unwrap();
         init_database(&conn).unwrap();
 
         // Insert test data
-        conn.execute(
-            r#"INSERT INTO dictionary_entries (traditional, simplified, pinyin, pinyin_display, source)
-               VALUES ('測試', '测试', 'ce4 shi4', 'cè shì', 'cc_cedict')"#,
-            [],
-        ).unwrap();
-
-        let entry_id = conn.last_insert_rowid();
+        let entry_id = insert_entry(&conn, "測試", "测试", "ce4 shi4", "cc_cedict", 1);
 
         conn.execute(
             r#"INSERT INTO definitions (entry_id, text, language) VALUES (?, 'test', 'en')"#,
             [entry_id],
         ).unwrap();
+
+        conn.execute(
+            r#"INSERT INTO usage_examples (entry_id, text, translation, sort_order)
+               VALUES (?, '這是測試', 'This is a test.', 0)"#,
+            [entry_id],
+        )
+        .unwrap();
+
+        let query_id = insert_entry(&conn, "查詢", "查询", "Cha2 xun2", "cc_cedict", 2);
+        conn.execute(
+            r#"INSERT INTO definitions (entry_id, text, language) VALUES (?, 'query', 'en')"#,
+            [query_id],
+        )
+        .unwrap();
+
+        let traditional_id = insert_entry(&conn, "傳統", "传统", "Chuan2 tong3", "moe_dict", 3);
+        conn.execute(
+            r#"INSERT INTO definitions (entry_id, text, language) VALUES (?, 'tradition', 'en')"#,
+            [traditional_id],
+        )
+        .unwrap();
 
         conn
     }
@@ -376,5 +468,80 @@ mod tests {
 
         let result = lookup(&conn, "测试", &options).unwrap();
         assert_eq!(result.entries.len(), 1);
+    }
+
+    #[test]
+    fn test_lookup_preserves_han_results_and_case_insensitive_pinyin_prefixes() {
+        let conn = setup_test_db();
+        let options = LookupOptions {
+            include_examples: true,
+            ..LookupOptions::default()
+        };
+
+        let traditional = lookup(&conn, "測試", &options).unwrap();
+        assert_eq!(traditional.entries.len(), 1);
+        assert_eq!(traditional.entries[0].traditional, "測試");
+        assert_eq!(traditional.entries[0].definitions[0].text, "test");
+        assert_eq!(traditional.entries[0].examples[0].text, "這是測試");
+
+        let simplified = lookup(&conn, "测试", &options).unwrap();
+        assert_eq!(simplified.entries.len(), 1);
+        assert_eq!(simplified.entries[0].simplified, "测试");
+
+        let pinyin = lookup(&conn, "cHa2", &options).unwrap();
+        assert_eq!(pinyin.entries.len(), 1);
+        assert_eq!(pinyin.entries[0].traditional, "查詢");
+    }
+
+    #[test]
+    fn test_contains_han_includes_unified_and_compatibility_ideographs() {
+        assert!(contains_han("測試"));
+        assert!(contains_han("\u{2F800}"));
+        assert!(contains_han("\u{2EBF0}"));
+        assert!(!contains_han("cHa2 xun2"));
+    }
+
+    #[test]
+    fn test_lookup_query_plans_use_dictionary_indexes_without_full_scans() {
+        let conn = setup_test_db();
+
+        let han_plan = dictionary_entries_query_plan(&conn, "測試", "");
+        assert!(
+            !han_plan
+                .iter()
+                .any(|detail| detail.contains("SCAN dictionary_entries")),
+            "Han lookup full-scanned dictionary_entries:\n{}",
+            han_plan.join("\n")
+        );
+        assert!(
+            han_plan
+                .iter()
+                .any(|detail| detail.contains("idx_entries_traditional")),
+            "Han lookup did not use idx_entries_traditional:\n{}",
+            han_plan.join("\n")
+        );
+        assert!(
+            han_plan
+                .iter()
+                .any(|detail| detail.contains("idx_entries_simplified")),
+            "Han lookup did not use idx_entries_simplified:\n{}",
+            han_plan.join("\n")
+        );
+
+        let pinyin_plan = dictionary_entries_query_plan(&conn, "cHa2", "");
+        assert!(
+            !pinyin_plan
+                .iter()
+                .any(|detail| detail.contains("SCAN dictionary_entries")),
+            "Pinyin lookup full-scanned dictionary_entries:\n{}",
+            pinyin_plan.join("\n")
+        );
+        assert!(
+            pinyin_plan
+                .iter()
+                .any(|detail| detail.contains("idx_entries_pinyin_nocase")),
+            "Pinyin lookup did not use idx_entries_pinyin_nocase:\n{}",
+            pinyin_plan.join("\n")
+        );
     }
 }
