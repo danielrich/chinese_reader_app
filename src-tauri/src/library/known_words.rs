@@ -4,10 +4,28 @@
 //! Words can be in "known" or "learning" status.
 //! Learning words are highlighted differently and count as unknown for analysis.
 
+use chrono::Utc;
 use rusqlite::{params, Connection};
 
 use super::error::Result;
+use super::maintenance::mark_analysis_dirty;
 use super::models::{ImportStats, KnownWord};
+
+fn mark_all_cached_or_requested_analysis_dirty(conn: &Connection) -> Result<()> {
+    let shelf_ids = {
+        let mut statement = conn.prepare(
+            "SELECT shelf_id FROM shelf_analyses_cache
+             UNION
+             SELECT shelf_id FROM analysis_shelf_jobs
+             ORDER BY shelf_id",
+        )?;
+        let shelf_ids = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        shelf_ids
+    };
+    mark_analysis_dirty(conn, &shelf_ids, Utc::now())
+}
 
 /// Add a word to the known vocabulary
 pub fn add_known_word(
@@ -25,6 +43,7 @@ pub fn add_known_word(
          VALUES (?, ?, ?, ?)",
         params![word, word_type, status, proficiency],
     )?;
+    mark_all_cached_or_requested_analysis_dirty(conn)?;
 
     get_known_word(conn, word)?.ok_or_else(|| {
         super::error::LibraryError::InvalidInput(format!("Failed to add word: {}", word))
@@ -57,10 +76,13 @@ pub fn get_known_word(conn: &Connection, word: &str) -> Result<Option<KnownWord>
 
 /// Update the status of a known word
 pub fn update_word_status(conn: &Connection, word: &str, status: &str) -> Result<()> {
-    conn.execute(
+    let changed = conn.execute(
         "UPDATE known_words SET status = ? WHERE word = ?",
         params![status, word],
     )?;
+    if changed > 0 {
+        mark_all_cached_or_requested_analysis_dirty(conn)?;
+    }
     Ok(())
 }
 
@@ -81,7 +103,10 @@ pub fn get_word_status(conn: &Connection, word: &str) -> Result<Option<String>> 
 
 /// Remove a word from known vocabulary
 pub fn remove_known_word(conn: &Connection, word: &str) -> Result<()> {
-    conn.execute("DELETE FROM known_words WHERE word = ?", [word])?;
+    let changed = conn.execute("DELETE FROM known_words WHERE word = ?", [word])?;
+    if changed > 0 {
+        mark_all_cached_or_requested_analysis_dirty(conn)?;
+    }
     Ok(())
 }
 

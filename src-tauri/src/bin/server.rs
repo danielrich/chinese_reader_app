@@ -810,7 +810,6 @@ fn dispatch_sync(conn: &Connection, command: &str, body: &Value) -> Result<Value
             let id: i64 = field(body, "id")?;
             let new_parent_id: Option<i64> = opt_field(body, "new_parent_id");
             library::shelf::move_shelf(conn, id, new_parent_id).map_err(db_err)?;
-            let _ = library::analysis::invalidate_shelf_analysis_cache(conn);
             Ok(Value::Null)
         }
 
@@ -833,7 +832,6 @@ fn dispatch_sync(conn: &Connection, command: &str, body: &Value) -> Result<Value
                 convert_to_traditional,
             )
             .map_err(db_err)?;
-            let _ = library::analysis::invalidate_shelf_analysis_cache(conn);
             serialize(serde_json::json!({
                 "text": result.text,
                 "section_shelf_id": result.section_shelf_id,
@@ -875,14 +873,12 @@ fn dispatch_sync(conn: &Connection, command: &str, body: &Value) -> Result<Value
         "delete_text" => {
             let id: i64 = field(body, "id")?;
             library::text::delete_text(conn, id).map_err(db_err)?;
-            let _ = library::analysis::invalidate_shelf_analysis_cache(conn);
             Ok(Value::Null)
         }
 
         "migrate_large_texts" => {
             let shelf_id: Option<i64> = opt_field(body, "shelf_id");
             let result = library::text::migrate_large_texts(conn, shelf_id).map_err(db_err)?;
-            let _ = library::analysis::invalidate_shelf_analysis_cache(conn);
             serialize(result)
         }
 
@@ -913,7 +909,6 @@ fn dispatch_sync(conn: &Connection, command: &str, body: &Value) -> Result<Value
         "reanalyze_text" => {
             let text_id: i64 = field(body, "text_id")?;
             let result = library::analysis::reanalyze_text(conn, text_id).map_err(db_err)?;
-            let _ = library::analysis::invalidate_shelf_analysis_cache(conn);
             serialize(result)
         }
 
@@ -991,7 +986,6 @@ fn dispatch_sync(conn: &Connection, command: &str, body: &Value) -> Result<Value
                 proficiency,
             )
             .map_err(db_err)?;
-            let _ = library::analysis::invalidate_shelf_analysis_cache(conn);
             serialize(result)
         }
 
@@ -999,14 +993,12 @@ fn dispatch_sync(conn: &Connection, command: &str, body: &Value) -> Result<Value
             let word: String = field(body, "word")?;
             let status: String = field(body, "status")?;
             library::known_words::update_word_status(conn, &word, &status).map_err(db_err)?;
-            let _ = library::analysis::invalidate_shelf_analysis_cache(conn);
             Ok(Value::Null)
         }
 
         "remove_known_word" => {
             let word: String = field(body, "word")?;
             library::known_words::remove_known_word(conn, &word).map_err(db_err)?;
-            let _ = library::analysis::invalidate_shelf_analysis_cache(conn);
             Ok(Value::Null)
         }
 
@@ -1032,7 +1024,6 @@ fn dispatch_sync(conn: &Connection, command: &str, body: &Value) -> Result<Value
             let word_type: String = field(body, "word_type")?;
             let result = library::known_words::import_known_words(conn, &content, &word_type)
                 .map_err(db_err)?;
-            let _ = library::analysis::invalidate_shelf_analysis_cache(conn);
             serialize(result)
         }
 

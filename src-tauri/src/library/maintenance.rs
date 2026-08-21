@@ -1,7 +1,7 @@
 //! Durable state for deferred shelf-analysis maintenance.
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, types::Type, Connection};
+use rusqlite::{params, params_from_iter, types::Type, Connection};
 use std::path::Path;
 
 use crate::dictionary;
@@ -61,6 +61,38 @@ pub fn mark_analysis_dirty(conn: &Connection, shelf_ids: &[i64], at: DateTime<Ut
 
     tx.commit()?;
     Ok(())
+}
+
+/// Returns the supplied shelves and their ancestors that already have cached or
+/// explicitly requested shelf analysis state.
+pub fn cached_or_requested_ancestor_ids(conn: &Connection, shelf_ids: &[i64]) -> Result<Vec<i64>> {
+    if shelf_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = shelf_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "WITH RECURSIVE ancestors(id) AS (
+             SELECT id FROM shelves WHERE id IN ({placeholders})
+             UNION
+             SELECT shelves.parent_id
+             FROM shelves
+             JOIN ancestors ON shelves.id = ancestors.id
+             WHERE shelves.parent_id IS NOT NULL
+         )
+         SELECT id FROM ancestors
+         WHERE EXISTS (
+             SELECT 1 FROM shelf_analyses_cache WHERE shelf_id = ancestors.id
+         ) OR EXISTS (
+             SELECT 1 FROM analysis_shelf_jobs WHERE shelf_id = ancestors.id
+         )
+         ORDER BY id"
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let shelf_ids = statement
+        .query_map(params_from_iter(shelf_ids.iter()), |row| row.get(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(shelf_ids)
 }
 
 /// Registers a shelf analysis request and schedules it for deferred maintenance.
@@ -308,8 +340,9 @@ fn parse_timestamp(
 mod tests {
     use super::*;
     use crate::dictionary;
-    use crate::library::analysis::get_shelf_analysis_status;
+    use crate::library::analysis::{auto_mark_text_as_known, get_shelf_analysis_status};
     use crate::library::models::{ShelfAnalysis, ShelfAnalysisStatus};
+    use crate::library::{known_words, shelf, speed, text};
     use rusqlite::Connection;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -332,6 +365,192 @@ mod tests {
             .unwrap();
         }
         conn
+    }
+
+    fn setup_mutation_test_db() -> Connection {
+        let conn = dictionary::init_memory_connection().unwrap();
+        conn.execute_batch(
+            "INSERT INTO shelves (id, name, parent_id) VALUES (1, 'Old root', NULL);
+             INSERT INTO shelves (id, name, parent_id) VALUES (2, 'Old parent', 1);
+             INSERT INTO shelves (id, name, parent_id) VALUES (3, 'Old leaf', 2);
+             INSERT INTO shelves (id, name, parent_id) VALUES (4, 'Unrelated cached', NULL);
+             INSERT INTO shelves (id, name, parent_id) VALUES (5, 'New root', NULL);
+             INSERT INTO shelves (id, name, parent_id) VALUES (6, 'New leaf', 5);
+             INSERT INTO shelves (id, name, parent_id) VALUES (7, 'Unrelated uncached', NULL);
+             INSERT INTO texts (id, shelf_id, title, content, character_count)
+             VALUES (11, 3, 'Original', '中文內容', 4);
+             INSERT INTO shelf_analyses_cache (shelf_id, data, cached_at)
+             VALUES (1, 'old-root', '2026-08-19T00:00:00Z');
+             INSERT INTO shelf_analyses_cache (shelf_id, data, cached_at)
+             VALUES (4, 'old-unrelated', '2026-08-19T00:00:00Z');
+             INSERT INTO shelf_analyses_cache (shelf_id, data, cached_at)
+             VALUES (5, 'old-new-root', '2026-08-19T00:00:00Z');
+             INSERT INTO analysis_shelf_jobs (shelf_id, dirty_at, requested_at)
+             VALUES (2, NULL, '2026-08-19T00:00:00Z');",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn job_ids(conn: &Connection, only_dirty: bool) -> Vec<i64> {
+        let sql = if only_dirty {
+            "SELECT shelf_id FROM analysis_shelf_jobs WHERE dirty_at IS NOT NULL ORDER BY shelf_id"
+        } else {
+            "SELECT shelf_id FROM analysis_shelf_jobs ORDER BY shelf_id"
+        };
+        let mut statement = conn.prepare(sql).unwrap();
+        statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    fn cached_rows(conn: &Connection) -> Vec<(i64, String)> {
+        let mut statement = conn
+            .prepare("SELECT shelf_id, data FROM shelf_analyses_cache ORDER BY shelf_id")
+            .unwrap();
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum MutationCase {
+        FinishSession,
+        UploadSession,
+        ManualSession,
+        DeleteSession,
+        ChangeKnownWord,
+        AutoMarkKnownWords,
+        CreateText,
+        DeleteText,
+        MoveText,
+        MoveShelf,
+        DeleteShelf,
+    }
+
+    #[test]
+    fn marks_analysis_dirty_for_relevant_mutations() {
+        let local_cases = [
+            MutationCase::FinishSession,
+            MutationCase::UploadSession,
+            MutationCase::ManualSession,
+            MutationCase::DeleteSession,
+            MutationCase::CreateText,
+            MutationCase::DeleteText,
+            MutationCase::DeleteShelf,
+        ];
+        for case in local_cases {
+            let conn = setup_mutation_test_db();
+            match case {
+                MutationCase::FinishSession => {
+                    let session = speed::start_reading_session(&conn, 11).unwrap();
+                    speed::finish_reading_session(&conn, session.id).unwrap();
+                }
+                MutationCase::UploadSession => {
+                    speed::upload_completed_session(
+                        &conn,
+                        &speed::UploadSession {
+                            local_id: "offline-1".into(),
+                            text_id: 11,
+                            started_at_ms: 1_756_000_000_000,
+                            finished_at_ms: 1_756_000_060_000,
+                        },
+                    )
+                    .unwrap();
+                }
+                MutationCase::ManualSession => {
+                    speed::log_offline_read(
+                        &conn,
+                        speed::ManualLogInput {
+                            text_ids: vec![11],
+                            finished_at: "2026-08-20T12:00:00Z".into(),
+                            total_duration_seconds: 60,
+                            source: Some("physical_book".into()),
+                        },
+                    )
+                    .unwrap();
+                }
+                MutationCase::DeleteSession => {
+                    conn.execute(
+                        "INSERT INTO reading_sessions
+                         (text_id, started_at, finished_at, character_count, is_complete)
+                         VALUES (11, '2026-08-20T10:00:00Z', '2026-08-20T10:01:00Z', 4, 1)",
+                        [],
+                    )
+                    .unwrap();
+                    let session_id = conn.last_insert_rowid();
+                    speed::delete_reading_session(&conn, session_id).unwrap();
+                }
+                MutationCase::CreateText => {
+                    text::create_text(&conn, 3, "Created", "新內容", None, "paste").unwrap();
+                }
+                MutationCase::DeleteText => text::delete_text(&conn, 11).unwrap(),
+                MutationCase::DeleteShelf => shelf::delete_shelf(&conn, 3).unwrap(),
+                _ => unreachable!(),
+            }
+
+            assert_eq!(job_ids(&conn, true), vec![1, 2], "{case:?}");
+            assert_eq!(job_ids(&conn, false), vec![1, 2], "{case:?}");
+            assert_eq!(
+                cached_rows(&conn),
+                vec![
+                    (1, "old-root".into()),
+                    (4, "old-unrelated".into()),
+                    (5, "old-new-root".into()),
+                ],
+                "{case:?}"
+            );
+        }
+
+        for case in [MutationCase::MoveText, MutationCase::MoveShelf] {
+            let conn = setup_mutation_test_db();
+            match case {
+                MutationCase::MoveText => text::move_text(&conn, 11, 6).unwrap(),
+                MutationCase::MoveShelf => shelf::move_shelf(&conn, 3, Some(5)).unwrap(),
+                _ => unreachable!(),
+            }
+
+            assert_eq!(job_ids(&conn, true), vec![1, 2, 5], "{case:?}");
+            assert_eq!(job_ids(&conn, false), vec![1, 2, 5], "{case:?}");
+            assert_eq!(cached_rows(&conn).len(), 3, "{case:?}");
+        }
+
+        for case in [
+            MutationCase::ChangeKnownWord,
+            MutationCase::AutoMarkKnownWords,
+        ] {
+            let conn = setup_mutation_test_db();
+            match case {
+                MutationCase::ChangeKnownWord => {
+                    conn.execute(
+                        "INSERT INTO known_words (word, word_type, status) VALUES ('中', 'character', 'learning')",
+                        [],
+                    )
+                    .unwrap();
+                    known_words::update_word_status(&conn, "中", "known").unwrap();
+                }
+                MutationCase::AutoMarkKnownWords => {
+                    auto_mark_text_as_known(&conn, 11).unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            assert_eq!(job_ids(&conn, true), vec![1, 2, 4, 5], "{case:?}");
+            assert_eq!(job_ids(&conn, false), vec![1, 2, 4, 5], "{case:?}");
+            assert_eq!(
+                cached_rows(&conn),
+                vec![
+                    (1, "old-root".into()),
+                    (4, "old-unrelated".into()),
+                    (5, "old-new-root".into()),
+                ],
+                "{case:?}"
+            );
+        }
     }
 
     fn temporary_db_path() -> PathBuf {

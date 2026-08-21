@@ -2,11 +2,13 @@
 //!
 //! Provides CRUD operations for texts stored in shelves.
 
+use chrono::Utc;
 use rusqlite::{params, Connection};
 use std::fs;
 use std::path::Path;
 
 use super::error::{LibraryError, Result};
+use super::maintenance::{cached_or_requested_ancestor_ids, mark_analysis_dirty};
 use super::models::{Text, TextSummary};
 use super::shelf;
 
@@ -220,7 +222,10 @@ fn create_text_internal(
     )?;
 
     let id = conn.last_insert_rowid();
-    get_text(conn, id)?.ok_or(LibraryError::TextNotFound(id))
+    let text = get_text(conn, id)?.ok_or(LibraryError::TextNotFound(id))?;
+    let dirty_shelf_ids = cached_or_requested_ancestor_ids(conn, &[shelf_id])?;
+    mark_analysis_dirty(conn, &dirty_shelf_ids, Utc::now())?;
+    Ok(text)
 }
 
 /// Create a new text with optional simplified-to-traditional conversion
@@ -362,12 +367,11 @@ pub fn update_text(
 
 /// Delete a text (cascades to analysis data)
 pub fn delete_text(conn: &Connection, id: i64) -> Result<()> {
-    // Check text exists
-    if get_text(conn, id)?.is_none() {
-        return Err(LibraryError::TextNotFound(id));
-    }
+    let text = get_text(conn, id)?.ok_or(LibraryError::TextNotFound(id))?;
+    let dirty_shelf_ids = cached_or_requested_ancestor_ids(conn, &[text.shelf_id])?;
 
     conn.execute("DELETE FROM texts WHERE id = ?", [id])?;
+    mark_analysis_dirty(conn, &dirty_shelf_ids, Utc::now())?;
     Ok(())
 }
 
@@ -406,20 +410,24 @@ pub fn import_text_file_with_options(
 
 /// Move a text to a different shelf
 pub fn move_text(conn: &Connection, text_id: i64, new_shelf_id: i64) -> Result<()> {
-    // Check text exists
-    if get_text(conn, text_id)?.is_none() {
-        return Err(LibraryError::TextNotFound(text_id));
-    }
+    let text = get_text(conn, text_id)?.ok_or(LibraryError::TextNotFound(text_id))?;
 
     // Check shelf exists
     if shelf::get_shelf(conn, new_shelf_id)?.is_none() {
         return Err(LibraryError::ShelfNotFound(new_shelf_id));
     }
 
+    let mut dirty_shelf_ids = cached_or_requested_ancestor_ids(conn, &[text.shelf_id])?;
+
     conn.execute(
         "UPDATE texts SET shelf_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         params![new_shelf_id, text_id],
     )?;
+
+    dirty_shelf_ids.extend(cached_or_requested_ancestor_ids(conn, &[new_shelf_id])?);
+    dirty_shelf_ids.sort_unstable();
+    dirty_shelf_ids.dedup();
+    mark_analysis_dirty(conn, &dirty_shelf_ids, Utc::now())?;
 
     Ok(())
 }

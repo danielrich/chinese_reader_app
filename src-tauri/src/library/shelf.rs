@@ -2,9 +2,11 @@
 //!
 //! Provides CRUD operations for hierarchical shelves.
 
+use chrono::Utc;
 use rusqlite::{params, Connection};
 
 use super::error::{LibraryError, Result};
+use super::maintenance::{cached_or_requested_ancestor_ids, mark_analysis_dirty};
 use super::models::{Shelf, ShelfTree};
 
 /// Create a new shelf
@@ -267,21 +269,20 @@ pub fn update_shelf(
 
 /// Delete a shelf (cascades to texts and child shelves)
 pub fn delete_shelf(conn: &Connection, id: i64) -> Result<()> {
-    // Check shelf exists
-    if get_shelf(conn, id)?.is_none() {
-        return Err(LibraryError::ShelfNotFound(id));
-    }
+    let shelf = get_shelf(conn, id)?.ok_or(LibraryError::ShelfNotFound(id))?;
+    let dirty_shelf_ids = match shelf.parent_id {
+        Some(parent_id) => cached_or_requested_ancestor_ids(conn, &[parent_id])?,
+        None => Vec::new(),
+    };
 
     conn.execute("DELETE FROM shelves WHERE id = ?", [id])?;
+    mark_analysis_dirty(conn, &dirty_shelf_ids, Utc::now())?;
     Ok(())
 }
 
 /// Move a shelf to a new parent
 pub fn move_shelf(conn: &Connection, id: i64, new_parent_id: Option<i64>) -> Result<()> {
-    // Check shelf exists
-    if get_shelf(conn, id)?.is_none() {
-        return Err(LibraryError::ShelfNotFound(id));
-    }
+    let shelf = get_shelf(conn, id)?.ok_or(LibraryError::ShelfNotFound(id))?;
 
     // Check new parent exists if specified
     if let Some(pid) = new_parent_id {
@@ -296,6 +297,11 @@ pub fn move_shelf(conn: &Connection, id: i64, new_parent_id: Option<i64>) -> Res
         }
     }
 
+    let mut dirty_shelf_ids = match shelf.parent_id {
+        Some(parent_id) => cached_or_requested_ancestor_ids(conn, &[parent_id])?,
+        None => Vec::new(),
+    };
+
     // Get next sort order for the new parent
     let sort_order: i64 = conn
         .query_row(
@@ -309,6 +315,13 @@ pub fn move_shelf(conn: &Connection, id: i64, new_parent_id: Option<i64>) -> Res
         "UPDATE shelves SET parent_id = ?, sort_order = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         params![new_parent_id, sort_order, id],
     )?;
+
+    if let Some(parent_id) = new_parent_id {
+        dirty_shelf_ids.extend(cached_or_requested_ancestor_ids(conn, &[parent_id])?);
+    }
+    dirty_shelf_ids.sort_unstable();
+    dirty_shelf_ids.dedup();
+    mark_analysis_dirty(conn, &dirty_shelf_ids, Utc::now())?;
 
     Ok(())
 }

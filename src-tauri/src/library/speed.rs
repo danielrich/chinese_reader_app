@@ -6,10 +6,11 @@
 //! - Correlating speed with vocabulary knowledge
 
 use chrono::{DateTime, Duration, Local, NaiveDate, Utc};
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 
 use super::error::{LibraryError, Result};
+use super::maintenance::{cached_or_requested_ancestor_ids, mark_analysis_dirty};
 
 // =============================================================================
 // Models
@@ -147,6 +148,30 @@ impl Default for SpeedStats {
 // Core Functions
 // =============================================================================
 
+fn cached_or_requested_text_ancestor_ids(conn: &Connection, text_ids: &[i64]) -> Result<Vec<i64>> {
+    if text_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = text_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT DISTINCT shelf_id FROM texts WHERE id IN ({placeholders}) ORDER BY shelf_id"
+    );
+    let shelf_ids = {
+        let mut statement = conn.prepare(&sql)?;
+        let shelf_ids = statement
+            .query_map(params_from_iter(text_ids.iter()), |row| row.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        shelf_ids
+    };
+    cached_or_requested_ancestor_ids(conn, &shelf_ids)
+}
+
+fn mark_text_analysis_dirty(conn: &Connection, text_ids: &[i64]) -> Result<()> {
+    let shelf_ids = cached_or_requested_text_ancestor_ids(conn, text_ids)?;
+    mark_analysis_dirty(conn, &shelf_ids, Utc::now())
+}
+
 /// Start a new reading session for a text
 pub fn start_reading_session(conn: &Connection, text_id: i64) -> Result<ReadingSession> {
     // Check text exists and get character count
@@ -272,6 +297,7 @@ pub fn finish_reading_session(conn: &Connection, session_id: i64) -> Result<Read
             session_id,
         ],
     )?;
+    mark_text_analysis_dirty(conn, &[session.text_id])?;
 
     // Return the updated session
     get_session_by_id(conn, session_id)
@@ -297,9 +323,11 @@ pub fn discard_reading_session(conn: &Connection, session_id: i64) -> Result<()>
 /// Delete a reading session (any session, complete or not)
 pub fn delete_reading_session(conn: &Connection, session_id: i64) -> Result<()> {
     // Verify session exists
-    get_session_by_id(conn, session_id)?;
+    let session = get_session_by_id(conn, session_id)?;
+    let dirty_shelf_ids = cached_or_requested_text_ancestor_ids(conn, &[session.text_id])?;
 
     conn.execute("DELETE FROM reading_sessions WHERE id = ?", [session_id])?;
+    mark_analysis_dirty(conn, &dirty_shelf_ids, Utc::now())?;
 
     Ok(())
 }
@@ -815,10 +843,12 @@ pub fn log_offline_read(conn: &Connection, input: ManualLogInput) -> Result<Vec<
     }
 
     // Return all created sessions
-    session_ids
+    let sessions = session_ids
         .iter()
         .map(|&id| get_session_by_id(conn, id))
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    mark_text_analysis_dirty(conn, &input.text_ids)?;
+    Ok(sessions)
 }
 
 // =============================================================================
@@ -928,7 +958,9 @@ pub fn upload_completed_session(conn: &Connection, s: &UploadSession) -> Result<
         ],
     )?;
 
-    Ok(conn.last_insert_rowid())
+    let session_id = conn.last_insert_rowid();
+    mark_text_analysis_dirty(conn, &[s.text_id])?;
+    Ok(session_id)
 }
 
 // =============================================================================

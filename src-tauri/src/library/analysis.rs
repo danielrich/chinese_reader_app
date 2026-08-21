@@ -524,7 +524,10 @@ pub fn get_analysis_report(
 
 /// Re-analyze a text (useful after vocabulary changes)
 pub fn reanalyze_text(conn: &Connection, text_id: i64) -> Result<TextAnalysis> {
-    analyze_text(conn, text_id)
+    let text = text::get_text(conn, text_id)?.ok_or(LibraryError::TextNotFound(text_id))?;
+    let analysis = analyze_text(conn, text_id)?;
+    invalidate_shelf_analysis_cache_for_shelf(conn, text.shelf_id)?;
+    Ok(analysis)
 }
 
 /// Segment text content into words and characters with known/unknown/learning status
@@ -581,19 +584,27 @@ pub fn segment_text(conn: &Connection, content: &str) -> Result<Vec<TextSegment>
     Ok(segments)
 }
 
-/// Invalidate all shelf analysis caches (call after vocabulary changes)
+/// Retain all shelf analysis caches while scheduling their deferred refresh.
 pub fn invalidate_shelf_analysis_cache(conn: &Connection) -> Result<()> {
-    conn.execute("DELETE FROM shelf_analyses_cache", [])?;
-    Ok(())
+    let shelf_ids = {
+        let mut statement = conn.prepare(
+            "SELECT shelf_id FROM shelf_analyses_cache
+             UNION
+             SELECT shelf_id FROM analysis_shelf_jobs
+             ORDER BY shelf_id",
+        )?;
+        let shelf_ids = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        shelf_ids
+    };
+    maintenance::mark_analysis_dirty(conn, &shelf_ids, Utc::now())
 }
 
-/// Invalidate the cache for a specific shelf (call when a text in that shelf changes)
+/// Retain relevant shelf analysis caches while scheduling their deferred refresh.
 pub fn invalidate_shelf_analysis_cache_for_shelf(conn: &Connection, shelf_id: i64) -> Result<()> {
-    conn.execute(
-        "DELETE FROM shelf_analyses_cache WHERE shelf_id = ?",
-        [shelf_id],
-    )?;
-    Ok(())
+    let shelf_ids = maintenance::cached_or_requested_ancestor_ids(conn, &[shelf_id])?;
+    maintenance::mark_analysis_dirty(conn, &shelf_ids, Utc::now())
 }
 
 /// Recursively get all shelf IDs including the given shelf and all descendants
@@ -920,7 +931,6 @@ pub fn auto_mark_text_as_known(conn: &Connection, text_id: i64) -> Result<AutoMa
     // Invalidate the analysis cache since vocabulary changed
     if characters_marked > 0 || words_marked > 0 {
         conn.execute("DELETE FROM text_analyses WHERE text_id = ?", [text_id])?;
-        invalidate_shelf_analysis_cache(conn)?;
     }
 
     Ok(AutoMarkStats {
@@ -1766,7 +1776,7 @@ mod tests {
     }
 
     #[test]
-    fn test_shelf_analysis_computation_and_publication() {
+    fn marks_analysis_dirty_when_legacy_invalidation_is_called() {
         let conn = setup_test_db();
         let shelf = create_shelf(&conn, "Test", None, None).unwrap();
         create_text(&conn, shelf.id, "Text1", "我喜欢学习中文", None, "paste").unwrap();
@@ -1788,7 +1798,7 @@ mod tests {
             .unwrap();
         assert_eq!(cache_count, 1);
 
-        // Invalidate and verify cache is cleared
+        // Legacy callers retain the stale row and schedule a rebuild.
         invalidate_shelf_analysis_cache(&conn).unwrap();
         let cache_count_after: i64 = conn
             .query_row(
@@ -1797,6 +1807,14 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(cache_count_after, 0);
+        assert_eq!(cache_count_after, 1);
+        let dirty_at: Option<String> = conn
+            .query_row(
+                "SELECT dirty_at FROM analysis_shelf_jobs WHERE shelf_id = ?",
+                [shelf.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(dirty_at.is_some());
     }
 }
