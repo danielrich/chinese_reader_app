@@ -60,9 +60,16 @@ fn lookup_entries(
     let rows = if contains_han(query) {
         stmt.query_map((query, query, query, limit as i64), entry_row)?
     } else {
-        let pinyin_upper_bound = format!("{query}\u{10FFFF}");
+        let pinyin_query = query.to_lowercase();
+        let pinyin_upper_bound = format!("{pinyin_query}\u{10FFFF}");
         stmt.query_map(
-            (query, &pinyin_upper_bound, query, query, limit as i64),
+            (
+                &pinyin_query,
+                &pinyin_upper_bound,
+                &pinyin_query,
+                query,
+                limit as i64,
+            ),
             entry_row,
         )?
     };
@@ -87,6 +94,8 @@ pub fn contains_han(query: &str) -> bool {
                 | '\u{20000}'..='\u{2EBEF}'
                 | '\u{2EBF0}'..='\u{2EE5D}'
                 | '\u{2F800}'..='\u{2FA1F}'
+                | '\u{30000}'..='\u{3134A}'
+                | '\u{31350}'..='\u{323AF}'
         )
     })
 }
@@ -389,11 +398,15 @@ mod tests {
                 .collect::<Result<Vec<String>, _>>()
                 .unwrap()
         } else {
-            let upper_bound = format!("{query}\u{10FFFF}");
-            stmt.query_map((query, &upper_bound, query, query, 100_i64), |row| row.get(3))
-                .unwrap()
-                .collect::<Result<Vec<String>, _>>()
-                .unwrap()
+            let pinyin_query = query.to_lowercase();
+            let upper_bound = format!("{pinyin_query}\u{10FFFF}");
+            stmt.query_map(
+                (&pinyin_query, &upper_bound, &pinyin_query, query, 100_i64),
+                |row| row.get(3),
+            )
+            .unwrap()
+            .collect::<Result<Vec<String>, _>>()
+            .unwrap()
         }
     }
 
@@ -448,6 +461,23 @@ mod tests {
         )
         .unwrap();
 
+        let tone_id = insert_entry(&conn, "側", "侧", "cè", "cc_cedict", 4);
+        conn.execute(
+            r#"INSERT INTO definitions (entry_id, text, language) VALUES (?, 'side', 'en')"#,
+            [tone_id],
+        )
+        .unwrap();
+
+        let er_id = insert_entry(&conn, "兒", "儿", "èr", "cc_cedict", 5);
+        conn.execute(
+            r#"INSERT INTO definitions (entry_id, text, language) VALUES (?, 'child', 'en')"#,
+            [er_id],
+        )
+        .unwrap();
+
+        insert_entry(&conn, "\u{30000}", "\u{30000}", "extension g", "kangxi", 6);
+        insert_entry(&conn, "\u{31350}", "\u{31350}", "extension h", "kangxi", 7);
+
         conn
     }
 
@@ -498,7 +528,37 @@ mod tests {
         assert!(contains_han("測試"));
         assert!(contains_han("\u{2F800}"));
         assert!(contains_han("\u{2EBF0}"));
+        assert!(contains_han("\u{30000}"));
+        assert!(contains_han("\u{31350}"));
         assert!(!contains_han("cHa2 xun2"));
+    }
+
+    #[test]
+    fn test_lookup_normalizes_unicode_tone_case_for_pinyin_prefixes() {
+        let conn = setup_test_db();
+        let options = LookupOptions::default();
+
+        let ce = lookup(&conn, "cÈ", &options).unwrap();
+        assert_eq!(ce.entries.len(), 1);
+        assert_eq!(ce.entries[0].traditional, "側");
+
+        let er = lookup(&conn, "Èr", &options).unwrap();
+        assert_eq!(er.entries.len(), 1);
+        assert_eq!(er.entries[0].traditional, "兒");
+    }
+
+    #[test]
+    fn test_lookup_uses_exact_han_path_for_extension_g_and_h() {
+        let conn = setup_test_db();
+        let options = LookupOptions::default();
+
+        let extension_g = lookup(&conn, "\u{30000}", &options).unwrap();
+        assert_eq!(extension_g.entries.len(), 1);
+        assert_eq!(extension_g.entries[0].traditional, "\u{30000}");
+
+        let extension_h = lookup(&conn, "\u{31350}", &options).unwrap();
+        assert_eq!(extension_h.entries.len(), 1);
+        assert_eq!(extension_h.entries[0].traditional, "\u{31350}");
     }
 
     #[test]
@@ -542,6 +602,22 @@ mod tests {
                 .any(|detail| detail.contains("idx_entries_pinyin_nocase")),
             "Pinyin lookup did not use idx_entries_pinyin_nocase:\n{}",
             pinyin_plan.join("\n")
+        );
+
+        let unicode_tone_plan = dictionary_entries_query_plan(&conn, "cÈ", "");
+        assert!(
+            !unicode_tone_plan
+                .iter()
+                .any(|detail| detail.contains("SCAN dictionary_entries")),
+            "Unicode-tone pinyin lookup full-scanned dictionary_entries:\n{}",
+            unicode_tone_plan.join("\n")
+        );
+        assert!(
+            unicode_tone_plan
+                .iter()
+                .any(|detail| detail.contains("idx_entries_pinyin_nocase")),
+            "Unicode-tone pinyin lookup did not use idx_entries_pinyin_nocase:\n{}",
+            unicode_tone_plan.join("\n")
         );
     }
 }
