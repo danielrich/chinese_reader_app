@@ -1,4 +1,5 @@
 import type { Text, TextSegment, TextSummary, TextVocabCache, VocabCacheEntry } from "./library";
+import type { ReadingSession } from "./speed";
 
 const DB_NAME = "chinese-reader";
 const DB_VERSION = 5;
@@ -552,6 +553,34 @@ export async function getNavCache<T>(key: string): Promise<T | null> {
   });
   db.close();
   return result ? result.data : null;
+}
+
+export interface CachedReadingHistory {
+  savedAt: number;
+  sessions: ReadingSession[];
+}
+
+function readingHistoryCacheKey(textId: number): string {
+  return `reading_history:${textId}`;
+}
+
+export async function getCachedReadingHistory(textId: number): Promise<CachedReadingHistory | null> {
+  return getNavCache<CachedReadingHistory>(readingHistoryCacheKey(textId));
+}
+
+export async function saveCachedReadingHistory(
+  textId: number,
+  sessions: ReadingSession[],
+): Promise<void> {
+  await saveNavCache(readingHistoryCacheKey(textId), { savedAt: Date.now(), sessions });
+}
+
+export async function invalidateCachedReadingHistory(textId: number): Promise<void> {
+  const db = await openDb();
+  const tx = db.transaction(STORE_NAV_CACHE, "readwrite");
+  tx.objectStore(STORE_NAV_CACHE).delete(readingHistoryCacheKey(textId));
+  await txDone(tx);
+  db.close();
 }
 
 // ── Text cache ─────────────────────────────────────────────────────────

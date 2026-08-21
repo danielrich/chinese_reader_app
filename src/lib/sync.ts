@@ -1,4 +1,4 @@
-import { listPendingSessions, saveSession } from "./idb";
+import { invalidateCachedReadingHistory, listPendingSessions, saveSession } from "./idb";
 
 export async function flushPendingSessions(): Promise<number> {
   const pending = await listPendingSessions();
@@ -22,6 +22,10 @@ export async function flushPendingSessions(): Promise<number> {
   for (const s of pending) {
     await saveSession({ ...s, status: "uploaded" });
   }
+  await Promise.all(
+    [...new Set(pending.map((session) => session.text_id))]
+      .map((textId) => invalidateCachedReadingHistory(textId).catch(() => {})),
+  );
 
   return pending.length;
 }

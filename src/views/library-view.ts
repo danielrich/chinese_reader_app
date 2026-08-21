@@ -8,6 +8,8 @@ import {
   deleteSession,
   saveNavCache,
   getNavCache,
+  getCachedReadingHistory,
+  saveCachedReadingHistory,
   getTextCache,
   saveTextSegments,
   getTextSegments,
@@ -1086,42 +1088,46 @@ function startSessionTimer() {
   }, 1000));
 }
 
-async function loadReadingHistory(textId: number) {
-  const container = document.getElementById("history-container");
-  if (!container) return;
+function renderReadingHistory(
+  container: HTMLElement,
+  textId: number,
+  history: speed.ReadingSession[],
+  stale = false,
+): void {
+  const cacheStatus = stale
+    ? '<p class="history-cache-status">Offline — showing saved reading history.</p>'
+    : "";
 
-  try {
-    const history = await speed.getTextReadingHistory(textId);
+  if (history.length === 0) {
+    container.innerHTML = `${cacheStatus}<p class="empty-message">No reading sessions yet. Start reading to track your progress!</p>`;
+    return;
+  }
 
-    if (history.length === 0) {
-      container.innerHTML = '<p class="empty-message">No reading sessions yet. Start reading to track your progress!</p>';
-      return;
-    }
-
-    let html = `
+  let html = `
+      ${cacheStatus}
       <div class="reading-history">
         <h3>Reading Sessions</h3>
         <div class="history-list">
-    `;
+  `;
 
-    for (const session of history) {
-      const isManual = session.is_manual_log;
-      const statusClass = isManual ? "manual" : session.is_complete ? "complete" : "in-progress";
-      const statusText = isManual ? "Logged" : session.is_complete ? "Completed" : "In Progress";
-      const firstReadBadge = session.is_first_read ? '<span class="first-read-badge">First Read</span>' : '';
-      const sourceBadge =
-        isManual && session.source
-          ? `<span class="source-badge">${escapeHtml(session.source.replace(/_/g, " "))}</span>`
-          : "";
+  for (const session of history) {
+    const isManual = session.is_manual_log;
+    const statusClass = isManual ? "manual" : session.is_complete ? "complete" : "in-progress";
+    const statusText = isManual ? "Logged" : session.is_complete ? "Completed" : "In Progress";
+    const firstReadBadge = session.is_first_read ? '<span class="first-read-badge">First Read</span>' : '';
+    const sourceBadge =
+      isManual && session.source
+        ? `<span class="source-badge">${escapeHtml(session.source.replace(/_/g, " "))}</span>`
+        : "";
 
-      html += `
+    html += `
         <div class="history-item ${statusClass}" data-session-id="${session.id}">
           <div class="history-item-header">
             <span class="history-date">${speed.formatSessionDate(session.started_at)}</span>
             <span class="history-status ${statusClass}">${statusText}</span>
             ${firstReadBadge}
             ${sourceBadge}
-            <button class="btn-delete-session" data-session-id="${session.id}" title="Delete session">×</button>
+            ${session.id >= 0 ? `<button class="btn-delete-session" data-session-id="${session.id}" title="Delete session">×</button>` : '<span class="history-status">Pending sync</span>'}
           </div>
           <div class="history-item-stats">
             ${session.is_complete
@@ -1144,13 +1150,13 @@ async function loadReadingHistory(textId: number) {
           </div>
         </div>
       `;
-    }
+  }
 
-    html += `</div></div>`;
-    container.innerHTML = html;
+  html += `</div></div>`;
+  container.innerHTML = html;
 
-    container.querySelectorAll(".btn-delete-session").forEach((btn) => {
-      btn.addEventListener("click", async (e) => {
+  container.querySelectorAll(".btn-delete-session").forEach((btn) => {
+    btn.addEventListener("click", async (e) => {
         e.preventDefault();
         e.stopPropagation();
 
@@ -1162,7 +1168,7 @@ async function loadReadingHistory(textId: number) {
         button.textContent = "...";
 
         try {
-          await speed.deleteReadingSession(sessionId);
+          await speed.deleteReadingSession(sessionId, textId);
 
           const item = container.querySelector(`.history-item[data-session-id="${sessionId}"]`);
           item?.remove();
@@ -1177,10 +1183,34 @@ async function loadReadingHistory(textId: number) {
           button.disabled = false;
           button.textContent = "×";
         }
-      });
     });
+  });
+}
+
+async function loadReadingHistory(textId: number) {
+  const container = document.getElementById("history-container");
+  if (!container) return;
+  const viewToken = libraryViewToken;
+  const isCurrentView = () => (
+    viewToken === libraryViewToken
+    && currentTextId === textId
+    && container.isConnected
+  );
+
+  const cached = await getCachedReadingHistory(textId).catch(() => null);
+  if (!isCurrentView()) return;
+  if (cached) renderReadingHistory(container, textId, cached.sessions);
+
+  try {
+    const history = await speed.getTextReadingHistoryFresh(textId);
+    if (!isCurrentView()) return;
+    await saveCachedReadingHistory(textId, history).catch(() => {});
+    if (!isCurrentView()) return;
+    renderReadingHistory(container, textId, history);
   } catch (error) {
-    container.innerHTML = `<p class="error">Failed to load history: ${error}</p>`;
+    if (!isCurrentView()) return;
+    if (cached) renderReadingHistory(container, textId, cached.sessions, true);
+    else container.innerHTML = `<p class="error">Failed to load history: ${error}</p>`;
   }
 }
 

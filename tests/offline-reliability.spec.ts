@@ -5,6 +5,56 @@ const textSummary = {
   character_count: 4, has_analysis: false,
 };
 
+function readingSession(id: number, characterCount: number) {
+  return {
+    id, text_id: 1, started_at: `2026-08-${String(id).padStart(2, "0")}T12:00:00Z`,
+    finished_at: `2026-08-${String(id).padStart(2, "0")}T12:10:00Z`,
+    character_count: characterCount, is_first_read: id === 1, is_complete: true,
+    known_characters_count: 0, known_words_count: 0, cumulative_characters_read: 0,
+    duration_seconds: 600, characters_per_minute: characterCount / 10,
+    auto_marked_characters: 0, auto_marked_words: 0,
+    text_known_char_percentage: null, text_known_word_percentage: null,
+    created_at: `2026-08-${String(id).padStart(2, "0")}T12:10:00Z`,
+    is_manual_log: false, source: null,
+  };
+}
+
+async function seedCachedTextAndHistory(page: Page, sessions?: unknown[]): Promise<void> {
+  await page.evaluate(async ({ summary, history }) => {
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open("chinese-reader", 5);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    const tx = db.transaction(["text_cache", "text_segments", "text_meta", "nav_cache"], "readwrite");
+    tx.objectStore("text_cache").put({
+      ...summary, content: "中文测试", source_type: "paste",
+      created_at: "2026-01-01", updated_at: "2026-01-01",
+    });
+    tx.objectStore("text_segments").put({ text_id: 1, segments: [], cached_at: Date.now() });
+    tx.objectStore("text_meta").put({ text_id: 1, text_cached_at: Date.now() });
+    if (history) {
+      tx.objectStore("nav_cache").put({
+        key: "reading_history:1",
+        data: { savedAt: Date.now() - 60_000, sessions: history },
+      });
+    }
+    await new Promise<void>((resolve, reject) => {
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error);
+    });
+    db.close();
+  }, { summary: textSummary, history: sessions });
+}
+
+async function openReadingHistory(page: Page): Promise<void> {
+  await page.getByRole("button", { name: "Library" }).click();
+  await page.locator('.shelf-item[data-shelf-id="1"]').click();
+  await page.locator('.text-item[data-text-id="1"]').click();
+  await page.getByRole("button", { name: "History" }).click();
+}
+
 async function mockLibraryApi(page: Page): Promise<void> {
   await page.route("**/api/invoke/**", async (route) => {
     const command = new URL(route.request().url()).pathname.split("/").pop();
@@ -296,6 +346,199 @@ test("vocab prefetch does not run when opening a text", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "Offline Test" })).toBeVisible();
   await page.waitForTimeout(500);
   expect(vocabRequests).toBe(0);
+});
+
+test("reading history renders cached sessions before replacing them with a fresh response", async ({ page }) => {
+  await mockLibraryApi(page);
+  await bootstrapControlledApp(page);
+  await seedCachedTextAndHistory(page, [readingSession(1, 111)]);
+
+  let releaseHistory!: () => void;
+  const historyGate = new Promise<void>((resolve) => { releaseHistory = resolve; });
+  await page.route("**/api/invoke/get_text_reading_history", async (route) => {
+    await historyGate;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify([readingSession(2, 222)]),
+    });
+  });
+
+  await openReadingHistory(page);
+  await expect(page.locator("#history-container")).toContainText("111");
+  await expect(page.locator("#history-container")).not.toContainText("222");
+
+  releaseHistory();
+  await expect(page.locator("#history-container")).toContainText("222");
+  await expect(page.locator("#history-container")).not.toContainText("111");
+});
+
+test("reading history retains cached sessions and labels them stale when refresh is offline", async ({ page }) => {
+  await mockLibraryApi(page);
+  await bootstrapControlledApp(page);
+  await seedCachedTextAndHistory(page, [readingSession(1, 333)]);
+  await page.route("**/api/invoke/get_text_reading_history", (route) => route.abort("connectionrefused"));
+
+  await openReadingHistory(page);
+
+  await expect(page.locator("#history-container")).toContainText("333");
+  await expect(page.locator(".history-cache-status")).toContainText(/offline|saved|stale/i);
+});
+
+test("reading history shows a spinner on first load when no cache exists", async ({ page }) => {
+  await mockLibraryApi(page);
+  await bootstrapControlledApp(page);
+  await seedCachedTextAndHistory(page);
+
+  let releaseHistory!: () => void;
+  const historyGate = new Promise<void>((resolve) => { releaseHistory = resolve; });
+  await page.route("**/api/invoke/get_text_reading_history", async (route) => {
+    await historyGate;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify([readingSession(4, 444)]),
+    });
+  });
+
+  await openReadingHistory(page);
+  await expect(page.locator("#history-container .loading")).toContainText("Loading history");
+  releaseHistory();
+  await expect(page.locator("#history-container")).toContainText("444");
+});
+
+test("deleting a reading session invalidates its cached history", async ({ page }) => {
+  await mockLibraryApi(page);
+  await bootstrapControlledApp(page);
+  await seedCachedTextAndHistory(page, [readingSession(5, 555)]);
+  await page.route("**/api/invoke/get_text_reading_history", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify([readingSession(5, 555)]) });
+  });
+  await page.route("**/api/invoke/delete_reading_session", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: "null" });
+  });
+
+  await openReadingHistory(page);
+  await page.locator('.btn-delete-session[data-session-id="5"]').click();
+
+  await expect.poll(() => page.evaluate(async () => {
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open("chinese-reader", 5);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    const value = await new Promise<unknown>((resolve, reject) => {
+      const request = db.transaction("nav_cache", "readonly").objectStore("nav_cache").get("reading_history:1");
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    db.close();
+    return value === undefined;
+  })).toBe(true);
+});
+
+test("manual reading log invalidates cached history for every affected text", async ({ page }) => {
+  await mockLibraryApi(page);
+  await bootstrapControlledApp(page);
+  await seedCachedTextAndHistory(page, [readingSession(6, 666)]);
+  await page.route("**/api/invoke/log_offline_read", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify([readingSession(6, 666)]) });
+  });
+  await page.route("**/api/invoke/get_text_reading_history", async (route) => {
+    await route.abort("connectionrefused");
+  });
+
+  await page.getByRole("button", { name: "Library" }).click();
+  await page.locator('.shelf-item[data-shelf-id="1"]').click();
+  await page.locator('.text-item[data-text-id="1"]').click();
+  await page.getByRole("button", { name: "Log offline read" }).click();
+  await page.locator("#offline-save-btn").click();
+
+  await expect.poll(() => page.evaluate(async () => {
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open("chinese-reader", 5);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    const value = await new Promise<unknown>((resolve, reject) => {
+      const request = db.transaction("nav_cache", "readonly").objectStore("nav_cache").get("reading_history:1");
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    db.close();
+    return value === undefined;
+  })).toBe(true);
+});
+
+test("completed local reading appears in cached history until successful sync invalidates it", async ({ page }) => {
+  await mockLibraryApi(page);
+  await bootstrapControlledApp(page);
+  await seedCachedTextAndHistory(page);
+  let releaseSync!: () => void;
+  const syncGate = new Promise<void>((resolve) => { releaseSync = resolve; });
+  await page.route("**/api/sync/sessions", async (route) => {
+    await syncGate;
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ uploaded: 1 }) });
+  });
+
+  await page.getByRole("button", { name: "Library" }).click();
+  await page.locator('.shelf-item[data-shelf-id="1"]').click();
+  await page.locator('.text-item[data-text-id="1"]').click();
+  await page.getByRole("button", { name: "Start Reading" }).click();
+  await page.getByRole("button", { name: "Finish Reading" }).click();
+
+  await expect.poll(() => page.evaluate(async () => {
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open("chinese-reader", 5);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    const record = await new Promise<{ data?: { sessions?: Array<{ id: number }> } } | undefined>((resolve, reject) => {
+      const request = db.transaction("nav_cache", "readonly").objectStore("nav_cache").get("reading_history:1");
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    db.close();
+    return record?.data?.sessions?.some((session) => session.id < 0) ?? false;
+  })).toBe(true);
+
+  releaseSync();
+  await expect.poll(() => page.evaluate(async () => {
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open("chinese-reader", 5);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    const value = await new Promise<unknown>((resolve, reject) => {
+      const request = db.transaction("nav_cache", "readonly").objectStore("nav_cache").get("reading_history:1");
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    db.close();
+    return value === undefined;
+  })).toBe(true);
+});
+
+test("late reading history refresh cannot replace a newer library view", async ({ page }) => {
+  await mockLibraryApi(page);
+  await bootstrapControlledApp(page);
+  await seedCachedTextAndHistory(page, [readingSession(8, 888)]);
+  let releaseHistory!: () => void;
+  const historyGate = new Promise<void>((resolve) => { releaseHistory = resolve; });
+  await page.route("**/api/invoke/get_text_reading_history", async (route) => {
+    await historyGate;
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify([readingSession(9, 999)]) });
+  });
+
+  await openReadingHistory(page);
+  await expect(page.locator("#history-container")).toContainText("888");
+  await page.getByRole("button", { name: "Back" }).click();
+  await expect(page.locator(".shelf-view-layout")).toBeVisible();
+  releaseHistory();
+  await page.waitForTimeout(150);
+
+  await expect(page.locator(".shelf-view-layout")).toBeVisible();
+  await expect(page.locator("#history-container")).toHaveCount(0);
 });
 
 test("a corrupted selected release falls back to an older complete release", async ({ page }) => {
