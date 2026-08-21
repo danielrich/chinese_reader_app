@@ -14,7 +14,7 @@ use super::error::{LibraryError, Result};
 use super::known_words;
 use super::maintenance;
 use super::models::{
-    AnalysisReport, CharacterContext, CharacterFrequency, ContextSnippet, FrequencySort,
+    AnalysisReport, CharacterContext, CharacterFrequency, ContextSnippet, FrequencySort, KnownWord,
     PreStudyCharacter, PreStudyResult, PreStudyWord, PreStudyWordResult, ShelfAnalysis,
     ShelfAnalysisStatus, TextAnalysis, TextSegment, WordFrequency,
 };
@@ -61,6 +61,35 @@ pub fn add_segmentation_word(word: &str, frequency: Option<i64>) {
     // Use the provided frequency or default to a high frequency to ensure the word is recognized
     let freq = frequency.unwrap_or(10000) as usize;
     jieba.add_word(word, Some(freq), None);
+}
+
+/// Persist a custom segmentation word and dirty every requested/cached shelf
+/// analysis in the same transaction. Optional vocabulary insertion participates
+/// in that transaction and deliberately shares the single dirty generation.
+pub fn persist_custom_segmentation_word(
+    conn: &Connection,
+    word: &str,
+    frequency: i64,
+    vocabulary: Option<(&str, Option<&str>)>,
+) -> Result<Option<KnownWord>> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "INSERT OR IGNORE INTO user_segmentation_words (word, frequency) VALUES (?1, ?2)",
+        params![word, frequency],
+    )?;
+    let known_word = if let Some((word_type, status)) = vocabulary {
+        Some(known_words::add_known_word_unscheduled(
+            &tx, word, word_type, status, None,
+        )?)
+    } else {
+        None
+    };
+    known_words::mark_all_analysis_dirty_in_transaction(&tx)?;
+    tx.commit()?;
+
+    // Publish to the in-memory segmenter only after durable state commits.
+    add_segmentation_word(word, Some(frequency));
+    Ok(known_word)
 }
 
 /// Load all user segmentation words from the database into jieba
@@ -1591,6 +1620,93 @@ mod tests {
             ],
         )
         .unwrap();
+    }
+
+    fn seed_dirty_generation_audit(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE dirty_generation_audit (id INTEGER PRIMARY KEY);
+             CREATE TRIGGER count_analysis_dirty_generation
+             AFTER UPDATE OF dirty_at ON analysis_maintenance
+             BEGIN
+               INSERT INTO dirty_generation_audit (id) VALUES (NULL);
+             END;",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn segmentation_only_mutation_retains_cache_and_creates_one_dirty_generation() {
+        let conn = setup_test_db();
+        let shelf = create_shelf(&conn, "Test", None, None).unwrap();
+        seed_cached_analysis(&conn, shelf.id, "2026-08-19 00:05:00");
+        let cached_before: String = conn
+            .query_row(
+                "SELECT data FROM shelf_analyses_cache WHERE shelf_id = ?1",
+                [shelf.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        seed_dirty_generation_audit(&conn);
+
+        let known = persist_custom_segmentation_word(&conn, "自訂詞", 10000, None).unwrap();
+
+        assert!(known.is_none());
+        let cached_after: String = conn
+            .query_row(
+                "SELECT data FROM shelf_analyses_cache WHERE shelf_id = ?1",
+                [shelf.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cached_after, cached_before);
+        let dirty: Option<String> = conn
+            .query_row(
+                "SELECT dirty_at FROM analysis_shelf_jobs WHERE shelf_id = ?1",
+                [shelf.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(dirty.is_some());
+        let generations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM dirty_generation_audit", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(generations, 1);
+    }
+
+    #[test]
+    fn segmentation_plus_vocabulary_mutation_shares_one_dirty_generation() {
+        let conn = setup_test_db();
+        let shelf = create_shelf(&conn, "Test", None, None).unwrap();
+        seed_cached_analysis(&conn, shelf.id, "2026-08-19 00:05:00");
+        seed_dirty_generation_audit(&conn);
+
+        let known = persist_custom_segmentation_word(
+            &conn,
+            "共同詞",
+            10000,
+            Some(("word", Some("learning"))),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(known.word, "共同詞");
+        assert_eq!(known.status, "learning");
+        let cache_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM shelf_analyses_cache WHERE shelf_id = ?1",
+                [shelf.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cache_count, 1);
+        let generations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM dirty_generation_audit", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(generations, 1);
     }
 
     #[test]

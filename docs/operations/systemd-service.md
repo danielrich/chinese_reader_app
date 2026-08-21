@@ -50,8 +50,11 @@ The durable state is stored in two additive tables:
 
 - `analysis_maintenance` contains the singleton `shelf_analysis` task, the
   earliest dirty time, run timestamps, and the last task-level error.
-- `analysis_shelf_jobs` contains one row per requested or cached shelf, including
-  dirty/request/completion timestamps and the last shelf-level error.
+- `analysis_shelf_jobs` contains one row once a shelf has been requested or
+  dirtied. Completed rows are retained with `dirty_at` cleared; an old cache by
+  itself may have no job row until its next mutation. Shelf deletion removes the
+  row through its foreign key. Each row records request/dirty/completion
+  timestamps and the last shelf-level error.
 
 Inspect state without changing it:
 
@@ -83,9 +86,10 @@ sudo journalctl -u chinese-reader --since "2 days ago" --no-pager \
   | grep analysis_maintenance
 ```
 
-Analysis computation is sequential on a dedicated SQLite connection. It does
-not hold the HTTP server's global write semaphore; only each short cache
-publication transaction competes with ordinary database writes.
+Analysis computation is sequential on a dedicated SQLite connection and does
+not hold the HTTP server's global write semaphore. Its short job-claim,
+maintenance-state, cache-publication, completion, and error-recording
+transactions can still briefly compete with ordinary SQLite writes.
 
 ## Deploy Frontend-Only Changes
 
@@ -128,24 +132,42 @@ For this release, retain both the SQLite online backup and the previous binary
 and `dist` directory until Linux health checks and Android acceptance tests pass.
 The new maintenance tables and lookup index are additive, so code rollback does
 not require removing them. Given a deployment backup containing `server` and
-`dist`, use the following procedure (set `CR_ROLLBACK` to its exact path):
+`dist`, pass its exact path as the argument to this fail-fast procedure. All
+sources and current live targets are validated and replacements are fully
+staged on the application filesystem before the daemon is stopped:
 
 ```bash
-CR_APP=/home/daniel/exper/chinese_reader_app
-CR_ROLLBACK=/home/daniel/backups/chinese-reader/DEPLOYMENT_TIMESTAMP
-CR_FAILED=/home/daniel/backups/chinese-reader/failed-deployment
+sudo bash -s -- /home/daniel/backups/chinese-reader/EXACT_DEPLOYMENT_BACKUP <<'ROLLBACK'
+set -euo pipefail
 
-mkdir -p "$CR_FAILED"
-cp "$CR_ROLLBACK/server" "$CR_APP/src-tauri/target/release/server.rollback"
-cp -a "$CR_ROLLBACK/dist" "$CR_APP/dist.rollback"
-sudo systemctl stop chinese-reader
-mv "$CR_APP/src-tauri/target/release/server" "$CR_FAILED/server"
-mv "$CR_APP/src-tauri/target/release/server.rollback" "$CR_APP/src-tauri/target/release/server"
-mv "$CR_APP/dist" "$CR_FAILED/dist"
-mv "$CR_APP/dist.rollback" "$CR_APP/dist"
-sudo systemctl start chinese-reader
-curl -k https://localhost/health
+readonly CR_ROLLBACK="$1"
+readonly CR_APP=/home/daniel/exper/chinese_reader_app
+readonly CR_LIVE_SERVER="$CR_APP/src-tauri/target/release/server"
+readonly CR_LIVE_DIST="$CR_APP/dist"
+
+test -x "$CR_ROLLBACK/server"
+test -d "$CR_ROLLBACK/dist"
+test -f "$CR_ROLLBACK/dist/index.html"
+test -x "$CR_LIVE_SERVER"
+test -d "$CR_LIVE_DIST"
+
+readonly CR_STAGE="$(mktemp -d "$CR_APP/.rollback-stage.XXXXXX")"
+readonly CR_FAILED="$(mktemp -d /home/daniel/backups/chinese-reader/failed-deployment.XXXXXX)"
+install -m 0755 "$CR_ROLLBACK/server" "$CR_STAGE/server"
+cp -a "$CR_ROLLBACK/dist" "$CR_STAGE/dist"
+test -x "$CR_STAGE/server"
+test -f "$CR_STAGE/dist/index.html"
+
+systemctl stop chinese-reader
+mv "$CR_LIVE_SERVER" "$CR_FAILED/server"
+mv "$CR_LIVE_DIST" "$CR_FAILED/dist"
+mv "$CR_STAGE/server" "$CR_LIVE_SERVER"
+mv "$CR_STAGE/dist" "$CR_LIVE_DIST"
+systemctl start chinese-reader
+curl --fail --silent --show-error --insecure https://localhost/health
 systemctl show chinese-reader -p MainPID -p ActiveEnterTimestamp --no-pager
+echo "Displaced deployment retained at $CR_FAILED"
+ROLLBACK
 ```
 
 Restore the database backup only if data/schema rollback is actually required;
@@ -160,6 +182,8 @@ credentials in scripts or documentation:
 
 ```bash
 BASE=https://127.0.0.1
+TEXT_ID=717
+SHELF_ID=338
 time_invoke () {
   command_name="$1"
   request_body="$2"
@@ -171,14 +195,14 @@ time_invoke () {
 time_invoke dictionary_lookup '{"query":"中文","include_examples":true,"include_character_info":true,"include_user_dictionaries":true,"sources":[]}'
 time_invoke dictionary_lookup '{"query":"zhongwen","include_examples":true,"include_character_info":true,"include_user_dictionaries":true,"sources":[]}'
 time_invoke get_shelf_tree '{}'
-time_invoke get_text_reading_history '{"text_id":TEXT_ID}'
-time_invoke get_shelf_analysis '{"shelf_id":SHELF_ID}'
+time_invoke get_text_reading_history "{\"text_id\":${TEXT_ID}}"
+time_invoke get_shelf_analysis "{\"shelf_id\":${SHELF_ID}}"
 
 curl -ksS -o /dev/null -w 'text %{http_code} %{size_download}B %{time_total}s\\n' \
-  "$BASE/api/texts/TEXT_ID"
+  "$BASE/api/texts/${TEXT_ID}"
 curl -ksS --compressed -D /tmp/vocab-headers.txt -o /dev/null \
   -w 'vocab %{http_code} %{size_download}B %{time_total}s\\n' \
-  "$BASE/api/texts/TEXT_ID/vocab-cache"
+  "$BASE/api/texts/${TEXT_ID}/vocab-cache"
 grep -iE '^(content-encoding|etag):' /tmp/vocab-headers.txt
 ```
 

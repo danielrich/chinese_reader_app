@@ -1665,31 +1665,16 @@ fn dispatch_sync(conn: &Connection, command: &str, body: &Value) -> Result<Value
             let add_to_vocabulary: bool = field(body, "add_to_vocabulary")?;
             let status: Option<String> = opt_field(body, "status");
             let frequency: i64 = 10000;
-            conn.execute(
-                "INSERT OR IGNORE INTO user_segmentation_words (word, frequency) VALUES (?, ?)",
-                rusqlite::params![&word, frequency],
+            let word_type = if word.chars().count() == 1 {
+                "character"
+            } else {
+                "word"
+            };
+            let vocabulary = add_to_vocabulary.then_some((word_type, status.as_deref()));
+            let known_word = library::analysis::persist_custom_segmentation_word(
+                conn, &word, frequency, vocabulary,
             )
             .map_err(db_err)?;
-            library::analysis::add_segmentation_word(&word, Some(frequency));
-            let known_word = if add_to_vocabulary {
-                let word_type = if word.chars().count() == 1 {
-                    "character"
-                } else {
-                    "word"
-                };
-                Some(
-                    library::known_words::add_known_word(
-                        conn,
-                        &word,
-                        word_type,
-                        status.as_deref(),
-                        None,
-                    )
-                    .map_err(db_err)?,
-                )
-            } else {
-                None
-            };
             serialize(serde_json::json!({
                 "word": word,
                 "added_to_segmentation": true,
@@ -1771,32 +1756,16 @@ fn dispatch_sync(conn: &Connection, command: &str, body: &Value) -> Result<Value
             .map_err(db_err)?;
 
             let frequency: i64 = 10000;
-            conn.execute(
-                "INSERT OR IGNORE INTO user_segmentation_words (word, frequency) VALUES (?, ?)",
-                rusqlite::params![&word, frequency],
+            let word_type = if word.chars().count() == 1 {
+                "character"
+            } else {
+                "word"
+            };
+            let vocabulary = add_to_vocabulary.then_some((word_type, status.as_deref()));
+            let known_word = library::analysis::persist_custom_segmentation_word(
+                conn, &word, frequency, vocabulary,
             )
             .map_err(db_err)?;
-            library::analysis::add_segmentation_word(&word, Some(frequency));
-
-            let known_word = if add_to_vocabulary {
-                let word_type = if word.chars().count() == 1 {
-                    "character"
-                } else {
-                    "word"
-                };
-                Some(
-                    library::known_words::add_known_word(
-                        conn,
-                        &word,
-                        word_type,
-                        status.as_deref(),
-                        None,
-                    )
-                    .map_err(db_err)?,
-                )
-            } else {
-                None
-            };
 
             serialize(serde_json::json!({
                 "word": word,
