@@ -854,7 +854,7 @@ pub fn publish_shelf_analysis(
     shelf_id: i64,
     analysis: &ShelfAnalysis,
     cutoff: DateTime<Utc>,
-) -> Result<()> {
+) -> Result<usize> {
     let data = serde_json::to_string(analysis).map_err(|error| {
         LibraryError::InvalidInput(format!(
             "failed to serialize shelf analysis for shelf {shelf_id}: {error}"
@@ -870,7 +870,7 @@ pub fn publish_shelf_analysis(
         params![shelf_id, data, cutoff.to_rfc3339()],
     )?;
     tx.commit()?;
-    Ok(())
+    Ok(data.len())
 }
 
 /// Statistics about auto-marking unknown words

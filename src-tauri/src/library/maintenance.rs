@@ -3,6 +3,7 @@
 use chrono::{DateTime, Utc};
 use rusqlite::{params, params_from_iter, types::Type, Connection, Transaction};
 use std::path::Path;
+use std::time::Instant;
 
 use crate::dictionary;
 use crate::library::analysis::{
@@ -258,16 +259,33 @@ pub fn run_due_analysis_maintenance(db_path: &Path, cutoff: DateTime<Utc>) -> Ma
     report.claimed = jobs.len();
 
     for shelf_id in jobs {
+        let job_started = Instant::now();
         let result = compute_shelf_analysis(&conn, shelf_id).and_then(|analysis| {
-            publish_shelf_analysis(&mut conn, shelf_id, &analysis, cutoff)?;
-            complete_shelf_job(&conn, shelf_id, cutoff)
+            let output_bytes = publish_shelf_analysis(&mut conn, shelf_id, &analysis, cutoff)?;
+            complete_shelf_job(&conn, shelf_id, cutoff)?;
+            Ok(output_bytes)
         });
 
         match result {
-            Ok(()) => report.succeeded += 1,
+            Ok(output_bytes) => {
+                report.succeeded += 1;
+                eprintln!(
+                    "analysis_maintenance_job cutoff={} shelf_id={} duration_ms={} output_bytes={} success=true",
+                    cutoff,
+                    shelf_id,
+                    job_started.elapsed().as_millis(),
+                    output_bytes
+                );
+            }
             Err(error) => {
                 let error = error.to_string();
                 report.failed += 1;
+                eprintln!(
+                    "analysis_maintenance_job cutoff={} shelf_id={} duration_ms={} output_bytes=0 success=false",
+                    cutoff,
+                    shelf_id,
+                    job_started.elapsed().as_millis()
+                );
                 report.failures.push(MaintenanceJobFailure {
                     shelf_id,
                     error: error.clone(),

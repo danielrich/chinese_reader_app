@@ -11,7 +11,7 @@
 
 use axum::{
     extract::{Path, Request, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -24,12 +24,77 @@ use serde_json::Value;
 use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
 
 const DB_PRAGMAS: &str =
     "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=30000;";
-const WRITE_WAIT_LOG_THRESHOLD: Duration = Duration::from_millis(250);
+const SLOW_REQUEST_THRESHOLD: Duration = Duration::from_millis(250);
+
+#[derive(Default)]
+struct RequestTimings {
+    pool_wait: Duration,
+    write_wait: Duration,
+    blocking: Duration,
+    total: Duration,
+}
+
+fn slow_request_log(command: &str, timings: &RequestTimings) -> Option<String> {
+    (timings.total > SLOW_REQUEST_THRESHOLD).then(|| {
+        format!(
+            "slow_request command={} pool_wait_ms={} write_wait_ms={} blocking_ms={} total_ms={}",
+            command,
+            timings.pool_wait.as_millis(),
+            timings.write_wait.as_millis(),
+            timings.blocking.as_millis(),
+            timings.total.as_millis()
+        )
+    })
+}
+
+fn emit_slow_request(command: &str, timings: RequestTimings) {
+    if let Some(line) = slow_request_log(command, &timings) {
+        eprintln!("{line}");
+    }
+}
+
+fn weak_etag_matches(if_none_match: Option<&HeaderValue>, etag: &str) -> bool {
+    let Some(value) = if_none_match.and_then(|value| value.to_str().ok()) else {
+        return false;
+    };
+    let target = etag.strip_prefix("W/").unwrap_or(etag);
+    value.split(',').map(str::trim).any(|candidate| {
+        candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == target
+    })
+}
+
+fn text_vocab_etag(conn: &Connection, text_id: i64) -> Result<String, ApiError> {
+    let version: (String, Option<i64>, Option<String>) = conn
+        .query_row(
+            "SELECT texts.updated_at, text_analyses.id, text_analyses.analyzed_at
+             FROM texts LEFT JOIN text_analyses ON text_analyses.text_id = texts.id
+             WHERE texts.id = ?1",
+            [text_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => not_found(format!("Text {text_id} not found")),
+            other => db_err(other),
+        })?;
+    let source = format!(
+        "{text_id}\0{}\0{}\0{}",
+        version.0,
+        version.1.unwrap_or_default(),
+        version.2.unwrap_or_default()
+    );
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in source.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Ok(format!("\"text-vocab-{text_id}-{hash:016x}\""))
+}
 
 fn local_maintenance_cutoff(date: NaiveDate) -> DateTime<Local> {
     Local
@@ -95,18 +160,20 @@ async fn execute_scheduled_maintenance(db_path: std::path::PathBuf, cutoff: Date
     .await
     {
         Ok(report) => eprintln!(
-            "Shelf analysis maintenance cutoff={} claimed={} succeeded={} failed={} still_dirty={} elapsed={:?} fatal_error={:?}",
+            "analysis_maintenance cutoff={} duration_ms={} claimed={} succeeded={} failed={} final_dirty={} fatal_error={:?}",
             report.cutoff,
+            started.elapsed().as_millis(),
             report.claimed,
             report.succeeded,
             report.failed,
             report.still_dirty,
-            started.elapsed(),
             report.fatal_error
         ),
         Err(error) => eprintln!(
-            "Shelf analysis maintenance worker failed cutoff={} elapsed={:?}: {}",
-            cutoff, started.elapsed(), error
+            "analysis_maintenance cutoff={} duration_ms={} success=false worker_error={}",
+            cutoff,
+            started.elapsed().as_millis(),
+            error
         ),
     }
 }
@@ -402,12 +469,13 @@ async fn main() {
         .route("/api/texts/{id}", get(get_text_handler))
         .route(
             "/api/texts/{id}/vocab-cache",
-            get(get_text_vocab_cache_handler),
+            get(get_text_vocab_cache_handler_with_headers),
         )
         .route("/api/sync/sessions", post(sync_sessions_handler))
         .fallback_service(serve_static)
         .with_state(db)
         .layer(middleware::from_fn(add_static_cache_headers))
+        .layer(CompressionLayer::new().gzip(true))
         .layer(cors);
 
     let addr: std::net::SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
@@ -447,22 +515,28 @@ async fn dispatch(
     Path(command): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, AppError> {
+    let total_started = Instant::now();
+    let mut timings = RequestTimings::default();
     let _write_permit = if is_write_command(&command) {
         let started = Instant::now();
         let permit = db.acquire_write_permit().await;
-        let waited = started.elapsed();
-        if waited >= WRITE_WAIT_LOG_THRESHOLD {
-            eprintln!("Write command '{command}' waited {waited:?} for the SQLite write lane");
-        }
+        timings.write_wait = started.elapsed();
         Some(permit)
     } else {
         None
     };
 
+    let pool_started = Instant::now();
     let conn = db.acquire().await;
-    let result = tokio::task::spawn_blocking(move || dispatch_sync(&conn, &command, &body))
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))??;
+    timings.pool_wait = pool_started.elapsed();
+    let blocking_started = Instant::now();
+    let work_command = command.clone();
+    let result =
+        tokio::task::spawn_blocking(move || dispatch_sync(&conn, &work_command, &body)).await;
+    timings.blocking = blocking_started.elapsed();
+    timings.total = total_started.elapsed();
+    emit_slow_request(&command, timings);
+    let result = result.map_err(|e| ApiError::Internal(e.to_string()))??;
     Ok(Json(result))
 }
 
@@ -470,43 +544,211 @@ async fn get_text_handler(
     State(db): State<Db>,
     Path(id): Path<i64>,
 ) -> Result<Json<Value>, AppError> {
+    let total_started = Instant::now();
+    let pool_started = Instant::now();
     let conn = db.acquire().await;
+    let pool_wait = pool_started.elapsed();
+    let blocking_started = Instant::now();
     let result = tokio::task::spawn_blocking(move || {
         let text = library::text::get_text(&conn, id)
             .map_err(db_err)?
             .ok_or_else(|| not_found(format!("Text {} not found", id)))?;
         serialize(text)
     })
-    .await
-    .map_err(|e| ApiError::Internal(e.to_string()))??;
+    .await;
+    emit_slow_request(
+        "get_text",
+        RequestTimings {
+            pool_wait,
+            blocking: blocking_started.elapsed(),
+            total: total_started.elapsed(),
+            ..Default::default()
+        },
+    );
+    let result = result.map_err(|e| ApiError::Internal(e.to_string()))??;
     Ok(Json(result))
 }
 
-async fn get_text_vocab_cache_handler(
+async fn get_text_vocab_cache_handler_with_headers(
     State(db): State<Db>,
     Path(id): Path<i64>,
-) -> Result<Json<Value>, AppError> {
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let total_started = Instant::now();
+    let pool_started = Instant::now();
     let conn = db.acquire().await;
-    let result = tokio::task::spawn_blocking(move || {
-        serialize(library::analysis::get_text_vocab_cache(&conn, id).map_err(db_err)?)
-    })
-    .await
-    .map_err(|e| ApiError::Internal(e.to_string()))??;
-    Ok(Json(result))
+    let pool_wait = pool_started.elapsed();
+    let blocking_started = Instant::now();
+    let result =
+        tokio::task::spawn_blocking(move || -> Result<(String, Option<Value>), ApiError> {
+            let etag = text_vocab_etag(&conn, id)?;
+            if weak_etag_matches(headers.get(header::IF_NONE_MATCH), &etag) {
+                return Ok((etag, None));
+            }
+            let value =
+                serialize(library::analysis::get_text_vocab_cache(&conn, id).map_err(db_err)?)?;
+            Ok((etag, Some(value)))
+        })
+        .await;
+    emit_slow_request(
+        "get_text_vocab_cache",
+        RequestTimings {
+            pool_wait,
+            blocking: blocking_started.elapsed(),
+            total: total_started.elapsed(),
+            ..Default::default()
+        },
+    );
+    let result = result.map_err(|e| ApiError::Internal(e.to_string()))??;
+    let (etag, value) = result;
+    let mut response = match value {
+        Some(value) => Json(value).into_response(),
+        None => StatusCode::NOT_MODIFIED.into_response(),
+    };
+    response.headers_mut().insert(
+        header::ETAG,
+        HeaderValue::from_str(&etag).map_err(|e| ApiError::Internal(e.to_string()))?,
+    );
+    Ok(response)
+}
+
+#[cfg(test)]
+mod server_performance_tests {
+    use super::{
+        get_text_vocab_cache_handler_with_headers, slow_request_log, text_vocab_etag,
+        weak_etag_matches, DbPool, RequestTimings,
+    };
+    use axum::{
+        body::{to_bytes, Body, HttpBody},
+        extract::{Path, State},
+        http::{header, HeaderMap, HeaderValue, Request, StatusCode},
+        response::IntoResponse,
+        routing::get,
+        Router,
+    };
+    use rusqlite::Connection;
+    use std::time::Duration;
+    use tower::ServiceExt;
+    use tower_http::compression::CompressionLayer;
+
+    #[tokio::test]
+    async fn gzip_accept_encoding_compresses_json() {
+        let app = Router::new()
+            .route(
+                "/json",
+                get(|| async {
+                    axum::Json(serde_json::json!({ "data": "x".repeat(4096) })).into_response()
+                }),
+            )
+            .layer(CompressionLayer::new().gzip(true));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/json")
+                    .header(header::ACCEPT_ENCODING, "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers().get(header::CONTENT_ENCODING).unwrap(),
+            "gzip"
+        );
+        assert!(!to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn if_none_match_uses_weak_comparison() {
+        let etag = "\"text-vocab-7-abc\"";
+        assert!(weak_etag_matches(
+            Some(&HeaderValue::from_static("W/\"text-vocab-7-abc\"")),
+            etag
+        ));
+        assert!(weak_etag_matches(
+            Some(&HeaderValue::from_static(
+                "\"other\", W/\"text-vocab-7-abc\""
+            )),
+            etag
+        ));
+        assert!(!weak_etag_matches(
+            Some(&HeaderValue::from_static("\"other\"")),
+            etag
+        ));
+    }
+
+    #[test]
+    fn vocabulary_etag_is_quoted_and_tracks_text_and_analysis_versions() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE texts (id INTEGER PRIMARY KEY, updated_at TEXT NOT NULL); CREATE TABLE text_analyses (id INTEGER PRIMARY KEY, text_id INTEGER UNIQUE, analyzed_at TEXT); INSERT INTO texts VALUES (7, 'v1'); INSERT INTO text_analyses VALUES (1, 7, 'a1');").unwrap();
+        let first = text_vocab_etag(&conn, 7).unwrap();
+        assert!(first.starts_with('"') && first.ends_with('"'));
+        conn.execute("UPDATE texts SET updated_at = 'v2' WHERE id = 7", [])
+            .unwrap();
+        let text_changed = text_vocab_etag(&conn, 7).unwrap();
+        assert_ne!(first, text_changed);
+        conn.execute(
+            "UPDATE text_analyses SET id = 2, analyzed_at = 'a2' WHERE text_id = 7",
+            [],
+        )
+        .unwrap();
+        assert_ne!(text_changed, text_vocab_etag(&conn, 7).unwrap());
+    }
+
+    #[test]
+    fn only_slow_samples_log_phase_timings_without_request_content() {
+        let fast = RequestTimings {
+            total: Duration::from_millis(250),
+            ..Default::default()
+        };
+        assert!(slow_request_log("dictionary_lookup", &fast).is_none());
+        let slow = RequestTimings {
+            pool_wait: Duration::from_millis(1),
+            write_wait: Duration::from_millis(2),
+            blocking: Duration::from_millis(248),
+            total: Duration::from_millis(251),
+        };
+        let line = slow_request_log("dictionary_lookup", &slow).unwrap();
+        assert_eq!(line, "slow_request command=dictionary_lookup pool_wait_ms=1 write_wait_ms=2 blocking_ms=248 total_ms=251");
+        assert!(!line.contains("query") && !line.contains("content"));
+    }
+
+    #[tokio::test]
+    async fn matching_vocab_etag_returns_304_with_no_body() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE texts (id INTEGER PRIMARY KEY, updated_at TEXT NOT NULL); CREATE TABLE text_analyses (id INTEGER PRIMARY KEY, text_id INTEGER UNIQUE, analyzed_at TEXT); INSERT INTO texts VALUES (7, 'v1'); INSERT INTO text_analyses VALUES (1, 7, 'a1');").unwrap();
+        let etag = text_vocab_etag(&conn, 7).unwrap();
+        let db = DbPool::new(vec![conn]);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::IF_NONE_MATCH,
+            HeaderValue::from_str(&format!("W/{etag}")).unwrap(),
+        );
+        let response = get_text_vocab_cache_handler_with_headers(State(db), Path(7), headers)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(response.headers().get(header::ETAG).unwrap(), etag.as_str());
+        assert_eq!(response.body().size_hint().lower(), 0);
+    }
 }
 
 async fn sync_sessions_handler(
     State(db): State<Db>,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, AppError> {
+    let total_started = Instant::now();
     let started = Instant::now();
     let _write_permit = db.acquire_write_permit().await;
-    let waited = started.elapsed();
-    if waited >= WRITE_WAIT_LOG_THRESHOLD {
-        eprintln!("Session sync waited {waited:?} for the SQLite write lane");
-    }
+    let write_wait = started.elapsed();
 
+    let pool_started = Instant::now();
     let conn = db.acquire().await;
+    let pool_wait = pool_started.elapsed();
+    let blocking_started = Instant::now();
     let result = tokio::task::spawn_blocking(move || {
         let sessions: Vec<library::speed::UploadSession> = serde_json::from_value(
             body.get("sessions")
@@ -520,8 +762,17 @@ async fn sync_sessions_handler(
         }
         serialize(serde_json::json!({ "session_ids": ids }))
     })
-    .await
-    .map_err(|e| ApiError::Internal(e.to_string()))??;
+    .await;
+    emit_slow_request(
+        "sync_sessions",
+        RequestTimings {
+            pool_wait,
+            write_wait,
+            blocking: blocking_started.elapsed(),
+            total: total_started.elapsed(),
+        },
+    );
+    let result = result.map_err(|e| ApiError::Internal(e.to_string()))??;
     Ok(Json(result))
 }
 
@@ -544,6 +795,7 @@ impl From<ApiError> for AppError {
     }
 }
 
+#[derive(Debug)]
 struct AppError(String, StatusCode);
 
 impl IntoResponse for AppError {
