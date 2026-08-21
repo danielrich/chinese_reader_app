@@ -617,11 +617,10 @@ fn get_all_descendant_shelf_ids(conn: &Connection, shelf_id: i64) -> Result<Vec<
 }
 
 /// Return cached shelf analysis state without performing analysis work.
-pub fn get_shelf_analysis_status(
+fn read_cached_shelf_analysis_status(
     conn: &Connection,
     shelf_id: i64,
-    now: DateTime<Utc>,
-) -> Result<ShelfAnalysisStatus> {
+) -> Result<Option<ShelfAnalysisStatus>> {
     let cached = conn
         .query_row(
             "SELECT cache.data, cache.cached_at, jobs.dirty_at, jobs.last_error
@@ -646,15 +645,31 @@ pub fn get_shelf_analysis_status(
                 "invalid cached shelf analysis for shelf {shelf_id}: {error}"
             ))
         })?;
-        return Ok(ShelfAnalysisStatus::Ready {
+        return Ok(Some(ShelfAnalysisStatus::Ready {
             analysis,
             cached_at,
             is_stale: dirty_at.is_some(),
             last_error,
-        });
+        }));
+    }
+
+    Ok(None)
+}
+
+/// Return cached shelf analysis state without performing analysis work.
+pub fn get_shelf_analysis_status(
+    conn: &Connection,
+    shelf_id: i64,
+    now: DateTime<Utc>,
+) -> Result<ShelfAnalysisStatus> {
+    if let Some(status) = read_cached_shelf_analysis_status(conn, shelf_id)? {
+        return Ok(status);
     }
 
     maintenance::request_shelf_analysis(conn, shelf_id, now)?;
+    if let Some(status) = read_cached_shelf_analysis_status(conn, shelf_id)? {
+        return Ok(status);
+    }
     let (requested_at, last_error) = conn.query_row(
         "SELECT requested_at, last_error FROM analysis_shelf_jobs WHERE shelf_id = ?1",
         [shelf_id],
@@ -1493,17 +1508,31 @@ fn get_character_context_from_shelves(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dictionary;
     use crate::dictionary::schema::init_database;
-    use crate::library::maintenance::mark_analysis_dirty;
+    use crate::library::maintenance::{claim_due_jobs, mark_analysis_dirty};
     use crate::library::models::ShelfAnalysisStatus;
     use crate::library::shelf::create_shelf;
     use crate::library::text::create_text;
     use chrono::{DateTime, Utc};
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{Duration, Instant};
+
+    static NEXT_STATUS_TEST_DB: AtomicU64 = AtomicU64::new(0);
 
     fn setup_test_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         init_database(&conn).unwrap();
         conn
+    }
+
+    fn temporary_db_path() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "chinese-reader-status-{}-{}.sqlite3",
+            std::process::id(),
+            NEXT_STATUS_TEST_DB.fetch_add(1, Ordering::Relaxed)
+        ))
     }
 
     fn utc(value: &str) -> DateTime<Utc> {
@@ -1591,6 +1620,98 @@ mod tests {
             .unwrap();
         assert_eq!(job.0, "2026-08-20T02:00:00+00:00");
         assert_eq!(job.1, "2026-08-20T02:00:00+00:00");
+    }
+
+    #[test]
+    fn shelf_analysis_status_rechecks_cache_after_enqueue_before_returning_pending() {
+        let conn = setup_test_db();
+        let shelf = create_shelf(&conn, "Test", None, None).unwrap();
+        let published = cached_analysis(shelf.id, 52);
+        conn.execute("CREATE TABLE race_publication (data TEXT NOT NULL)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO race_publication (data) VALUES (?1)",
+            [serde_json::to_string(&published).unwrap()],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER publish_cache_during_request
+             BEFORE INSERT ON analysis_shelf_jobs
+             BEGIN
+                 INSERT INTO shelf_analyses_cache (shelf_id, data, cached_at)
+                 SELECT NEW.shelf_id, data, '2026-08-20T02:00:00+00:00'
+                 FROM race_publication;
+             END;",
+        )
+        .unwrap();
+
+        let status =
+            get_shelf_analysis_status(&conn, shelf.id, utc("2026-08-20T02:00:00Z")).unwrap();
+
+        assert!(matches!(
+            status,
+            ShelfAnalysisStatus::Ready {
+                analysis: ShelfAnalysis { text_count: 52, .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn cached_status_read_completes_while_publication_transaction_is_open() {
+        let path = temporary_db_path();
+        let writer = dictionary::init_connection(&path).unwrap();
+        writer.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+        writer
+            .execute("INSERT INTO shelves (id, name) VALUES (4, 'Shelf 4')", [])
+            .unwrap();
+        let old_analysis = cached_analysis(4, 37);
+        let new_analysis = cached_analysis(4, 52);
+        writer
+            .execute(
+                "INSERT INTO shelf_analyses_cache (shelf_id, data, cached_at)
+                 VALUES (4, ?1, '2026-08-19T00:05:00+00:00')",
+                [serde_json::to_string(&old_analysis).unwrap()],
+            )
+            .unwrap();
+        mark_analysis_dirty(&writer, &[4], utc("2026-08-20T01:00:00Z")).unwrap();
+        assert_eq!(
+            claim_due_jobs(&writer, utc("2026-08-20T05:05:00Z")).unwrap(),
+            vec![4]
+        );
+        let reader = Connection::open(&path).unwrap();
+        reader.busy_timeout(Duration::ZERO).unwrap();
+
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        writer
+            .execute(
+                "UPDATE shelf_analyses_cache
+                 SET data = ?1, cached_at = '2026-08-20T05:05:00+00:00'
+                 WHERE shelf_id = 4",
+                [serde_json::to_string(&new_analysis).unwrap()],
+            )
+            .unwrap();
+
+        let read_started = Instant::now();
+        let status = get_shelf_analysis_status(&reader, 4, utc("2026-08-20T05:06:00Z")).unwrap();
+        let read_elapsed = read_started.elapsed();
+
+        assert!(matches!(
+            status,
+            ShelfAnalysisStatus::Ready {
+                analysis: ShelfAnalysis { text_count: 37, .. },
+                is_stale: true,
+                ..
+            }
+        ));
+        assert!(
+            read_elapsed < Duration::from_secs(1),
+            "cached status read took {read_elapsed:?} while publication was open"
+        );
+        writer.execute_batch("ROLLBACK").unwrap();
+        drop(reader);
+        drop(writer);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

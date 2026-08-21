@@ -68,32 +68,21 @@ pub fn request_shelf_analysis(conn: &Connection, shelf_id: i64, at: DateTime<Utc
     let at = at.to_rfc3339();
     let tx = conn.unchecked_transaction()?;
 
-    update_task_dirty(&tx, &at)?;
-    tx.execute(
+    let changed = tx.execute(
         "INSERT INTO analysis_shelf_jobs (shelf_id, dirty_at, requested_at)
-         VALUES (?1, ?2, ?2)
+         SELECT ?1, ?2, ?2
+         WHERE NOT EXISTS (
+             SELECT 1 FROM shelf_analyses_cache WHERE shelf_id = ?1
+         )
          ON CONFLICT(shelf_id) DO UPDATE SET
              requested_at = excluded.requested_at,
-             dirty_at = CASE
-                 WHEN analysis_shelf_jobs.dirty_at IS NULL
-                   OR excluded.dirty_at < analysis_shelf_jobs.dirty_at
-                   OR (
-                       analysis_shelf_jobs.dirty_at <= (
-                           SELECT last_started_at
-                           FROM analysis_maintenance
-                           WHERE task = 'shelf_analysis'
-                       )
-                       AND excluded.dirty_at > (
-                           SELECT last_started_at
-                           FROM analysis_maintenance
-                           WHERE task = 'shelf_analysis'
-                       )
-                   )
-                 THEN excluded.dirty_at
-                 ELSE analysis_shelf_jobs.dirty_at
-             END",
+             dirty_at = excluded.dirty_at
+         WHERE analysis_shelf_jobs.dirty_at IS NULL",
         params![shelf_id, at],
     )?;
+    if changed > 0 {
+        update_task_dirty(&tx, &at)?;
+    }
 
     tx.commit()?;
     Ok(())
@@ -521,6 +510,67 @@ mod tests {
             maintenance_snapshot(&conn).unwrap().dirty_at,
             Some(utc("2026-08-20T05:05:00Z"))
         );
+    }
+
+    #[test]
+    fn polling_claimed_missing_job_does_not_create_post_cutoff_dirtiness() {
+        let conn = setup_test_db();
+        request_shelf_analysis(&conn, 7, utc("2026-08-20T01:00:00Z")).unwrap();
+        assert_eq!(
+            claim_due_jobs(&conn, utc("2026-08-20T05:05:00Z")).unwrap(),
+            vec![7]
+        );
+
+        request_shelf_analysis(&conn, 7, utc("2026-08-20T06:00:00Z")).unwrap();
+
+        let (requested_at, dirty_at): (String, String) = conn
+            .query_row(
+                "SELECT requested_at, dirty_at FROM analysis_shelf_jobs WHERE shelf_id = 7",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(requested_at, "2026-08-20T01:00:00+00:00");
+        assert_eq!(dirty_at, "2026-08-20T01:00:00+00:00");
+
+        complete_shelf_job(&conn, 7, utc("2026-08-20T05:05:00Z")).unwrap();
+        let remaining_dirty_at: Option<String> = conn
+            .query_row(
+                "SELECT dirty_at FROM analysis_shelf_jobs WHERE shelf_id = 7",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(remaining_dirty_at.is_none());
+    }
+
+    #[test]
+    fn request_after_publication_does_not_redirty_completed_job() {
+        let conn = setup_test_db();
+        request_shelf_analysis(&conn, 7, utc("2026-08-20T01:00:00Z")).unwrap();
+        assert_eq!(
+            claim_due_jobs(&conn, utc("2026-08-20T05:05:00Z")).unwrap(),
+            vec![7]
+        );
+        conn.execute(
+            "INSERT INTO shelf_analyses_cache (shelf_id, data, cached_at)
+             VALUES (7, ?1, '2026-08-20T05:05:00+00:00')",
+            [serde_json::to_string(&empty_analysis(7)).unwrap()],
+        )
+        .unwrap();
+        complete_shelf_job(&conn, 7, utc("2026-08-20T05:05:00Z")).unwrap();
+
+        request_shelf_analysis(&conn, 7, utc("2026-08-20T06:00:00Z")).unwrap();
+
+        let dirty_at: Option<String> = conn
+            .query_row(
+                "SELECT dirty_at FROM analysis_shelf_jobs WHERE shelf_id = 7",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(dirty_at.is_none());
+        assert!(maintenance_snapshot(&conn).unwrap().dirty_at.is_none());
     }
 
     #[test]
