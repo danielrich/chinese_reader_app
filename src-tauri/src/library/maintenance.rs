@@ -168,6 +168,7 @@ pub fn claim_due_jobs(conn: &Connection, cutoff: DateTime<Utc>) -> Result<Vec<i6
         jobs
     };
 
+    reconcile_task_dirty(&tx)?;
     tx.execute(
         "UPDATE analysis_maintenance
          SET last_started_at = ?1
@@ -176,6 +177,22 @@ pub fn claim_due_jobs(conn: &Connection, cutoff: DateTime<Utc>) -> Result<Vec<i6
     )?;
     tx.commit()?;
     Ok(jobs)
+}
+
+/// Reconciles singleton dirtiness with the earliest surviving shelf job.
+/// Call this in the same transaction as shelf deletion so cascaded jobs cannot
+/// leave a permanently dirty singleton behind.
+pub fn reconcile_task_dirty(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE analysis_maintenance
+         SET dirty_at = (
+             SELECT MIN(dirty_at) FROM analysis_shelf_jobs
+             WHERE dirty_at IS NOT NULL
+         )
+         WHERE task = ?1",
+        [TASK],
+    )?;
+    Ok(())
 }
 
 /// Records successful completion, clearing only dirtiness observed by the cutoff.
@@ -338,7 +355,10 @@ fn complete_task_if_no_due_jobs(
     if !due_job_exists {
         tx.execute(
             "UPDATE analysis_maintenance
-             SET dirty_at = CASE WHEN dirty_at <= ?1 THEN NULL ELSE dirty_at END,
+             SET dirty_at = (
+                     SELECT MIN(dirty_at) FROM analysis_shelf_jobs
+                     WHERE dirty_at IS NOT NULL
+                 ),
                  last_completed_at = CASE
                      WHEN dirty_at <= ?1 THEN ?1
                      ELSE last_completed_at
@@ -863,6 +883,32 @@ mod tests {
     }
 
     #[test]
+    fn deleting_the_only_dirty_shelf_clears_singleton_dirtiness() {
+        let conn = setup_test_db();
+        request_shelf_analysis(&conn, 7, utc("2026-08-20T01:00:00Z")).unwrap();
+
+        shelf::delete_shelf(&conn, 7).unwrap();
+
+        assert!(job_ids(&conn, false).is_empty());
+        assert_eq!(maintenance_snapshot(&conn).unwrap().dirty_at, None);
+    }
+
+    #[test]
+    fn empty_claim_reconciles_orphaned_singleton_dirtiness() {
+        let conn = setup_test_db();
+        conn.execute(
+            "UPDATE analysis_maintenance SET dirty_at = ?1 WHERE task = ?2",
+            params!["2026-08-20T01:00:00+00:00", TASK],
+        )
+        .unwrap();
+
+        assert!(claim_due_jobs(&conn, utc("2026-08-20T05:05:00Z"))
+            .unwrap()
+            .is_empty());
+        assert_eq!(maintenance_snapshot(&conn).unwrap().dirty_at, None);
+    }
+
+    #[test]
     fn migration_creates_maintenance_tables_and_singleton_idempotently() {
         let conn = setup_test_db();
         crate::dictionary::schema::init_database(&conn).unwrap();
@@ -1006,6 +1052,24 @@ mod tests {
         mark_analysis_dirty(&conn, &[7], utc("2026-08-20T06:00:00Z")).unwrap();
         complete_shelf_job(&conn, 7, utc("2026-08-20T05:05:00Z")).unwrap();
         assert!(maintenance_snapshot(&conn).unwrap().dirty_at.is_some());
+    }
+
+    #[test]
+    fn completing_due_job_reconciles_singleton_to_separate_future_job() {
+        let conn = setup_test_db();
+        mark_analysis_dirty(&conn, &[7], utc("2026-08-20T04:00:00Z")).unwrap();
+        mark_analysis_dirty(&conn, &[8], utc("2026-08-20T06:00:00Z")).unwrap();
+        assert_eq!(
+            claim_due_jobs(&conn, utc("2026-08-20T05:05:00Z")).unwrap(),
+            vec![7]
+        );
+
+        complete_shelf_job(&conn, 7, utc("2026-08-20T05:05:00Z")).unwrap();
+
+        assert_eq!(
+            maintenance_snapshot(&conn).unwrap().dirty_at,
+            Some(utc("2026-08-20T06:00:00Z"))
+        );
     }
 
     #[test]

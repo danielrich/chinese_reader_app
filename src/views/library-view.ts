@@ -330,6 +330,8 @@ function renderShelfContents(
   textCache: Map<number, CacheMetadata>,
   bundleStatuses: Map<number, OfflineTextBundleStatus>,
 ) {
+  const shelfNode = findShelfById(shelfTree, shelfId);
+  const hasAnyTexts = (shelfNode?.text_count ?? texts.length) > 0;
   const offlineDownloadError = offlineDownloadErrors.get(shelfId);
   const shelfAnalysis = shelfAnalysisStatus?.status === "ready" ? shelfAnalysisStatus.analysis : null;
   const hasTexts = shelfAnalysis !== null && shelfAnalysis.text_count > 0;
@@ -367,7 +369,7 @@ function renderShelfContents(
         </div>
   `;
 
-  html += renderShelfAnalysisSection(shelfAnalysisStatus, analysisState, texts.length > 0);
+  html += renderShelfAnalysisSection(shelfAnalysisStatus, analysisState, hasAnyTexts);
 
   if (texts.length === 0) {
     html += `<p class="empty-message">No texts in this shelf yet. Add one to get started.</p>`;
@@ -729,11 +731,14 @@ async function loadTextView(textId: number) {
   try {
     const cachedText = !navigator.onLine ? await getTextCache(textId).catch(() => null) : null;
     const text = cachedText ?? await library.getText(textId);
-    const textCache = await getTextCacheMetadata(textId).catch(() => null);
-    setCurrentTextCharacterCount(text.character_count);
-
-    setActiveSession(await getInProgressSessionForText(textId));
+    const [textCache, session] = await Promise.all([
+      getTextCacheMetadata(textId).catch(() => null),
+      getInProgressSessionForText(textId),
+    ]);
     if (viewToken !== libraryViewToken) return;
+    setCurrentTextCharacterCount(text.character_count);
+    setActiveSession(session);
+    setCurrentTextId(textId);
 
     const currentTextIndex = currentShelfTexts.findIndex(t => t.id === textId);
     const hasPrevSection = currentTextIndex > 0;
@@ -823,7 +828,7 @@ async function loadTextView(textId: number) {
 
     mainContainer.innerHTML = html;
 
-    loadInteractiveText(text.content, textId);
+    loadInteractiveText(text.content, textId, viewToken);
 
     if (activeSession) {
       startSessionTimer();
@@ -1236,13 +1241,14 @@ async function loadReadingHistory(textId: number) {
   }
 }
 
-async function loadInteractiveText(content: string, textId: number) {
+async function loadInteractiveText(content: string, textId: number, viewToken = libraryViewToken) {
+  const ownsView = () => viewToken === libraryViewToken && currentTextId === textId;
+  if (!ownsView()) return;
   const container = document.getElementById("text-content-interactive");
   if (!container) return;
 
-  setCurrentTextId(textId);
-
   const renderSegments = (segments: library.TextSegment[]) => {
+    if (!ownsView() || !container.isConnected) return;
     setCurrentTextSegments(segments);
 
     let html = "";
@@ -1279,6 +1285,7 @@ async function loadInteractiveText(content: string, textId: number) {
 
   try {
     const cachedSegments = await getTextSegments(textId).catch(() => null);
+    if (!ownsView()) return;
 
     if (!navigator.onLine && cachedSegments) {
       renderSegments(cachedSegments);
@@ -1291,6 +1298,7 @@ async function loadInteractiveText(content: string, textId: number) {
 
     try {
       const segments = await library.segmentText(content);
+      if (!ownsView()) return;
       saveTextSegments(textId, segments).catch((err) =>
         console.warn("save text-segments failed:", err),
       );
@@ -1299,6 +1307,7 @@ async function loadInteractiveText(content: string, textId: number) {
       if (!cachedSegments) throw segmentError;
     }
   } catch (error) {
+    if (!ownsView()) return;
     container.innerHTML = `<p class="error">Failed to load text: ${error}</p>`;
   }
 }

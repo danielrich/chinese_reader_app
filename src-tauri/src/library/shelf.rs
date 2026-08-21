@@ -373,6 +373,7 @@ pub fn delete_shelf(conn: &Connection, id: i64) -> Result<()> {
 
     tx.execute("DELETE FROM shelves WHERE id = ?", [id])?;
     mark_analysis_dirty_in_transaction(&tx, &dirty_shelf_ids, Utc::now())?;
+    crate::library::maintenance::reconcile_task_dirty(&tx)?;
     tx.commit()?;
     Ok(())
 }

@@ -152,22 +152,19 @@ test -x "$CR_LIVE_SERVER"
 test -d "$CR_LIVE_DIST"
 test -f "$CR_LIVE_DIST/index.html"
 
-readonly CR_STAGE="$(mktemp -d "$CR_APP/.rollback-stage.XXXXXX")"
-readonly CR_HOLD="$(mktemp -d "$CR_APP/.rollback-hold.XXXXXX")"
-readonly CR_FAILED="$(mktemp -d "$CR_APP/.rollback-failed.XXXXXX")"
-install -m 0755 "$CR_ROLLBACK/server" "$CR_STAGE/server"
-cp -a "$CR_ROLLBACK/dist" "$CR_STAGE/dist"
-test -x "$CR_STAGE/server"
-test -f "$CR_STAGE/dist/index.html"
-
-readonly CR_APP_DEVICE="$(stat -c %d "$CR_APP")"
-test "$(stat -c %d "$CR_STAGE")" = "$CR_APP_DEVICE"
-test "$(stat -c %d "$CR_HOLD")" = "$CR_APP_DEVICE"
-test "$(stat -c %d "$CR_FAILED")" = "$CR_APP_DEVICE"
-test "$(stat -c %d "$(dirname "$CR_LIVE_SERVER")")" = "$CR_APP_DEVICE"
-test "$(stat -c %d "$CR_LIVE_DIST")" = "$CR_APP_DEVICE"
-
+CR_STAGE=
+CR_HOLD=
+CR_FAILED=
 CR_SERVICE_TOUCHED=0
+
+cleanup_rollback_directory() {
+  case "$1" in
+    "$CR_APP"/.rollback-*) test ! -e "$1" || rm -rf -- "$1" ;;
+    "") ;;
+    *) echo "Refusing to clean unexpected rollback path: $1" >&2; return 1 ;;
+  esac
+}
+
 recover_original_deployment() {
   readonly failure_status="$?"
   trap - ERR EXIT INT TERM
@@ -183,13 +180,39 @@ recover_original_deployment() {
       mv "$CR_HOLD/dist" "$CR_LIVE_DIST"
     fi
     systemctl start chinese-reader
+    echo "Rollback swap failed; originals restored. Partial replacements: $CR_FAILED" >&2
+  else
+    cleanup_rollback_directory "$CR_STAGE"
+    cleanup_rollback_directory "$CR_HOLD"
+    cleanup_rollback_directory "$CR_FAILED"
   fi
-  echo "Rollback swap failed; originals restored. Partial replacements: $CR_FAILED" >&2
   exit "$failure_status"
 }
 trap recover_original_deployment ERR EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+CR_STAGE="$(mktemp -d "$CR_APP/.rollback-stage.XXXXXX")"
+test -n "$CR_STAGE" && test "$(dirname "$CR_STAGE")" = "$CR_APP"
+readonly CR_STAGE
+CR_HOLD="$(mktemp -d "$CR_APP/.rollback-hold.XXXXXX")"
+test -n "$CR_HOLD" && test "$(dirname "$CR_HOLD")" = "$CR_APP"
+readonly CR_HOLD
+CR_FAILED="$(mktemp -d "$CR_APP/.rollback-failed.XXXXXX")"
+test -n "$CR_FAILED" && test "$(dirname "$CR_FAILED")" = "$CR_APP"
+readonly CR_FAILED
+
+readonly CR_APP_DEVICE="$(stat -c %d "$CR_APP")"
+test "$(stat -c %d "$CR_STAGE")" = "$CR_APP_DEVICE"
+test "$(stat -c %d "$CR_HOLD")" = "$CR_APP_DEVICE"
+test "$(stat -c %d "$CR_FAILED")" = "$CR_APP_DEVICE"
+test "$(stat -c %d "$(dirname "$CR_LIVE_SERVER")")" = "$CR_APP_DEVICE"
+test "$(stat -c %d "$CR_LIVE_DIST")" = "$CR_APP_DEVICE"
+
+install -m 0755 "$CR_ROLLBACK/server" "$CR_STAGE/server"
+cp -a "$CR_ROLLBACK/dist" "$CR_STAGE/dist"
+test -x "$CR_STAGE/server"
+test -f "$CR_STAGE/dist/index.html"
 
 CR_SERVICE_TOUCHED=1
 systemctl stop chinese-reader

@@ -246,6 +246,129 @@ test("lazy analysis waits for details and renders pending nightly status", async
   await expect.poll(() => analysisRequests).toBe(1);
 });
 
+test("parent shelf with only descendant texts can request aggregate analysis", async ({ page }) => {
+  let requestedShelf: number | null = null;
+  await mockLibraryApi(page);
+  await page.route("**/api/invoke/get_shelf_tree", (route) => route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify([{
+      shelf: { id: 1, name: "Parent", description: null, parent_id: null, sort_order: 0, created_at: "2026-01-01", updated_at: "2026-01-01" },
+      text_count: 1,
+      unread_count: 1,
+      children: [{
+        shelf: { id: 2, name: "Child", description: null, parent_id: 1, sort_order: 0, created_at: "2026-01-01", updated_at: "2026-01-01" },
+        text_count: 1,
+        unread_count: 1,
+        children: [],
+      }],
+    }]),
+  }));
+  await page.route("**/api/invoke/list_texts_in_shelf", (route) => route.fulfill({ status: 200, contentType: "application/json", body: "[]" }));
+  await page.route("**/api/invoke/get_shelf_analysis", async (route) => {
+    requestedShelf = (await route.request().postDataJSON()).shelf_id;
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ status: "pending", requested_at: "2026-08-20T19:00:00Z", last_error: null }) });
+  });
+
+  await bootstrapControlledApp(page);
+  await page.getByRole("button", { name: "Library" }).click();
+  await page.locator('.shelf-item[data-shelf-id="1"]').click();
+  await expect(page.locator(".shelf-analysis-details")).toBeVisible();
+  await page.locator(".shelf-analysis-summary").click();
+
+  await expect.poll(() => requestedShelf).toBe(1);
+});
+
+test("delayed text navigation cannot replace the newer text or its segments", async ({ page }) => {
+  await mockLibraryApi(page);
+  await page.unroute("**/api/invoke/**");
+  await page.route("**/api/invoke/**", async (route) => {
+    const command = new URL(route.request().url()).pathname.split("/").pop();
+    const segmentContent = command === "segment_text"
+      ? String((await route.request().postDataJSON()).content)
+      : "";
+    const values: Record<string, unknown> = {
+      get_shelf_tree: [{ shelf: { id: 1, name: "Test Shelf", description: null, parent_id: null, sort_order: 0, created_at: "2026-01-01", updated_at: "2026-01-01" }, children: [], text_count: 2, unread_count: 2 }],
+      list_texts_in_shelf: [textSummary, { ...textSummary, id: 2, title: "Text B", character_count: 2 }],
+      segment_text: [{ text: segmentContent[0], segment_type: "character", is_cjk: true, is_known: false, is_learning: false }],
+      get_stats: {},
+    };
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(values[command ?? ""] ?? null) });
+  });
+  let releaseA!: () => void;
+  const gateA = new Promise<void>((resolve) => { releaseA = resolve; });
+  let textBRequests = 0;
+  await page.context().route("**/api/texts/**", async (route) => {
+    const id = Number(new URL(route.request().url()).pathname.split("/").pop());
+    if (id === 1) {
+      await gateA;
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ...textSummary, content: "甲甲", title: "Text A" }) });
+      return;
+    }
+    if (id === 2) {
+      textBRequests += 1;
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ ...textSummary, id: 2, content: "乙乙", title: "Text B", character_count: 2 }) });
+      return;
+    }
+    await route.continue();
+  });
+
+  await bootstrapControlledApp(page);
+  await page.evaluate(async () => {
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open("chinese-reader", 5);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    const tx = db.transaction("sessions", "readwrite");
+    tx.objectStore("sessions").put({
+      local_id: "session-b", text_id: 2, started_at: Date.now(), finished_at: null,
+      status: "in_progress", character_count: 99, paused_at: null, source: "in_app",
+    });
+    await new Promise<void>((resolve, reject) => {
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+    db.close();
+  });
+  await page.getByRole("button", { name: "Library" }).click();
+  await page.locator('.shelf-item[data-shelf-id="1"]').click();
+  await expect(page.locator('.text-item[data-text-id="2"]')).toBeVisible();
+  await page.evaluate(() => {
+    document.querySelector<HTMLElement>('.text-item[data-text-id="1"]')?.click();
+    document.querySelector<HTMLElement>('.text-item[data-text-id="2"]')?.click();
+  });
+  await expect.poll(() => textBRequests).toBe(1);
+  await expect(page.getByRole("heading", { name: "Text B" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Finish Reading" })).toBeVisible();
+  releaseA();
+  await page.waitForTimeout(250);
+
+  await expect(page.getByRole("heading", { name: "Text B" })).toBeVisible();
+  await expect(page.locator("#text-content-interactive")).toContainText("乙");
+  await expect(page.locator("#text-content-interactive")).not.toContainText("甲");
+  page.once("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "Discard" }).click();
+  await expect(page.getByRole("button", { name: "Start Reading" })).toBeVisible();
+  await page.getByRole("button", { name: "Start Reading" }).click();
+  await expect(page.getByRole("button", { name: "Finish Reading" })).toBeVisible();
+  const readActive = () => page.evaluate(async () => {
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open("chinese-reader", 5);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    const sessions = await new Promise<any[]>((resolve, reject) => {
+      const request = db.transaction("sessions", "readonly").objectStore("sessions").getAll();
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    db.close();
+    return sessions.find((session) => session.status === "in_progress");
+  });
+  await expect.poll(readActive).toMatchObject({ text_id: 2, character_count: 2 });
+});
+
 test("lazy analysis renders stale cached data with its timestamp", async ({ page }) => {
   await mockLibraryApi(page);
   await page.route("**/api/invoke/get_shelf_analysis", async (route) => {

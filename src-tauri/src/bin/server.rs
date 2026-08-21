@@ -121,7 +121,7 @@ fn text_vocab_etag(version: &str, representation: &[u8]) -> String {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    format!("\"text-vocab-{hash:016x}\"")
+    format!("W/\"text-vocab-{hash:016x}\"")
 }
 
 fn serialize_json_bytes_with<F>(serializer: F) -> Result<(Vec<u8>, Duration), ApiError>
@@ -763,7 +763,7 @@ mod server_performance_tests {
         conn.execute_batch("CREATE TABLE texts (id INTEGER PRIMARY KEY, updated_at TEXT NOT NULL); CREATE TABLE text_analyses (id INTEGER PRIMARY KEY, text_id INTEGER UNIQUE, analyzed_at TEXT); INSERT INTO texts VALUES (7, 'v1'); INSERT INTO text_analyses VALUES (1, 7, 'a1');").unwrap();
         let first_version = text_vocab_version(&conn, 7).unwrap();
         let first = text_vocab_etag(&first_version, br#"{"definition":"old"}"#);
-        assert!(first.starts_with('"') && first.ends_with('"'));
+        assert!(first.starts_with("W/\"") && first.ends_with('"'));
         conn.execute("UPDATE texts SET updated_at = 'v2' WHERE id = 7", [])
             .unwrap();
         let text_changed = text_vocab_etag(
@@ -864,10 +864,7 @@ mod server_performance_tests {
         let etag = text_vocab_etag(&version, &serde_json::to_vec(&value).unwrap());
         let db = DbPool::new(vec![conn]);
         let mut headers = HeaderMap::new();
-        headers.insert(
-            header::IF_NONE_MATCH,
-            HeaderValue::from_str(&format!("W/{etag}")).unwrap(),
-        );
+        headers.insert(header::IF_NONE_MATCH, HeaderValue::from_str(&etag).unwrap());
         let response = get_text_vocab_cache_handler_with_headers(State(db), Path(7), headers)
             .await
             .unwrap();
