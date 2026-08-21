@@ -225,6 +225,21 @@ export interface ShelfAnalysis {
   known_words: WordFrequency[];
 }
 
+/** Cached shelf-analysis state. Analysis is produced by nightly maintenance. */
+export type ShelfAnalysisStatus =
+  | {
+      status: "ready";
+      analysis: ShelfAnalysis;
+      cached_at: string;
+      is_stale: boolean;
+      last_error: string | null;
+    }
+  | {
+      status: "pending";
+      requested_at: string;
+      last_error: string | null;
+    };
+
 /** A segment of text with known/unknown/learning status */
 export interface TextSegment {
   /** The text content */
@@ -531,8 +546,8 @@ export async function reanalyzeText(textId: number): Promise<TextAnalysis> {
 /**
  * Get aggregated analysis for a shelf
  */
-export async function getShelfAnalysis(shelfId: number, options?: RequestOptions): Promise<ShelfAnalysis> {
-  return invoke<ShelfAnalysis>("get_shelf_analysis", { shelfId }, options);
+export async function getShelfAnalysisStatus(shelfId: number, options?: RequestOptions): Promise<ShelfAnalysisStatus> {
+  return invoke<ShelfAnalysisStatus>("get_shelf_analysis", { shelfId }, options);
 }
 
 /**

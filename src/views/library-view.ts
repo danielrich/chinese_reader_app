@@ -49,14 +49,13 @@ import {
 
 // Track current sort mode (local to library view)
 let currentSort: library.FrequencySort = "text_frequency";
-let pendingShelfAnalysisTimer: number | null = null;
 let activeShelfAnalysisController: AbortController | null = null;
 const offlineDownloadErrors = new Map<number, string>();
 
 const CACHED_PREVIEW_DELAY_MS = 250;
 
 type ShelfListState = "loading" | "cached" | "fresh" | "offline";
-type AnalysisState = "loading" | "cached" | "fresh" | "offline" | "unavailable";
+type AnalysisState = "idle" | "loading" | "offline" | "unavailable";
 
 function textsCacheKey(shelfId: number): string {
   return `texts_in_shelf_${shelfId}`;
@@ -236,10 +235,6 @@ async function loadTextsInShelf(shelfId: number) {
   const mainContainer = document.getElementById("library-main");
   if (!mainContainer) return;
 
-  if (pendingShelfAnalysisTimer !== null) {
-    window.clearTimeout(pendingShelfAnalysisTimer);
-    pendingShelfAnalysisTimer = null;
-  }
   activeShelfAnalysisController?.abort();
   activeShelfAnalysisController = null;
 
@@ -247,91 +242,29 @@ async function loadTextsInShelf(shelfId: number) {
     texts: library.TextSummary[],
     listState: ShelfListState,
   ) => {
-    if (pendingShelfAnalysisTimer !== null) {
-      window.clearTimeout(pendingShelfAnalysisTimer);
-      pendingShelfAnalysisTimer = null;
-    }
     activeShelfAnalysisController?.abort();
     activeShelfAnalysisController = null;
 
     setCurrentShelfTexts(texts);
     const shelf = findShelfById(shelfTree, shelfId);
-    const [cachedAnalysis, shelfCache, textCache, bundleStatuses] = await Promise.all([
-      getNavCache<library.ShelfAnalysis>(shelfAnalysisCacheKey(shelfId)).catch(() => null),
+    const [shelfCache, textCache, bundleStatuses] = await Promise.all([
       getShelfCacheMetadata(shelfId).catch(() => null),
       listTextCacheMetadata(texts.map((text) => text.id)).catch(() => new Map<number, CacheMetadata>()),
       listOfflineTextBundleStatuses(texts.map((text) => text.id)).catch(() => new Map<number, OfflineTextBundleStatus>()),
     ]);
-    const analysisState: AnalysisState = cachedAnalysis
-      ? "cached"
-      : listState === "offline"
-        ? "offline"
-        : "loading";
     renderShelfContents(
       mainContainer,
       shelfId,
       shelf?.shelf.name || "Shelf",
       texts,
-      cachedAnalysis,
-      analysisState,
+      null,
+      listState === "offline" ? "offline" : "idle",
       listState,
       shelfCache,
       textCache,
       bundleStatuses,
     );
 
-    if (listState === "offline") return;
-
-    pendingShelfAnalysisTimer = window.setTimeout(async () => {
-      pendingShelfAnalysisTimer = null;
-      const controller = new AbortController();
-      activeShelfAnalysisController = controller;
-
-      try {
-        const freshAnalysis = await library.getShelfAnalysis(shelfId, { signal: controller.signal });
-        saveNavCache(shelfAnalysisCacheKey(shelfId), freshAnalysis).catch(() => {});
-        markShelfAnalysisCached(shelfId).catch(() => {});
-        if (selectedShelfId === shelfId) {
-          const [freshShelfCache, freshTextCache, freshBundleStatuses] = await Promise.all([
-            getShelfCacheMetadata(shelfId).catch(() => null),
-            listTextCacheMetadata(texts.map((text) => text.id)).catch(() => new Map<number, CacheMetadata>()),
-            listOfflineTextBundleStatuses(texts.map((text) => text.id)).catch(() => new Map<number, OfflineTextBundleStatus>()),
-          ]);
-          renderShelfContents(
-            mainContainer,
-            shelfId,
-            shelf?.shelf.name || "Shelf",
-            texts,
-            freshAnalysis,
-            "fresh",
-            "fresh",
-            freshShelfCache,
-            freshTextCache,
-            freshBundleStatuses,
-          );
-        }
-      } catch (analysisError) {
-        if ((analysisError as Error).name === "AbortError") return;
-        if (cachedAnalysis || selectedShelfId !== shelfId) return;
-        console.warn("Failed to load shelf analysis:", analysisError);
-        renderShelfContents(
-          mainContainer,
-          shelfId,
-          shelf?.shelf.name || "Shelf",
-          texts,
-          null,
-          navigator.onLine ? "unavailable" : "offline",
-          listState,
-          shelfCache,
-          textCache,
-          bundleStatuses,
-        );
-      } finally {
-        if (activeShelfAnalysisController === controller) {
-          activeShelfAnalysisController = null;
-        }
-      }
-    }, cachedAnalysis ? 150 : 350);
   };
 
   const cachedTexts = await getNavCache<library.TextSummary[]>(textsCacheKey(shelfId)).catch(() => null);
@@ -382,7 +315,7 @@ function renderShelfContents(
   shelfId: number,
   shelfName: string,
   texts: library.TextSummary[],
-  shelfAnalysis: library.ShelfAnalysis | null,
+  shelfAnalysisStatus: library.ShelfAnalysisStatus | null,
   analysisState: AnalysisState,
   listState: ShelfListState,
   shelfCache: CacheMetadata | null,
@@ -390,6 +323,7 @@ function renderShelfContents(
   bundleStatuses: Map<number, OfflineTextBundleStatus>,
 ) {
   const offlineDownloadError = offlineDownloadErrors.get(shelfId);
+  const shelfAnalysis = shelfAnalysisStatus?.status === "ready" ? shelfAnalysisStatus.analysis : null;
   const hasTexts = shelfAnalysis !== null && shelfAnalysis.text_count > 0;
   const offlineReadyCount = texts.filter((text) => isBundleOfflineReady(bundleStatuses.get(text.id))).length;
   const cacheAge = formatCacheAge(shelfCache?.last_cached_at);
@@ -425,7 +359,7 @@ function renderShelfContents(
         </div>
   `;
 
-  html += renderShelfAnalysisSection(shelfAnalysis, analysisState, texts.length > 0);
+  html += renderShelfAnalysisSection(shelfAnalysisStatus, analysisState, texts.length > 0);
 
   if (texts.length === 0) {
     html += `<p class="empty-message">No texts in this shelf yet. Add one to get started.</p>`;
@@ -473,28 +407,43 @@ function renderShelfContents(
 
   html += `</div>`;
   mainContainer.innerHTML = html;
-  bindShelfContents(mainContainer, shelfId, texts);
+  bindShelfContents(mainContainer, shelfId, texts, listState, shelfCache, textCache, bundleStatuses);
 }
 
 function renderShelfAnalysisSection(
-  shelfAnalysis: library.ShelfAnalysis | null,
+  shelfAnalysisStatus: library.ShelfAnalysisStatus | null,
   analysisState: AnalysisState,
   hasAnyTexts: boolean,
 ): string {
-  if (shelfAnalysis === null) {
-    if (!hasAnyTexts) return "";
-    const message = analysisState === "loading"
-      ? "Loading shelf analysis..."
-      : analysisState === "offline"
-        ? "Offline and no cached shelf analysis is available yet."
-        : "Shelf analysis is currently unavailable.";
+  if (!hasAnyTexts) return "";
+
+  if (shelfAnalysisStatus === null || shelfAnalysisStatus.status === "pending") {
+    const renderedState = shelfAnalysisStatus?.status === "pending" ? "pending" : analysisState;
+    let message: string;
+    if (shelfAnalysisStatus?.status === "pending" && shelfAnalysisStatus.last_error) {
+      message = `The nightly analysis failed: ${shelfAnalysisStatus.last_error}`;
+    } else if (shelfAnalysisStatus?.status === "pending") {
+      message = "Analysis is pending and will be prepared by the nightly maintenance job.";
+    } else if (analysisState === "idle") {
+      message = "Open to view the latest nightly shelf analysis.";
+    } else if (analysisState === "loading") {
+      message = "Loading cached shelf analysis...";
+    } else if (analysisState === "offline") {
+      message = "Offline and no cached shelf analysis is available yet.";
+    } else if (analysisState === "unavailable") {
+      message = "Shelf analysis is currently unavailable.";
+    } else {
+      message = "Shelf analysis is currently unavailable.";
+    }
     return `
-      <details class="shelf-analysis shelf-analysis-details" open>
+      <details class="shelf-analysis shelf-analysis-details" data-analysis-state="${renderedState}" ${renderedState === "idle" ? "" : "open"}>
         <summary class="shelf-analysis-summary">Shelf Analysis</summary>
-        <p class="empty-message">${message}</p>
+        <p class="empty-message shelf-analysis-status">${escapeHtml(message)}</p>
       </details>
     `;
   }
+
+  const shelfAnalysis = shelfAnalysisStatus.analysis;
 
   const knownCharOccurrences = shelfAnalysis.known_characters.reduce((sum, c) => sum + c.frequency, 0);
   const knownWordOccurrences = shelfAnalysis.known_words.reduce((sum, w) => sum + w.frequency, 0);
@@ -504,7 +453,13 @@ function renderShelfAnalysisSection(
   const knownWordRate = shelfAnalysis.total_words > 0
     ? Math.round((knownWordOccurrences / shelfAnalysis.total_words) * 100)
     : 100;
-  const cacheStatus = analysisState === "cached" ? "Showing cached analysis." : "";
+  const cachedAt = new Date(shelfAnalysisStatus.cached_at).toLocaleString();
+  const cacheStatus = shelfAnalysisStatus.is_stale
+    ? "Stale analysis cached"
+    : "Analysis updated";
+  const errorStatus = shelfAnalysisStatus.last_error
+    ? ` Last nightly refresh failed: ${shelfAnalysisStatus.last_error}`
+    : "";
 
   const formatShelfFreqItem = (item: library.CharacterFrequency | library.WordFrequency, type: "character" | "word") => {
     const label = type === "character" ? (item as library.CharacterFrequency).character : (item as library.WordFrequency).word;
@@ -521,9 +476,11 @@ function renderShelfAnalysisSection(
   };
 
   return `
-    <details class="shelf-analysis shelf-analysis-details" open>
+    <details class="shelf-analysis shelf-analysis-details" data-analysis-state="ready" open>
       <summary class="shelf-analysis-summary">Shelf Analysis</summary>
-      ${cacheStatus ? `<p class="empty-message">${cacheStatus}</p>` : ""}
+      <p class="empty-message shelf-analysis-status ${shelfAnalysisStatus.is_stale ? "stale" : "ready"}">
+        ${escapeHtml(cacheStatus)} <time datetime="${escapeHtml(shelfAnalysisStatus.cached_at)}">${escapeHtml(cachedAt)}</time>.${escapeHtml(errorStatus)}
+      </p>
       <div class="analysis-summary shelf-stats">
         <div class="stat-card">
           <span class="stat-value">${shelfAnalysis.text_count}</span>
@@ -596,7 +553,90 @@ function renderShelfAnalysisSection(
   `;
 }
 
-function bindShelfContents(mainContainer: HTMLElement, shelfId: number, texts: library.TextSummary[]) {
+function bindShelfContents(
+  mainContainer: HTMLElement,
+  shelfId: number,
+  texts: library.TextSummary[],
+  listState: ShelfListState,
+  shelfCache: CacheMetadata | null,
+  textCache: Map<number, CacheMetadata>,
+  bundleStatuses: Map<number, OfflineTextBundleStatus>,
+) {
+  const analysisDetails = mainContainer.querySelector<HTMLDetailsElement>(".shelf-analysis-details");
+  analysisDetails?.querySelector(".shelf-analysis-summary")?.addEventListener("click", async () => {
+    if (analysisDetails.dataset.analysisState !== "idle") return;
+    analysisDetails.dataset.analysisState = "loading";
+    const statusElement = analysisDetails.querySelector<HTMLElement>(".shelf-analysis-status");
+    if (statusElement) statusElement.textContent = "Loading cached shelf analysis...";
+
+    if (!navigator.onLine) {
+      const cachedAnalysis = await getNavCache<library.ShelfAnalysis>(shelfAnalysisCacheKey(shelfId)).catch(() => null);
+      if (selectedShelfId !== shelfId || !mainContainer.isConnected) return;
+      renderShelfContents(
+        mainContainer,
+        shelfId,
+        findShelfById(shelfTree, shelfId)?.shelf.name || "Shelf",
+        texts,
+        cachedAnalysis
+          ? {
+              status: "ready",
+              analysis: cachedAnalysis,
+              cached_at: new Date(shelfCache?.analysis_cached_at ?? shelfCache?.last_cached_at ?? 0).toISOString(),
+              is_stale: true,
+              last_error: null,
+            }
+          : null,
+        cachedAnalysis ? "idle" : "offline",
+        listState,
+        shelfCache,
+        textCache,
+        bundleStatuses,
+      );
+      return;
+    }
+
+    const controller = new AbortController();
+    activeShelfAnalysisController?.abort();
+    activeShelfAnalysisController = controller;
+    try {
+      const status = await library.getShelfAnalysisStatus(shelfId, { signal: controller.signal });
+      if (controller.signal.aborted || selectedShelfId !== shelfId || !mainContainer.isConnected) return;
+      if (status.status === "ready") {
+        saveNavCache(shelfAnalysisCacheKey(shelfId), status.analysis).catch(() => {});
+        markShelfAnalysisCached(shelfId).catch(() => {});
+      }
+      renderShelfContents(
+        mainContainer,
+        shelfId,
+        findShelfById(shelfTree, shelfId)?.shelf.name || "Shelf",
+        texts,
+        status,
+        "idle",
+        listState,
+        shelfCache,
+        textCache,
+        bundleStatuses,
+      );
+    } catch (error) {
+      if ((error as Error).name === "AbortError" || selectedShelfId !== shelfId) return;
+      console.warn("Failed to load shelf analysis status:", error);
+      renderShelfContents(
+        mainContainer,
+        shelfId,
+        findShelfById(shelfTree, shelfId)?.shelf.name || "Shelf",
+        texts,
+        null,
+        navigator.onLine ? "unavailable" : "offline",
+        listState,
+        shelfCache,
+        textCache,
+        bundleStatuses,
+      );
+    } finally {
+      if (activeShelfAnalysisController === controller) activeShelfAnalysisController = null;
+    }
+  });
+
   document.getElementById("add-text-btn")?.addEventListener("click", () => showAddTextModal(shelfId));
   document.getElementById("split-large-texts-btn")?.addEventListener("click", () => splitLargeTextsInShelf(shelfId));
   const cacheBtn = document.getElementById("cache-shelf-btn") as HTMLButtonElement;
@@ -660,7 +700,7 @@ function bindShelfContents(mainContainer: HTMLElement, shelfId: number, texts: l
     mainContainer.querySelectorAll(".freq-item.selected").forEach(el => el.classList.remove("selected"));
   });
 
-  if (window.matchMedia("(max-width: 700px)").matches) {
+  if (window.matchMedia("(max-width: 700px)").matches && analysisDetails?.dataset.analysisState === "idle") {
     document.querySelector(".shelf-analysis-details")?.removeAttribute("open");
   }
 }
@@ -679,11 +719,6 @@ async function loadTextView(textId: number) {
     const text = cachedText ?? await library.getText(textId);
     const textCache = await getTextCacheMetadata(textId).catch(() => null);
     setCurrentTextCharacterCount(text.character_count);
-
-    // Pre-warm the per-text vocab cache so the SW caches it for offline lookup
-    library.getTextVocabCache(textId).catch((err) =>
-      console.warn("vocab-cache prefetch failed:", err),
-    );
 
     setActiveSession(await getInProgressSessionForText(textId));
 
@@ -2581,9 +2616,11 @@ async function cacheShelfForOffline(shelfId: number, directTexts: library.TextSu
       const currentShelfId = shelfIds[index];
       btn.textContent = `Caching analysis ${index + 1}/${shelfIds.length}...`;
       try {
-        const analysis = await library.getShelfAnalysis(currentShelfId);
-        saveNavCache(shelfAnalysisCacheKey(currentShelfId), analysis).catch(() => {});
-        markShelfAnalysisCached(currentShelfId).catch(() => {});
+        const status = await library.getShelfAnalysisStatus(currentShelfId);
+        if (status.status === "ready") {
+          saveNavCache(shelfAnalysisCacheKey(currentShelfId), status.analysis).catch(() => {});
+          markShelfAnalysisCached(currentShelfId).catch(() => {});
+        }
       } catch (error) {
         console.warn(`Failed to cache shelf analysis for ${currentShelfId}:`, error);
       }

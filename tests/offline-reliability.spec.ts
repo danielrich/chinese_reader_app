@@ -115,7 +115,11 @@ test("copy diagnostics exposes local and worker recovery evidence", async ({ pag
   await bootstrapControlledApp(page);
 
   await page.locator("#offline-copy-btn").click();
-  const copied = await page.evaluate(() => navigator.clipboard.readText());
+  let copied = "";
+  await expect.poll(async () => {
+    copied = await page.evaluate(() => navigator.clipboard.readText());
+    return copied.length;
+  }).toBeGreaterThan(0);
 
   expect(JSON.parse(copied)).toMatchObject({
     local: { controlled: true, activeReleaseId: expect.any(String) },
@@ -157,6 +161,95 @@ test("opening a locally stored text issues no text record request", async ({ pag
 
   await expect(page.getByRole("heading", { name: "Offline Test" })).toBeVisible();
   expect(textRequests).toEqual([]);
+});
+
+test("lazy analysis waits for details and renders pending nightly status", async ({ page }) => {
+  let analysisRequests = 0;
+  await mockLibraryApi(page);
+  await page.route("**/api/invoke/get_shelf_analysis", async (route) => {
+    analysisRequests += 1;
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        status: "pending",
+        requested_at: "2026-08-20T19:00:00Z",
+        last_error: null,
+      }),
+    });
+  });
+
+  await bootstrapControlledApp(page);
+  await page.getByRole("button", { name: "Library" }).click();
+  await page.locator('.shelf-item[data-shelf-id="1"]').click();
+
+  await expect(page.locator(".shelf-analysis-details")).toBeVisible();
+  await expect(page.locator(".cache-pill")).toContainText("Live");
+  expect(analysisRequests).toBe(0);
+
+  await page.locator(".shelf-analysis-summary").click();
+  await expect(page.locator(".shelf-analysis-status")).toContainText("pending");
+  await expect.poll(() => analysisRequests).toBe(1);
+
+  await page.locator(".shelf-analysis-summary").click();
+  await page.locator(".shelf-analysis-summary").click();
+  await expect.poll(() => analysisRequests).toBe(1);
+});
+
+test("lazy analysis renders stale cached data with its timestamp", async ({ page }) => {
+  await mockLibraryApi(page);
+  await page.route("**/api/invoke/get_shelf_analysis", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        status: "ready",
+        cached_at: "2026-08-20T06:30:00Z",
+        is_stale: true,
+        last_error: null,
+        analysis: {
+          shelf_id: 1, text_count: 1, total_characters: 4, unique_characters: 4,
+          known_characters_count: 0, total_words: 1, unique_words: 1, known_words_count: 0,
+          unknown_characters: [], known_characters: [], unknown_words: [], known_words: [],
+        },
+      }),
+    });
+  });
+
+  await bootstrapControlledApp(page);
+  await page.getByRole("button", { name: "Library" }).click();
+  await page.locator('.shelf-item[data-shelf-id="1"]').click();
+  await expect(page.locator(".cache-pill")).toContainText("Live");
+  await page.locator(".shelf-analysis-summary").click();
+
+  await expect(page.locator(".shelf-analysis-status")).toContainText("Stale");
+  await expect(page.locator(".shelf-analysis-status time")).toHaveAttribute("datetime", "2026-08-20T06:30:00Z");
+  await expect(page.locator(".shelf-stats")).toContainText("4");
+});
+
+test("vocab prefetch does not run when opening a text", async ({ page }) => {
+  await mockLibraryApi(page);
+  let vocabRequests = 0;
+  await page.context().route("**/api/texts/1/vocab-cache", async (route) => {
+    vocabRequests += 1;
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ text_id: 1, words: [], characters: [] }) });
+  });
+  await page.context().route("**/api/texts/1", async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ ...textSummary, content: "中文测试", source_type: "paste", created_at: "2026-01-01", updated_at: "2026-01-01" }),
+    });
+  });
+
+  await bootstrapControlledApp(page);
+  await page.getByRole("button", { name: "Library" }).click();
+  await page.locator('.shelf-item[data-shelf-id="1"]').click();
+  await page.locator('.text-item[data-text-id="1"]').click();
+
+  await expect(page.getByRole("heading", { name: "Offline Test" })).toBeVisible();
+  await page.waitForTimeout(500);
+  expect(vocabRequests).toBe(0);
 });
 
 test("a corrupted selected release falls back to an older complete release", async ({ page }) => {
