@@ -4,12 +4,31 @@
 
 use chrono::Utc;
 use rusqlite::{params, Connection};
+use std::collections::{HashMap, HashSet};
 
 use super::error::{LibraryError, Result};
-use super::maintenance::{
-    cached_or_requested_ancestor_ids, mark_analysis_dirty_in_transaction,
-};
+use super::maintenance::{cached_or_requested_ancestor_ids, mark_analysis_dirty_in_transaction};
 use super::models::{Shelf, ShelfTree};
+
+#[cfg(test)]
+thread_local! {
+    static BULK_QUERY_STAGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn record_bulk_query_stage() {
+    #[cfg(test)]
+    BULK_QUERY_STAGES.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(test)]
+fn reset_bulk_query_stages() {
+    BULK_QUERY_STAGES.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn bulk_query_stage_count() -> usize {
+    BULK_QUERY_STAGES.with(std::cell::Cell::get)
+}
 
 /// Create a new shelf
 pub fn create_shelf(
@@ -122,16 +141,6 @@ pub fn list_child_shelves(conn: &Connection, parent_id: i64) -> Result<Vec<Shelf
     Ok(shelves)
 }
 
-/// Get text count for a shelf
-fn get_text_count(conn: &Connection, shelf_id: i64) -> Result<i64> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM texts WHERE shelf_id = ?",
-        [shelf_id],
-        |row| row.get(0),
-    )?;
-    Ok(count)
-}
-
 /// Returns unread text counts for the given shelf IDs in a single query.
 /// A text is "unread" if it has no completed reading session (is_complete = 1).
 pub fn get_unread_counts(
@@ -180,62 +189,146 @@ pub fn get_unread_counts(
     Ok(map)
 }
 
-fn collect_shelf_ids(trees: &[ShelfTree]) -> Vec<i64> {
-    let mut ids = Vec::new();
-    for tree in trees {
-        ids.push(tree.shelf.id);
-        ids.extend(collect_shelf_ids(&tree.children));
-    }
-    ids
+fn load_all_shelves(conn: &Connection) -> Result<Vec<Shelf>> {
+    record_bulk_query_stage();
+    let mut stmt = conn.prepare(
+        "SELECT id, name, description, parent_id, sort_order, created_at, updated_at
+         FROM shelves ORDER BY parent_id, sort_order, name",
+    )?;
+    let shelves = stmt
+        .query_map([], |row| {
+            Ok(Shelf {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                parent_id: row.get(3)?,
+                sort_order: row.get(4)?,
+                created_at: row.get(5)?,
+                updated_at: row.get(6)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(shelves)
 }
 
-/// Recursively sets unread_count on each node.
-/// Parent unread_count = own unread + sum of children's unread_count.
-fn apply_unread_counts(
-    trees: &mut Vec<ShelfTree>,
-    counts: &std::collections::HashMap<i64, i64>,
-) {
-    for tree in trees.iter_mut() {
-        apply_unread_counts(&mut tree.children, counts);
-        let own = counts.get(&tree.shelf.id).copied().unwrap_or(0);
-        let children_sum: i64 = tree.children.iter().map(|c| c.unread_count).sum();
-        tree.unread_count = own + children_sum;
-    }
+fn load_direct_text_counts(conn: &Connection) -> Result<HashMap<i64, i64>> {
+    record_bulk_query_stage();
+    let mut stmt = conn.prepare("SELECT shelf_id, COUNT(*) FROM texts GROUP BY shelf_id")?;
+    let counts = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<std::result::Result<HashMap<_, _>, _>>()?;
+    Ok(counts)
 }
 
-/// Build shelf tree recursively. text_count is rolled up: parent count
-/// includes all descendants' texts, mirroring how unread_count rolls up.
-fn build_shelf_tree(conn: &Connection, shelf: Shelf) -> Result<ShelfTree> {
-    let own_text_count = get_text_count(conn, shelf.id)?;
-    let children_shelves = list_child_shelves(conn, shelf.id)?;
+fn load_all_unread_counts(conn: &Connection) -> Result<HashMap<i64, i64>> {
+    record_bulk_query_stage();
+    let mut stmt = conn.prepare(
+        "SELECT t.shelf_id, COUNT(*)
+         FROM texts t
+         WHERE NOT EXISTS (
+             SELECT 1 FROM reading_sessions rs
+             WHERE rs.text_id = t.id AND rs.is_complete = 1
+         )
+         GROUP BY t.shelf_id",
+    )?;
+    let counts = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<std::result::Result<HashMap<_, _>, _>>()?;
+    Ok(counts)
+}
 
-    let children: Vec<ShelfTree> = children_shelves
-        .into_iter()
-        .map(|child| build_shelf_tree(conn, child))
-        .collect::<Result<Vec<_>>>()?;
+fn assemble_shelf_node(
+    shelf: Shelf,
+    children_by_parent: &mut HashMap<Option<i64>, Vec<Shelf>>,
+    direct_text_counts: &HashMap<i64, i64>,
+    direct_unread_counts: &HashMap<i64, i64>,
+    visiting: &mut HashSet<i64>,
+    assembled: &mut HashSet<i64>,
+) -> Result<ShelfTree> {
+    if !visiting.insert(shelf.id) {
+        return Err(LibraryError::InvalidInput(format!(
+            "Cycle detected in shelf hierarchy at shelf {}",
+            shelf.id
+        )));
+    }
 
-    let children_text_count: i64 = children.iter().map(|c| c.text_count).sum();
+    let child_shelves = children_by_parent
+        .remove(&Some(shelf.id))
+        .unwrap_or_default();
+    let mut children = Vec::with_capacity(child_shelves.len());
+    for child in child_shelves {
+        children.push(assemble_shelf_node(
+            child,
+            children_by_parent,
+            direct_text_counts,
+            direct_unread_counts,
+            visiting,
+            assembled,
+        )?);
+    }
+
+    visiting.remove(&shelf.id);
+    assembled.insert(shelf.id);
+    let text_count = direct_text_counts.get(&shelf.id).copied().unwrap_or(0)
+        + children.iter().map(|child| child.text_count).sum::<i64>();
+    let unread_count = direct_unread_counts.get(&shelf.id).copied().unwrap_or(0)
+        + children.iter().map(|child| child.unread_count).sum::<i64>();
 
     Ok(ShelfTree {
         shelf,
         children,
-        text_count: own_text_count + children_text_count,
-        unread_count: 0,
+        text_count,
+        unread_count,
     })
 }
 
 /// Get the complete shelf tree
 pub fn get_shelf_tree(conn: &Connection) -> Result<Vec<ShelfTree>> {
-    let root_shelves = list_root_shelves(conn)?;
-    let mut trees: Vec<ShelfTree> = root_shelves
-        .into_iter()
-        .map(|shelf| build_shelf_tree(conn, shelf))
-        .collect::<Result<Vec<_>>>()?;
+    let shelves = load_all_shelves(conn)?;
+    let direct_text_counts = load_direct_text_counts(conn)?;
+    let direct_unread_counts = load_all_unread_counts(conn)?;
+    let shelf_ids: HashSet<i64> = shelves.iter().map(|shelf| shelf.id).collect();
 
-    // Single query for all unread counts, then aggregate in Rust
-    let all_ids = collect_shelf_ids(&trees);
-    let unread_counts = get_unread_counts(conn, &all_ids)?;
-    apply_unread_counts(&mut trees, &unread_counts);
+    for shelf in &shelves {
+        if let Some(parent_id) = shelf.parent_id {
+            if !shelf_ids.contains(&parent_id) {
+                return Err(LibraryError::InvalidInput(format!(
+                    "Shelf {} references missing parent {}",
+                    shelf.id, parent_id
+                )));
+            }
+        }
+    }
+
+    let mut children_by_parent: HashMap<Option<i64>, Vec<Shelf>> = HashMap::new();
+    for shelf in shelves {
+        children_by_parent
+            .entry(shelf.parent_id)
+            .or_default()
+            .push(shelf);
+    }
+
+    let roots = children_by_parent.remove(&None).unwrap_or_default();
+    let expected_count = shelf_ids.len();
+    let mut visiting = HashSet::new();
+    let mut assembled = HashSet::new();
+    let mut trees = Vec::with_capacity(roots.len());
+    for root in roots {
+        trees.push(assemble_shelf_node(
+            root,
+            &mut children_by_parent,
+            &direct_text_counts,
+            &direct_unread_counts,
+            &mut visiting,
+            &mut assembled,
+        )?);
+    }
+
+    if assembled.len() != expected_count {
+        return Err(LibraryError::InvalidInput(
+            "Cycle detected in shelf hierarchy".to_string(),
+        ));
+    }
 
     Ok(trees)
 }
@@ -365,7 +458,11 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_database(&conn).unwrap();
         // Create a shelf and two texts, complete a session on one
-        conn.execute("INSERT INTO shelves (id, name, sort_order) VALUES (1, 'Test', 0)", []).unwrap();
+        conn.execute(
+            "INSERT INTO shelves (id, name, sort_order) VALUES (1, 'Test', 0)",
+            [],
+        )
+        .unwrap();
         conn.execute("INSERT INTO texts (id, shelf_id, title, content, character_count) VALUES (1, 1, 'Text A', 'content', 100)", []).unwrap();
         conn.execute("INSERT INTO texts (id, shelf_id, title, content, character_count) VALUES (2, 1, 'Text B', 'content', 200)", []).unwrap();
         // Only text 1 has a completed session
@@ -373,7 +470,8 @@ mod tests {
             "INSERT INTO reading_sessions (text_id, started_at, character_count, is_complete)
              VALUES (1, '2026-01-01T00:00:00Z', 100, 1)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn
     }
 
@@ -392,7 +490,8 @@ mod tests {
             "INSERT INTO reading_sessions (text_id, started_at, character_count, is_complete)
              VALUES (2, '2026-01-01T00:00:00Z', 200, 1)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         let counts = get_unread_counts(&conn, &[1]).unwrap();
         assert_eq!(counts.get(&1), Some(&0));
     }
@@ -443,6 +542,102 @@ mod tests {
         let tree = get_shelf_tree(&conn).unwrap();
         assert_eq!(tree.len(), 1);
         assert_eq!(tree[0].children.len(), 2);
+    }
+
+    #[test]
+    fn shelf_tree_preserves_order_and_rolls_up_counts() {
+        let conn = setup_test_db();
+        conn.execute_batch(
+            "INSERT INTO shelves (id, name, parent_id, sort_order) VALUES
+                 (1, 'Root B', NULL, 0),
+                 (2, 'Root A', NULL, 0),
+                 (3, 'Child Z', 2, 0),
+                 (4, 'Child A', 2, 0),
+                 (5, 'Grandchild', 4, 0),
+                 (6, 'Empty', NULL, 2);
+             INSERT INTO texts (id, shelf_id, title, content, character_count) VALUES
+                 (1, 2, 'Root unread', 'a', 1),
+                 (2, 3, 'Child read', 'b', 1),
+                 (3, 4, 'Child unread', 'c', 1),
+                 (4, 5, 'Grandchild read', 'd', 1),
+                 (5, 5, 'Grandchild unread', 'e', 1);
+             INSERT INTO reading_sessions
+                 (text_id, started_at, character_count, is_complete) VALUES
+                 (2, '2026-01-01T00:00:00Z', 1, 1),
+                 (4, '2026-01-01T00:00:00Z', 1, 1);",
+        )
+        .unwrap();
+
+        let tree = get_shelf_tree(&conn).unwrap();
+
+        assert_eq!(
+            tree.iter()
+                .map(|n| n.shelf.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Root A", "Root B", "Empty"]
+        );
+        let root = &tree[0];
+        assert_eq!(
+            root.children
+                .iter()
+                .map(|n| n.shelf.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Child A", "Child Z"]
+        );
+        assert_eq!(root.text_count, 5);
+        assert_eq!(root.unread_count, 3);
+        assert_eq!(root.children[0].text_count, 3);
+        assert_eq!(root.children[0].unread_count, 2);
+        assert_eq!(root.children[0].children[0].text_count, 2);
+        assert_eq!(root.children[0].children[0].unread_count, 1);
+        assert_eq!((tree[1].text_count, tree[1].unread_count), (0, 0));
+        assert_eq!((tree[2].text_count, tree[2].unread_count), (0, 0));
+    }
+
+    #[test]
+    fn shelf_tree_uses_three_bulk_query_stages_regardless_of_size() {
+        let conn = setup_test_db();
+        for id in 1..=500 {
+            conn.execute(
+                "INSERT INTO shelves (id, name, sort_order) VALUES (?, ?, ?)",
+                params![id, format!("Shelf {id:03}"), id],
+            )
+            .unwrap();
+        }
+
+        reset_bulk_query_stages();
+        get_shelf_tree(&conn).unwrap();
+
+        assert_eq!(bulk_query_stage_count(), 3);
+    }
+
+    #[test]
+    fn shelf_tree_rejects_orphaned_shelves() {
+        let conn = setup_test_db();
+        conn.execute("PRAGMA foreign_keys = OFF", []).unwrap();
+        conn.execute(
+            "INSERT INTO shelves (id, name, parent_id, sort_order) VALUES (1, 'Orphan', 999, 0)",
+            [],
+        )
+        .unwrap();
+
+        let error = get_shelf_tree(&conn).unwrap_err();
+        assert!(matches!(error, LibraryError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn shelf_tree_rejects_cycles() {
+        let conn = setup_test_db();
+        conn.execute("PRAGMA foreign_keys = OFF", []).unwrap();
+        conn.execute_batch(
+            "INSERT INTO shelves (id, name, parent_id, sort_order) VALUES
+                 (1, 'Cycle A', 2, 0),
+                 (2, 'Cycle B', 1, 0);",
+        )
+        .unwrap();
+
+        let error = get_shelf_tree(&conn).unwrap_err();
+        assert!(matches!(error, LibraryError::InvalidInput(_)));
     }
 
     #[test]
