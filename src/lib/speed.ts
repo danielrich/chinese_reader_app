@@ -13,6 +13,7 @@ import {
   getCachedReadingHistory,
   saveCachedReadingHistory,
   invalidateCachedReadingHistory,
+  advanceReadingHistoryGeneration,
   type LocalSession,
 } from "./idb";
 import { uuid } from "../utils";
@@ -61,6 +62,8 @@ export interface ReadingSession {
   is_manual_log: boolean;
   /** Source identifier for manually logged sessions */
   source: string | null;
+  /** Client-generated identity for a locally completed session awaiting sync. */
+  client_local_id?: string;
 }
 
 /** A data point for speed correlation graphs */
@@ -255,6 +258,7 @@ export async function finishReadingSession(localId: string): Promise<LocalSessio
   };
   await saveSession(completed);
 
+  advanceReadingHistoryGeneration(completed.text_id);
   const cachedHistory = await getCachedReadingHistory(completed.text_id).catch(() => null);
   const pendingSession: ReadingSession = {
     id: -Date.now(),
@@ -276,6 +280,7 @@ export async function finishReadingSession(localId: string): Promise<LocalSessio
     created_at: new Date().toISOString(),
     is_manual_log: false,
     source: completed.source ?? "in_app",
+    client_local_id: completed.local_id,
   };
   await saveCachedReadingHistory(completed.text_id, [
     pendingSession,

@@ -9,7 +9,9 @@ import {
   saveNavCache,
   getNavCache,
   getCachedReadingHistory,
-  saveCachedReadingHistory,
+  saveCachedReadingHistoryIfCurrent,
+  advanceReadingHistoryGeneration,
+  getReadingHistoryGeneration,
   getTextCache,
   saveTextSegments,
   getTextSegments,
@@ -1191,10 +1193,12 @@ async function loadReadingHistory(textId: number) {
   const container = document.getElementById("history-container");
   if (!container) return;
   const viewToken = libraryViewToken;
+  const historyGeneration = advanceReadingHistoryGeneration(textId);
   const isCurrentView = () => (
     viewToken === libraryViewToken
     && currentTextId === textId
     && container.isConnected
+    && getReadingHistoryGeneration(textId) === historyGeneration
   );
 
   const cached = await getCachedReadingHistory(textId).catch(() => null);
@@ -1202,10 +1206,28 @@ async function loadReadingHistory(textId: number) {
   if (cached) renderReadingHistory(container, textId, cached.sessions);
 
   try {
-    const history = await speed.getTextReadingHistoryFresh(textId);
+    const freshHistory = await speed.getTextReadingHistoryFresh(textId);
     if (!isCurrentView()) return;
-    await saveCachedReadingHistory(textId, history).catch(() => {});
-    if (!isCurrentView()) return;
+    const pendingSessions = (cached?.sessions ?? []).filter((session) => session.id < 0);
+    const sameSession = (pending: speed.ReadingSession, fresh: speed.ReadingSession) => {
+      if (pending.client_local_id && fresh.client_local_id) {
+        return pending.client_local_id === fresh.client_local_id;
+      }
+      return pending.text_id === fresh.text_id
+        && Date.parse(pending.started_at) === Date.parse(fresh.started_at)
+        && Date.parse(pending.finished_at ?? "") === Date.parse(fresh.finished_at ?? "")
+        && pending.character_count === fresh.character_count;
+    };
+    const history = [
+      ...pendingSessions.filter((pending) => !freshHistory.some((fresh) => sameSession(pending, fresh))),
+      ...freshHistory,
+    ];
+    const saved = await saveCachedReadingHistoryIfCurrent(
+      textId,
+      history,
+      historyGeneration,
+    ).catch(() => false);
+    if (!saved || !isCurrentView()) return;
     renderReadingHistory(container, textId, history);
   } catch (error) {
     if (!isCurrentView()) return;

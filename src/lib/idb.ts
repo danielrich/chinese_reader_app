@@ -560,6 +560,18 @@ export interface CachedReadingHistory {
   sessions: ReadingSession[];
 }
 
+const readingHistoryGenerations = new Map<number, number>();
+
+export function advanceReadingHistoryGeneration(textId: number): number {
+  const generation = (readingHistoryGenerations.get(textId) ?? 0) + 1;
+  readingHistoryGenerations.set(textId, generation);
+  return generation;
+}
+
+export function getReadingHistoryGeneration(textId: number): number {
+  return readingHistoryGenerations.get(textId) ?? 0;
+}
+
 function readingHistoryCacheKey(textId: number): string {
   return `reading_history:${textId}`;
 }
@@ -575,7 +587,28 @@ export async function saveCachedReadingHistory(
   await saveNavCache(readingHistoryCacheKey(textId), { savedAt: Date.now(), sessions });
 }
 
+export async function saveCachedReadingHistoryIfCurrent(
+  textId: number,
+  sessions: ReadingSession[],
+  generation: number,
+): Promise<boolean> {
+  const db = await openDb();
+  if (getReadingHistoryGeneration(textId) !== generation) {
+    db.close();
+    return false;
+  }
+  const tx = db.transaction(STORE_NAV_CACHE, "readwrite");
+  tx.objectStore(STORE_NAV_CACHE).put({
+    key: readingHistoryCacheKey(textId),
+    data: { savedAt: Date.now(), sessions },
+  });
+  await txDone(tx);
+  db.close();
+  return true;
+}
+
 export async function invalidateCachedReadingHistory(textId: number): Promise<void> {
+  advanceReadingHistoryGeneration(textId);
   const db = await openDb();
   const tx = db.transaction(STORE_NAV_CACHE, "readwrite");
   tx.objectStore(STORE_NAV_CACHE).delete(readingHistoryCacheKey(textId));

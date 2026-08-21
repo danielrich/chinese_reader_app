@@ -541,6 +541,216 @@ test("late reading history refresh cannot replace a newer library view", async (
   await expect(page.locator("#history-container")).toHaveCount(0);
 });
 
+test("fresh reading history keeps a pending local session visible while sync is delayed", async ({ page }) => {
+  await mockLibraryApi(page);
+  await bootstrapControlledApp(page);
+  await seedCachedTextAndHistory(page);
+  let releaseSync!: () => void;
+  const syncGate = new Promise<void>((resolve) => { releaseSync = resolve; });
+  await page.route("**/api/sync/sessions", async (route) => {
+    await syncGate;
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ uploaded: 1 }) });
+  });
+  let historyRequests = 0;
+  await page.route("**/api/invoke/get_text_reading_history", async (route) => {
+    historyRequests += 1;
+    await route.fulfill({ status: 200, contentType: "application/json", body: "[]" });
+  });
+
+  await page.getByRole("button", { name: "Library" }).click();
+  await page.locator('.shelf-item[data-shelf-id="1"]').click();
+  await page.locator('.text-item[data-text-id="1"]').click();
+  await page.getByRole("button", { name: "Start Reading" }).click();
+  await page.getByRole("button", { name: "Finish Reading" }).click();
+  await page.getByRole("button", { name: "History" }).click();
+
+  await expect.poll(() => historyRequests).toBe(1);
+  await page.waitForTimeout(150);
+  await expect(page.locator("#history-container")).toContainText("Pending sync");
+  releaseSync();
+});
+
+test("fresh reading history deduplicates an equivalent pending local session", async ({ page }) => {
+  await mockLibraryApi(page);
+  await bootstrapControlledApp(page);
+  const pending = { ...readingSession(15, 1500), id: -15 };
+  const uploaded = {
+    ...pending,
+    id: 150,
+    started_at: pending.started_at.replace("Z", "+00:00"),
+    finished_at: pending.finished_at.replace("Z", "+00:00"),
+  };
+  await seedCachedTextAndHistory(page, [pending]);
+  await page.route("**/api/invoke/get_text_reading_history", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify([uploaded]) });
+  });
+
+  await openReadingHistory(page);
+
+  await expect(page.locator(".history-item")).toHaveCount(1);
+  await expect(page.locator('.history-item[data-session-id="150"]')).toBeVisible();
+});
+
+test("late reading history refresh cannot resurrect a deleted session", async ({ page }) => {
+  await mockLibraryApi(page);
+  await bootstrapControlledApp(page);
+  const deleted = readingSession(10, 1010);
+  await seedCachedTextAndHistory(page, [deleted]);
+  let releaseHistory!: () => void;
+  const historyGate = new Promise<void>((resolve) => { releaseHistory = resolve; });
+  await page.route("**/api/invoke/get_text_reading_history", async (route) => {
+    await historyGate;
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify([deleted]) });
+  });
+  await page.route("**/api/invoke/delete_reading_session", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: "null" });
+  });
+
+  await openReadingHistory(page);
+  await page.locator('.btn-delete-session[data-session-id="10"]').click();
+  await expect(page.locator('.history-item[data-session-id="10"]')).toHaveCount(0);
+  releaseHistory();
+  await page.waitForTimeout(150);
+
+  await expect(page.locator('.history-item[data-session-id="10"]')).toHaveCount(0);
+  await expect.poll(() => page.evaluate(async () => {
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open("chinese-reader", 5);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    const request = db.transaction("nav_cache", "readonly").objectStore("nav_cache").get("reading_history:1");
+    const value = await new Promise<unknown>((resolve, reject) => {
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    db.close();
+    return value === undefined;
+  })).toBe(true);
+});
+
+test("late reading history refresh cannot undo multi-text manual-log invalidation", async ({ page }) => {
+  await mockLibraryApi(page);
+  await bootstrapControlledApp(page);
+  const stale = readingSession(11, 1111);
+  await seedCachedTextAndHistory(page, []);
+  await page.evaluate(async () => {
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open("chinese-reader", 5);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    const tx = db.transaction("nav_cache", "readwrite");
+    tx.objectStore("nav_cache").put({ key: "reading_history:2", data: { savedAt: Date.now(), sessions: [] } });
+    await new Promise<void>((resolve, reject) => {
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+    db.close();
+  });
+  let releaseHistory!: () => void;
+  const historyGate = new Promise<void>((resolve) => { releaseHistory = resolve; });
+  let historyRequests = 0;
+  await page.route("**/api/invoke/get_text_reading_history", async (route) => {
+    historyRequests += 1;
+    if (historyRequests === 1) {
+      await historyGate;
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify([stale]) });
+    } else {
+      await route.abort("connectionrefused");
+    }
+  });
+  await page.route("**/api/invoke/search_texts", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify([{ ...textSummary, id: 2, title: "Second Text" }]) });
+  });
+  let loggedTextIds: number[] = [];
+  await page.route("**/api/invoke/log_offline_read", async (route) => {
+    loggedTextIds = route.request().postDataJSON().input.text_ids;
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify([readingSession(12, 12), { ...readingSession(13, 13), text_id: 2 }]) });
+  });
+
+  await openReadingHistory(page);
+  await page.getByRole("button", { name: "Log offline read" }).click();
+  await page.locator("#text-search").fill("Second");
+  await page.locator('.text-search-result-item[data-id="2"]').click();
+  await page.locator("#offline-save-btn").click();
+  await expect.poll(() => historyRequests).toBe(2);
+  expect(loggedTextIds).toEqual([1, 2]);
+  releaseHistory();
+  await page.waitForTimeout(150);
+
+  await expect(page.locator('.history-item[data-session-id="11"]')).toHaveCount(0);
+  await expect.poll(() => page.evaluate(async () => {
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open("chinese-reader", 5);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    const tx = db.transaction("nav_cache", "readonly");
+    const values = await Promise.all([1, 2].map((id) => new Promise<unknown>((resolve, reject) => {
+      const request = tx.objectStore("nav_cache").get(`reading_history:${id}`);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    })));
+    db.close();
+    return values.every((value) => value === undefined);
+  })).toBe(true);
+});
+
+test("late reading history refresh cannot undo successful sync invalidation", async ({ page }) => {
+  await mockLibraryApi(page);
+  await bootstrapControlledApp(page);
+  const stale = readingSession(14, 1414);
+  await seedCachedTextAndHistory(page, []);
+  await page.evaluate(async () => {
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open("chinese-reader", 5);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    const tx = db.transaction("sessions", "readwrite");
+    tx.objectStore("sessions").put({
+      local_id: "sync-race", text_id: 1, started_at: Date.now() - 60_000,
+      finished_at: Date.now(), status: "completed_pending_upload", character_count: 4,
+    });
+    await new Promise<void>((resolve, reject) => {
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+    db.close();
+  });
+  let releaseHistory!: () => void;
+  const historyGate = new Promise<void>((resolve) => { releaseHistory = resolve; });
+  await page.route("**/api/invoke/get_text_reading_history", async (route) => {
+    await historyGate;
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify([stale]) });
+  });
+  await page.route("**/api/sync/sessions", async (route) => {
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ uploaded: 1 }) });
+  });
+
+  await openReadingHistory(page);
+  await page.evaluate(() => window.dispatchEvent(new Event("online")));
+  await expect.poll(() => page.evaluate(async () => {
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open("chinese-reader", 5);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    const request = db.transaction("nav_cache", "readonly").objectStore("nav_cache").get("reading_history:1");
+    const value = await new Promise<unknown>((resolve, reject) => {
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    db.close();
+    return value === undefined;
+  })).toBe(true);
+  releaseHistory();
+  await page.waitForTimeout(150);
+
+  await expect(page.locator('.history-item[data-session-id="14"]')).toHaveCount(0);
+});
+
 test("a corrupted selected release falls back to an older complete release", async ({ page }) => {
   await bootstrapControlledApp(page);
   const initial = await workerMessage<{ activeReleaseId: string }>(page, "VERIFY_SHELL");
