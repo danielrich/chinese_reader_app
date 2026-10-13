@@ -418,6 +418,7 @@ function renderShelfContents(
             <button id="add-text-btn" class="btn-primary">Add Text</button>
             <button id="split-large-texts-btn" class="btn-secondary">Split Large Texts</button>
             <button id="cache-shelf-btn" class="btn-secondary">${escapeHtml(offlineDownloadError ?? "Cache for Offline")}</button>
+            <button id="export-epub-btn" class="btn-secondary">Export as EPUB</button>
             <button id="edit-shelf-btn" class="btn-secondary">Edit</button>
             <button id="move-shelf-btn" class="btn-secondary">Move</button>
             <button id="delete-shelf-btn" class="btn-danger">Delete</button>
@@ -473,7 +474,7 @@ function renderShelfContents(
 
   html += `</div>`;
   mainContainer.innerHTML = html;
-  bindShelfContents(mainContainer, shelfId, texts);
+  bindShelfContents(mainContainer, shelfId, shelfName, texts);
 }
 
 function renderShelfAnalysisSection(
@@ -596,11 +597,25 @@ function renderShelfAnalysisSection(
   `;
 }
 
-function bindShelfContents(mainContainer: HTMLElement, shelfId: number, texts: library.TextSummary[]) {
+function bindShelfContents(mainContainer: HTMLElement, shelfId: number, shelfName: string, texts: library.TextSummary[]) {
   document.getElementById("add-text-btn")?.addEventListener("click", () => showAddTextModal(shelfId));
   document.getElementById("split-large-texts-btn")?.addEventListener("click", () => splitLargeTextsInShelf(shelfId));
   const cacheBtn = document.getElementById("cache-shelf-btn") as HTMLButtonElement;
   cacheBtn?.addEventListener("click", () => cacheShelfForOffline(shelfId, texts, cacheBtn));
+  const exportBtn = document.getElementById("export-epub-btn") as HTMLButtonElement;
+  exportBtn?.addEventListener("click", async () => {
+    exportBtn.disabled = true;
+    exportBtn.textContent = "Preparing EPUB…";
+    try {
+      await library.downloadShelfEpub(shelfId, shelfName);
+    } catch (error) {
+      console.error("EPUB export failed:", error);
+      alert(`EPUB export failed: ${error}`);
+    } finally {
+      exportBtn.disabled = false;
+      exportBtn.textContent = "Export as EPUB";
+    }
+  });
   document.getElementById("edit-shelf-btn")?.addEventListener("click", () => showEditShelfModal(shelfId));
   document.getElementById("move-shelf-btn")?.addEventListener("click", () => showMoveShelfModal(shelfId));
   document.getElementById("delete-shelf-btn")?.addEventListener("click", () => confirmDeleteShelf(shelfId));

@@ -374,6 +374,33 @@ export async function moveShelf(
   return invoke<void>("move_shelf", { id, newParentId });
 }
 
+/** Download one shelf and all descendants as a Kindle-friendly EPUB. */
+export async function downloadShelfEpub(shelfId: number, fallbackName: string): Promise<void> {
+  let objectUrl: string | null = null;
+  try {
+    const response = await fetch(`/api/shelves/${shelfId}/export.epub`, { cache: "no-store" });
+    if (!response.ok) {
+      throw new Error((await response.text()) || `EPUB export failed (${response.status})`);
+    }
+    const disposition = response.headers.get("Content-Disposition") ?? "";
+    const encodedName = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+    const safeFallback = fallbackName.replace(/[\\/:*?"<>|]/g, "").trim() || "shelf";
+    let filename = `${safeFallback}.epub`;
+    if (encodedName) {
+      try { filename = decodeURIComponent(encodedName); } catch { /* use fallback */ }
+    }
+    objectUrl = URL.createObjectURL(await response.blob());
+    const anchor = document.createElement("a");
+    anchor.href = objectUrl;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+  } finally {
+    if (objectUrl) URL.revokeObjectURL(objectUrl);
+  }
+}
+
 // =============================================================================
 // Text API
 // =============================================================================
