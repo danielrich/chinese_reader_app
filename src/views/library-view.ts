@@ -1068,6 +1068,21 @@ async function loadReadingHistory(textId: number) {
         isManual && session.source
           ? `<span class="source-badge">${escapeHtml(session.source.replace(/_/g, " "))}</span>`
           : "";
+      const timedStats =
+        session.is_complete &&
+        session.duration_seconds !== null &&
+        session.characters_per_minute !== null
+          ? `
+                <span class="history-stat">
+                  <strong>${speed.formatDuration(session.duration_seconds)}</strong>
+                  <span>Duration</span>
+                </span>
+                <span class="history-stat">
+                  <strong>${speed.formatSpeed(session.characters_per_minute)}</strong>
+                  <span>chars/min</span>
+                </span>
+            `
+          : "";
 
       html += `
         <div class="history-item ${statusClass}" data-session-id="${session.id}">
@@ -1080,16 +1095,7 @@ async function loadReadingHistory(textId: number) {
           </div>
           <div class="history-item-stats">
             ${session.is_complete
-              ? `
-                <span class="history-stat">
-                  <strong>${speed.formatDuration(session.duration_seconds || 0)}</strong>
-                  <span>Duration</span>
-                </span>
-                <span class="history-stat">
-                  <strong>${speed.formatSpeed(session.characters_per_minute || 0)}</strong>
-                  <span>chars/min</span>
-                </span>
-              `
+              ? timedStats
               : `<span class="history-stat"><strong>${speed.formatElapsedTime(session.started_at)}</strong><span>Elapsed</span></span>`
             }
             <span class="history-stat">
@@ -2133,14 +2139,19 @@ async function showOfflineLogModal() {
       </div>
 
       <div>
-        <label class="form-label">Total reading time</label>
+        <button type="button" id="offline-duration-toggle" class="btn-secondary" aria-expanded="false">
+          Add reading time
+        </button>
+        <div id="offline-duration-fields" hidden>
+        <label class="form-label">Total reading time (optional)</label>
         <div class="duration-row">
           <div>
-            <input type="number" id="duration-hours" min="0" max="23" value="0" placeholder="hrs" />
+            <input type="number" id="duration-hours" min="0" max="23" value="" placeholder="hrs" />
           </div>
           <div>
-            <input type="number" id="duration-minutes" min="0" max="59" value="30" placeholder="min" />
+            <input type="number" id="duration-minutes" min="0" max="59" value="" placeholder="min" />
           </div>
+        </div>
         </div>
       </div>
 
@@ -2162,6 +2173,14 @@ async function showOfflineLogModal() {
   `;
 
   const modal = createModal("Log offline reading", modalContent);
+
+  const durationToggle = modal.querySelector("#offline-duration-toggle") as HTMLButtonElement;
+  const durationFields = modal.querySelector("#offline-duration-fields") as HTMLElement;
+  durationToggle.addEventListener("click", () => {
+    const expanded = durationToggle.getAttribute("aria-expanded") === "true";
+    durationToggle.setAttribute("aria-expanded", String(!expanded));
+    durationFields.hidden = expanded;
+  });
 
   function refreshChips() {
     const chipList = modal.querySelector("#chip-list")!;
@@ -2277,12 +2296,13 @@ async function saveOfflineLog(
   const hoursInput = modal.querySelector("#duration-hours") as HTMLInputElement;
   const minutesInput = modal.querySelector("#duration-minutes") as HTMLInputElement;
 
-  const hours = parseInt(hoursInput.value) || 0;
-  const minutes = parseInt(minutesInput.value) || 0;
-  const totalSeconds = hours * 3600 + minutes * 60;
+  const hasDuration = hoursInput.value.trim() !== "" || minutesInput.value.trim() !== "";
+  const totalSeconds = hasDuration
+    ? (Number(hoursInput.value || 0) * 3600) + (Number(minutesInput.value || 0) * 60)
+    : null;
 
-  if (totalSeconds <= 0) {
-    alert("Please enter a reading duration.");
+  if (hasDuration && (!Number.isFinite(totalSeconds) || totalSeconds! <= 0)) {
+    alert("Reading time must be greater than zero, or leave both fields blank.");
     return;
   }
   if (selectedTexts.size === 0) {

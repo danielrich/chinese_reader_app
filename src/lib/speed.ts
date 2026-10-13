@@ -157,8 +157,8 @@ export interface ManualLogInput {
   text_ids: number[];
   /** When the session was finished (ISO 8601) */
   finished_at: string;
-  /** Total duration of the session in seconds */
-  total_duration_seconds: number;
+  /** Total duration of the session in seconds, or null for an untimed read */
+  total_duration_seconds: number | null;
   /** Source identifier for this offline session */
   source: string | null;
 }
