@@ -13,10 +13,11 @@ This change adds:
 
 - An **Export as EPUB** action on every shelf.
 - A server endpoint that generates and downloads one EPUB for the selected shelf subtree.
+- Clickable first occurrences of unknown segmented words with offline definitions.
 - Optional rather than mandatory duration fields in the existing offline-read modal.
 - Backend support for completed manual reading sessions whose duration and speed are unknown.
 
-It does not send files directly to an Amazon account, manage Kindle Collections, export vocabulary or analysis data, synchronize Kindle annotations back into Chinese Reader, or add PDF export.
+It does not send files directly to an Amazon account, manage Kindle Collections, export vocabulary-study progress or analysis reports, synchronize Kindle annotations back into Chinese Reader, or add PDF export. It does embed the minimum vocabulary status and dictionary-definition information needed to produce the requested word links.
 
 ## EPUB export
 
@@ -29,6 +30,8 @@ The selected shelf becomes the book title and top-level navigation entry. Child 
 For example, exporting `總會大會` produces one book with conference shelves as sections and talks as chapters. Exporting `2026年十月總會大會` produces a smaller book containing only that conference and its talks.
 
 The button is disabled while a download is being prepared and reports a concise error if generation fails. No database state changes during export.
+
+Within each text, the first occurrence of every unknown segmented word with an available dictionary definition is visually distinguished with a dotted underline and is clickable. Tapping it on Kindle Scribe opens the definition as a footnote popup. The popup can be closed without leaving the reading position, or the reader can choose to navigate to the full definition page and then use **Back to reading** to return to the exact word.
 
 ### Server architecture
 
@@ -54,8 +57,21 @@ Generate an EPUB 3 document with:
 - An EPUB navigation document whose nested ordered lists mirror the shelf hierarchy.
 - A linear spine containing chapters in depth-first display order.
 - Minimal embedded CSS optimized for horizontal Chinese reading on e-ink.
+- Per-chapter footnotes for linked unknown words.
 
 Shelf names, titles, authors, and text content are escaped as XML. Plain-text paragraphs are produced by splitting stored content on blank lines and line breaks; source text is never interpreted as markup. Shelf sections without direct prose link to their first descendant chapter. Authors are rendered beneath chapter titles when present.
+
+### Unknown-word definitions
+
+Use the app's existing Jieba segmentation and vocabulary status rules. A segmented word is unknown when it is not marked `known`; words marked `learning` and words with no saved status are therefore eligible. Only multi-character segments classified as words are linked in the initial version. Known words, punctuation, whitespace, and single-character segments remain ordinary text.
+
+Only the first occurrence of each distinct eligible word in a text is linked. Later occurrences remain unstyled. This keeps long talks readable while still providing one accessible definition for each unknown word.
+
+Resolve definitions from the existing dictionary lookup sources using their normal priority. A footnote contains the word, pinyin when available, and the first useful definition. If no definition is available, leave the word unlinked. Dictionary content is captured in the EPUB at export time, so lookup works offline and does not change if the app's dictionary later changes.
+
+Render the first occurrence as an anchor with `epub:type="noteref"` pointing to a chapter-local `<aside epub:type="footnote">`. Each footnote includes a bidirectional **Back to reading** link. Definitions follow the chapter text.
+
+Scribe testing established an important layout constraint: page-break and minimum-height styling must never be applied directly to the footnote `<aside>`, because that prevents the popup from previewing the definition. Instead, place each plain footnote inside an outer definition-page `<section>`. Apply `break-before: page`, legacy `page-break-before: always`, and corresponding break-after rules to the outer section only. This yields all three desired behaviors on Scribe: an immediate popup preview, **Go to footnote** navigation to an isolated definition page, and a working return link to the source word.
 
 The implementation uses a small ZIP dependency and explicit EPUB files rather than a browser-side generator. This centralizes database traversal, avoids downloading every chapter as separate API calls, and makes the same export available to any browser client.
 
@@ -64,6 +80,7 @@ The implementation uses a small ZIP dependency and explicit EPUB files rather th
 - Unknown shelf: `404`.
 - Shelf subtree with no texts: `400` with a user-readable message.
 - Invalid XML characters are removed while valid Unicode, including CJK extension characters, is retained.
+- Dictionary lookup failures affect only the relevant word; the chapter still exports with that word unlinked.
 - Oversized export or ZIP/build failure: `500` with a concise response; partial files are never returned.
 - A failed export leaves the database and shelf UI unchanged.
 
@@ -108,6 +125,10 @@ Rust unit tests cover:
 - Escaping titles, authors, and Chinese text into valid XHTML/XML.
 - Required EPUB ZIP entries and the uncompressed first `mimetype` entry.
 - Nested navigation matching a multi-level shelf tree.
+- Jieba segmentation links only the first occurrence of each distinct unknown multi-character word.
+- Known words and unknown words without definitions remain unlinked.
+- Footnotes contain word, pinyin, definition, and a backlink to the exact source anchor.
+- Page-break CSS is attached to an outer definition section and never to the inner footnote aside.
 - Empty and missing shelf errors.
 - Untimed manual logs producing completed sessions with null duration/speed while preserving characters, first-read state, and streak eligibility.
 - Timed manual logs retaining proportional duration and CPM behavior.
@@ -117,7 +138,7 @@ Server tests cover EPUB response content type, filename headers, unknown/empty s
 
 Frontend/browser tests cover the shelf button, successful download request, visible export failure, the collapsed optional-time control, saving an untimed read, and saving a timed read. Existing Rust, TypeScript build, and Playwright offline tests must remain green.
 
-Validate a generated General Conference EPUB with an EPUB validator when available, inspect its nested TOC in Kindle Previewer, and perform one Send to Kindle smoke test on the Scribe after deployment.
+Validate a generated General Conference EPUB with an EPUB validator when available and inspect its nested TOC in Kindle Previewer. The prototype `noteref` structure has been tested through Send to Kindle on a Scribe: a plain inner footnote inside a page-breaking outer wrapper displays the definition in the popup, navigates to an isolated definition page, and returns to the exact reading position. Repeat that smoke test with the production-generated EPUB after deployment.
 
 ## Deployment and rollback
 
