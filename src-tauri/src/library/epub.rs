@@ -70,6 +70,7 @@ const MAX_EXPORT_BYTES: usize = 200 * 1024 * 1024;
 const EPUB_CSS: &str = r#"body { font-family: serif; line-height: 1.65; margin: 5%; }
 .unknown { text-decoration: underline; text-decoration-style: dotted; font-weight: 600; }
 .definition-page-wrapper { break-before: page; page-break-before: always; break-after: page; page-break-after: always; }
+.definition-card { border-top: 1px solid #999; padding-top: 0.75em; }
 .back-link { display: block; margin-top: 2em; font-weight: 700; }
 .pinyin { font-style: italic; }
 "#;
@@ -260,7 +261,7 @@ fn render_chapter(prepared: &PreparedChapter) -> String {
     }
     let definitions = prepared.definitions.iter().enumerate().map(|(index, definition)| {
         let pinyin = definition.content.pinyin.as_ref().map(|p| format!("<p class=\"pinyin\">{}</p>", sanitize_xml_text(p))).unwrap_or_default();
-        format!("<section class=\"definition-page-wrapper\"><aside epub:type=\"footnote\" id=\"{}\"><h2>{}</h2>{}<p>{}</p><a class=\"back-link\" href=\"#source-{}-{}\">Back to reading</a></aside></section>", definition.id, sanitize_xml_text(&definition.content.word), pinyin, sanitize_xml_text(&definition.content.definition), prepared.chapter.text_id, index + 1)
+        format!("<section class=\"definition-page-wrapper\"><aside id=\"{}\" class=\"definition-card\" epub:type=\"footnote\"><h2>{}</h2>{}<p>{}</p><a class=\"back-link\" href=\"#source-{}-{}\">Back to reading</a></aside></section>", definition.id, sanitize_xml_text(&definition.content.word), pinyin, sanitize_xml_text(&definition.content.definition), prepared.chapter.text_id, index + 1)
     }).collect::<String>();
     let author = prepared
         .chapter
@@ -741,12 +742,17 @@ mod tests {
         let chapter = read_entry(&mut archive, "OEBPS/chapter-11.xhtml");
         assert!(chapter.contains("epub:type=\"noteref\""));
         assert!(chapter.contains("<section class=\"definition-page-wrapper\">"));
-        assert!(chapter.contains("<aside epub:type=\"footnote\""));
+        assert!(chapter.contains(
+            "<aside id=\"def-11-1\" class=\"definition-card\" epub:type=\"footnote\">"
+        ));
         assert!(chapter.contains("href=\"#source-11-1\""));
         assert!(chapter.contains("&amp; &lt; &gt; &quot; &apos;"));
         assert!(!chapter.contains('\u{0001}'));
         let css = read_entry(&mut archive, "OEBPS/style.css");
         assert!(css.contains(".definition-page-wrapper"));
+        assert!(css.contains(
+            ".definition-card { border-top: 1px solid #999; padding-top: 0.75em; }"
+        ));
         assert!(!css.contains("aside { break-before"));
     }
 
