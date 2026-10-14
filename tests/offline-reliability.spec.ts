@@ -110,6 +110,18 @@ test("text API responses are never stored in service-worker caches", async ({ pa
   expect(cached).toEqual({ found: false });
 });
 
+test("EPUB exports are never stored in service-worker caches", async ({ page }) => {
+  await bootstrapControlledApp(page);
+  await page.evaluate(() => fetch("/api/shelves/987654/export.epub"));
+  const cached = await page.evaluate(async () => {
+    for (const name of await caches.keys()) {
+      if (await (await caches.open(name)).match("/api/shelves/987654/export.epub")) return true;
+    }
+    return false;
+  });
+  expect(cached).toBe(false);
+});
+
 test("copy diagnostics exposes local and worker recovery evidence", async ({ page, context }) => {
   await context.grantPermissions(["clipboard-read", "clipboard-write"]);
   await bootstrapControlledApp(page);

@@ -389,6 +389,7 @@ pub fn get_speed_data(
         FROM reading_sessions rs
         JOIN texts t ON rs.text_id = t.id
         WHERE rs.is_complete = 1
+          AND rs.characters_per_minute IS NOT NULL
         "#,
     );
 
@@ -511,6 +512,7 @@ pub fn get_speed_stats(
             FROM reading_sessions rs
             JOIN texts t ON rs.text_id = t.id
             WHERE rs.is_complete = 1
+              AND rs.characters_per_minute IS NOT NULL
               AND (? = 0 OR rs.is_first_read = 1)
             {}
             ORDER BY rs.finished_at DESC
@@ -535,6 +537,7 @@ pub fn get_speed_stats(
                 SELECT rs.characters_per_minute
                 FROM reading_sessions rs
                 WHERE rs.is_complete = 1
+                  AND rs.characters_per_minute IS NOT NULL
                   AND (? = 0 OR rs.is_first_read = 1)
                 ORDER BY rs.finished_at DESC
                 LIMIT 5
@@ -1041,6 +1044,7 @@ fn recent_average_for_read_number_scoped(
                 FROM reading_sessions rs
                 JOIN texts t ON rs.text_id = t.id
                 WHERE rs.is_complete = 1
+                  AND rs.characters_per_minute IS NOT NULL
                   AND (
                       SELECT COUNT(*)
                       FROM reading_sessions prior
@@ -1441,6 +1445,12 @@ mod tests {
         let streak = get_reading_streak(&conn).unwrap();
         assert!(streak.read_today);
         assert!(streak.current_streak >= 1);
+        assert!(get_speed_data(&conn, None, true, None).unwrap().is_empty());
+        assert_eq!(
+            get_speed_stats(&conn, None, true).unwrap().average_speed,
+            0.0
+        );
+        assert!(!get_read_pass_estimates(&conn, None).unwrap().is_empty());
     }
 
     #[test]

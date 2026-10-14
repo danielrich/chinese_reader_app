@@ -75,6 +75,7 @@ const EPUB_CSS: &str = r#"body { font-family: serif; line-height: 1.65; margin: 
 "#;
 
 pub fn export_shelf_epub(conn: &Connection, shelf_id: i64) -> Result<ExportedEpub> {
+    preflight_export_size(conn, shelf_id, MAX_EXPORT_BYTES)?;
     let book = load_export_book(conn, shelf_id)?;
     let bytes = build_epub(conn, &book)?;
     let filename = format!("{}.epub", sanitize_filename(&book.title));
@@ -82,8 +83,12 @@ pub fn export_shelf_epub(conn: &Connection, shelf_id: i64) -> Result<ExportedEpu
 }
 
 pub fn build_epub(conn: &Connection, book: &ExportBook) -> Result<Vec<u8>> {
+    build_epub_with_limit(conn, book, MAX_EXPORT_BYTES)
+}
+
+fn build_epub_with_limit(conn: &Connection, book: &ExportBook, limit: usize) -> Result<Vec<u8>> {
     let estimated = estimated_content_bytes(&book.root);
-    if estimated > MAX_EXPORT_BYTES {
+    if estimated > limit {
         return Err(LibraryError::InvalidInput(
             "EPUB export is too large".into(),
         ));
@@ -95,17 +100,21 @@ pub fn build_epub(conn: &Connection, book: &ExportBook) -> Result<Vec<u8>> {
         .map(|chapter| (chapter.text_id, format!("chapter-{}", chapter.text_id)))
         .collect();
     let mut cache = HashMap::new();
-    let chapters = source
-        .into_iter()
-        .map(|chapter| {
-            let prepared = prepare_chapter(conn, chapter, &mut cache)?;
-            Ok(RenderedChapter {
-                id: format!("chapter-{}", chapter.text_id),
-                href: format!("chapter-{}.xhtml", chapter.text_id),
-                xhtml: render_chapter(&prepared),
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let mut generated_bytes = 0usize;
+    let mut chapters = Vec::with_capacity(source.len());
+    for chapter in source {
+        let prepared = prepare_chapter(conn, chapter, &mut cache)?;
+        generated_bytes = generated_bytes
+            .checked_add(prepared_render_upper_bound(&prepared))
+            .filter(|total| *total <= limit)
+            .ok_or_else(|| LibraryError::InvalidInput("EPUB export is too large".into()))?;
+        let rendered = RenderedChapter {
+            id: format!("chapter-{}", chapter.text_id),
+            href: format!("chapter-{}.xhtml", chapter.text_id),
+            xhtml: render_chapter(&prepared),
+        };
+        chapters.push(rendered);
+    }
 
     let modified = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let entries = [
@@ -114,7 +123,7 @@ pub fn build_epub(conn: &Connection, book: &ExportBook) -> Result<Vec<u8>> {
         ("OEBPS/nav.xhtml", render_nav(book, &chapter_ids)),
         ("OEBPS/content.opf", render_package(book, &chapters, &modified)),
     ];
-    let cursor = Cursor::new(Vec::with_capacity(estimated.min(MAX_EXPORT_BYTES)));
+    let cursor = Cursor::new(Vec::with_capacity(estimated.min(limit)));
     let mut zip = zip::ZipWriter::new(cursor);
     zip.start_file(
         "mimetype",
@@ -134,6 +143,54 @@ pub fn build_epub(conn: &Connection, book: &ExportBook) -> Result<Vec<u8>> {
         zip.write_all(chapter.xhtml.as_bytes())?;
     }
     Ok(zip.finish().map_err(zip_error)?.into_inner())
+}
+
+fn preflight_export_size(conn: &Connection, shelf_id: i64, limit: usize) -> Result<()> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM shelves WHERE id = ?)",
+        [shelf_id],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Err(LibraryError::ShelfNotFound(shelf_id));
+    }
+    let bytes: i64 = conn.query_row(
+        "WITH RECURSIVE shelf_tree(id) AS (SELECT id FROM shelves WHERE id = ? UNION ALL SELECT s.id FROM shelves s JOIN shelf_tree st ON s.parent_id = st.id) SELECT COALESCE(SUM(LENGTH(CAST(t.content AS BLOB)) + LENGTH(CAST(t.title AS BLOB)) + COALESCE(LENGTH(CAST(t.author AS BLOB)), 0)), 0) FROM texts t WHERE t.shelf_id IN (SELECT id FROM shelf_tree)",
+        [shelf_id], |row| row.get(0))?;
+    if bytes as usize > limit {
+        return Err(LibraryError::InvalidInput(
+            "EPUB export is too large".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn prepared_render_upper_bound(prepared: &PreparedChapter) -> usize {
+    let escaped = |value: &str| value.len().saturating_mul(6);
+    let segment_bytes = prepared
+        .segments
+        .iter()
+        .map(|segment| {
+            escaped(&segment.text).saturating_add(if segment.definition_id.is_some() {
+                256
+            } else {
+                0
+            })
+        })
+        .sum::<usize>();
+    let definition_bytes = prepared
+        .definitions
+        .iter()
+        .map(|definition| {
+            escaped(&definition.content.word)
+                .saturating_add(definition.content.pinyin.as_deref().map_or(0, escaped))
+                .saturating_add(escaped(&definition.content.definition))
+                .saturating_add(512)
+        })
+        .sum::<usize>();
+    segment_bytes
+        .saturating_add(definition_bytes)
+        .saturating_add(2048)
 }
 
 fn zip_error(error: zip::result::ZipError) -> LibraryError {
@@ -211,12 +268,16 @@ fn render_chapter(prepared: &PreparedChapter) -> String {
         .as_ref()
         .map(|a| format!("<p class=\"author\">{}</p>", sanitize_xml_text(a)))
         .unwrap_or_default();
+    let paragraphs = body
+        .split("\n\n")
+        .map(|paragraph| format!("<p>{}</p>", paragraph.replace('\n', "<br/>")))
+        .collect::<String>();
     format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><head><title>{}</title><link rel="stylesheet" type="text/css" href="style.css"/></head><body><article><h1>{}</h1>{}<p>{}</p></article>{}</body></html>"#,
+        r#"<?xml version="1.0" encoding="UTF-8"?><html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><head><title>{}</title><link rel="stylesheet" type="text/css" href="style.css"/></head><body><article><h1>{}</h1>{}{}</article>{}</body></html>"#,
         sanitize_xml_text(&prepared.chapter.title),
         sanitize_xml_text(&prepared.chapter.title),
         author,
-        body,
+        paragraphs,
         definitions
     )
 }
@@ -316,21 +377,28 @@ pub fn prepare_chapter(
                     max_results: Some(10),
                     ..Default::default()
                 };
-                let result = crate::dictionary::lookup(conn, &segment.text, &options)?;
-                let found = result.entries.into_iter().find_map(|entry| {
-                    let definition = entry.definitions.first()?.text.trim().to_string();
-                    if definition.is_empty() {
-                        return None;
+                let found = match crate::dictionary::lookup(conn, &segment.text, &options) {
+                    Ok(result) => result.entries.into_iter().find_map(|entry| {
+                        let definition = entry.definitions.first()?.text.trim().to_string();
+                        if definition.is_empty() {
+                            return None;
+                        }
+                        Some(DefinitionContent {
+                            word: segment.text.clone(),
+                            pinyin: entry
+                                .pinyin_display
+                                .filter(|value| !value.trim().is_empty())
+                                .or_else(|| {
+                                    (!entry.pinyin.trim().is_empty()).then_some(entry.pinyin)
+                                }),
+                            definition,
+                        })
+                    }),
+                    Err(error) => {
+                        eprintln!("Skipping EPUB definition for {:?}: {}", segment.text, error);
+                        None
                     }
-                    Some(DefinitionContent {
-                        word: segment.text.clone(),
-                        pinyin: entry
-                            .pinyin_display
-                            .filter(|value| !value.trim().is_empty())
-                            .or_else(|| (!entry.pinyin.trim().is_empty()).then_some(entry.pinyin)),
-                        definition,
-                    })
-                });
+                };
                 cache.insert(segment.text.clone(), found.clone());
                 found
             };
@@ -577,6 +645,63 @@ mod tests {
         let prepared =
             prepare_chapter(&conn, &chapter, &mut std::collections::HashMap::new()).unwrap();
         assert_eq!(prepared.definitions.len(), 1);
+    }
+
+    #[test]
+    fn prepare_chapter_degrades_dictionary_errors_to_unlinked_text() {
+        let conn = setup_export_db();
+        crate::library::analysis::add_segmentation_word("救贖", Some(100));
+        conn.execute("DROP TABLE definitions", []).unwrap();
+        let chapter = ExportChapter {
+            text_id: 79,
+            title: "T".into(),
+            author: None,
+            content: "救贖".into(),
+        };
+        let prepared = prepare_chapter(&conn, &chapter, &mut HashMap::new()).unwrap();
+        assert!(prepared.definitions.is_empty());
+        assert!(prepared
+            .segments
+            .iter()
+            .all(|segment| segment.definition_id.is_none()));
+    }
+
+    #[test]
+    fn build_epub_preserves_paragraph_and_line_breaks() {
+        let conn = setup_export_db();
+        let mut book = load_export_book(&conn, 1).unwrap();
+        book.root.chapters[0].content = "第一行\n第二行\n\n第二段".into();
+        let bytes = build_epub(&conn, &book).unwrap();
+        let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let chapter = read_entry(&mut archive, "OEBPS/chapter-11.xhtml");
+        assert!(chapter.contains("<p>第一行<br/>第二行</p><p>第二段</p>"));
+    }
+
+    #[test]
+    fn build_epub_accounts_for_generated_definition_content() {
+        let conn = setup_export_db();
+        crate::library::analysis::add_segmentation_word("救贖", Some(100));
+        seed_definition(&conn, "救贖", "jiu4 shu2", "jiùshú");
+        conn.execute("UPDATE definitions SET text = ?", ["&".repeat(200)])
+            .unwrap();
+        let book = ExportBook {
+            shelf_id: 1,
+            title: "T".into(),
+            root: ExportSection {
+                shelf_id: 1,
+                title: "T".into(),
+                chapters: vec![ExportChapter {
+                    text_id: 1,
+                    title: "T".into(),
+                    author: None,
+                    content: "救贖".into(),
+                }],
+                children: vec![],
+            },
+        };
+        assert!(
+            matches!(build_epub_with_limit(&conn, &book, 300), Err(LibraryError::InvalidInput(message)) if message == "EPUB export is too large")
+        );
     }
 
     fn read_entry(archive: &mut zip::ZipArchive<Cursor<Vec<u8>>>, name: &str) -> String {
