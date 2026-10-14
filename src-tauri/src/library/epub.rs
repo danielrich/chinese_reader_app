@@ -360,60 +360,58 @@ pub fn prepare_chapter(
     cache: &mut HashMap<String, Option<DefinitionContent>>,
 ) -> Result<PreparedChapter> {
     let source_segments = super::analysis::segment_text(conn, &chapter.content)?;
-    let mut linked_words = HashSet::new();
+    let mut known_characters = HashSet::new();
+    let mut known_stmt = conn.prepare(
+        "SELECT word FROM known_words WHERE status = 'known' AND length(word) = 1",
+    )?;
+    for character in known_stmt.query_map([], |row| row.get::<_, String>(0))? {
+        known_characters.insert(character?);
+    }
+    let mut linked_terms = HashSet::new();
     let mut definitions = Vec::new();
     let mut segments = Vec::with_capacity(source_segments.len());
 
     for segment in source_segments {
-        let eligible = segment.segment_type == "word" && !segment.is_known;
-        let mut definition_id = None;
-        if eligible && !linked_words.contains(&segment.text) {
-            let content = if let Some(cached) = cache.get(&segment.text) {
-                cached.clone()
-            } else {
-                let options = crate::dictionary::LookupOptions {
-                    include_examples: false,
-                    include_character_info: false,
-                    include_user_dictionaries: false,
-                    max_results: Some(10),
-                    ..Default::default()
-                };
-                let found = match crate::dictionary::lookup(conn, &segment.text, &options) {
-                    Ok(result) => result.entries.into_iter().find_map(|entry| {
-                        let definition = entry.definitions.first()?.text.trim().to_string();
-                        if definition.is_empty() {
-                            return None;
-                        }
-                        Some(DefinitionContent {
-                            word: segment.text.clone(),
-                            pinyin: entry
-                                .pinyin_display
-                                .filter(|value| !value.trim().is_empty())
-                                .or_else(|| {
-                                    (!entry.pinyin.trim().is_empty()).then_some(entry.pinyin)
-                                }),
-                            definition,
-                        })
-                    }),
-                    Err(error) => {
-                        eprintln!("Skipping EPUB definition for {:?}: {}", segment.text, error);
-                        None
-                    }
-                };
-                cache.insert(segment.text.clone(), found.clone());
-                found
-            };
+        if segment.segment_type == "word" && !segment.is_known {
+            let content = lookup_definition(conn, &segment.text, cache);
             if let Some(content) = content {
-                let id = format!("def-{}-{}", chapter.text_id, definitions.len() + 1);
-                definition_id = Some(id.clone());
-                definitions.push(ExportDefinition { id, content });
-                linked_words.insert(segment.text.clone());
+                let definition_id = if linked_terms.insert(segment.text.clone()) {
+                    Some(push_definition(chapter.text_id, content, &mut definitions))
+                } else {
+                    None
+                };
+                segments.push(PreparedSegment {
+                    text: segment.text,
+                    definition_id,
+                });
+                continue;
             }
         }
-        segments.push(PreparedSegment {
-            text: segment.text,
-            definition_id,
-        });
+
+        if segment.is_cjk {
+            for character in segment.text.chars() {
+                let text = character.to_string();
+                let definition_id = if !known_characters.contains(&text)
+                    && !linked_terms.contains(&text)
+                {
+                    lookup_definition(conn, &text, cache).map(|content| {
+                        linked_terms.insert(text.clone());
+                        push_definition(chapter.text_id, content, &mut definitions)
+                    })
+                } else {
+                    None
+                };
+                segments.push(PreparedSegment {
+                    text,
+                    definition_id,
+                });
+            }
+        } else {
+            segments.push(PreparedSegment {
+                text: segment.text,
+                definition_id: None,
+            });
+        }
     }
 
     Ok(PreparedChapter {
@@ -421,6 +419,58 @@ pub fn prepare_chapter(
         segments,
         definitions,
     })
+}
+
+fn push_definition(
+    text_id: i64,
+    content: DefinitionContent,
+    definitions: &mut Vec<ExportDefinition>,
+) -> String {
+    let id = format!("def-{}-{}", text_id, definitions.len() + 1);
+    definitions.push(ExportDefinition {
+        id: id.clone(),
+        content,
+    });
+    id
+}
+
+fn lookup_definition(
+    conn: &Connection,
+    term: &str,
+    cache: &mut HashMap<String, Option<DefinitionContent>>,
+) -> Option<DefinitionContent> {
+    if let Some(cached) = cache.get(term) {
+        return cached.clone();
+    }
+    let options = crate::dictionary::LookupOptions {
+        include_examples: false,
+        include_character_info: false,
+        include_user_dictionaries: false,
+        max_results: Some(10),
+        ..Default::default()
+    };
+    let found = match crate::dictionary::lookup(conn, term, &options) {
+        Ok(result) => result.entries.into_iter().find_map(|entry| {
+            let definition = entry.definitions.first()?.text.trim().to_string();
+            if definition.is_empty() {
+                return None;
+            }
+            Some(DefinitionContent {
+                word: term.to_string(),
+                pinyin: entry
+                    .pinyin_display
+                    .filter(|value| !value.trim().is_empty())
+                    .or_else(|| (!entry.pinyin.trim().is_empty()).then_some(entry.pinyin)),
+                definition,
+            })
+        }),
+        Err(error) => {
+            eprintln!("Skipping EPUB definition for {:?}: {}", term, error);
+            None
+        }
+    };
+    cache.insert(term.to_string(), found.clone());
+    found
 }
 
 pub fn load_export_book(conn: &Connection, shelf_id: i64) -> Result<ExportBook> {
@@ -621,10 +671,14 @@ mod tests {
             prepared.definitions[0].content.pinyin.as_deref(),
             Some("jiùshú")
         );
-        assert!(prepared
-            .segments
-            .iter()
-            .any(|s| s.text == "未收錄詞語" && s.definition_id.is_none()));
+        assert_eq!(
+            prepared
+                .segments
+                .iter()
+                .map(|segment| segment.text.as_str())
+                .collect::<String>(),
+            chapter.content
+        );
     }
 
     #[test]
@@ -646,6 +700,60 @@ mod tests {
         let prepared =
             prepare_chapter(&conn, &chapter, &mut std::collections::HashMap::new()).unwrap();
         assert_eq!(prepared.definitions.len(), 1);
+    }
+
+    #[test]
+    fn prepare_chapter_links_unknown_characters_outside_linked_words_once() {
+        let conn = setup_export_db();
+        for word in ["救贖", "力量"] {
+            crate::library::analysis::add_segmentation_word(word, Some(100));
+        }
+        for term in ["救贖", "救", "贖", "希", "力量", "力", "量"] {
+            seed_definition(&conn, term, "pin1 yin1", "pīnyīn");
+        }
+        conn.execute(
+            "INSERT INTO known_words (word, word_type, status) VALUES ('力量', 'word', 'known')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO known_words (word, word_type, status) VALUES ('力', 'character', 'known')",
+            [],
+        )
+        .unwrap();
+        let chapter = ExportChapter {
+            text_id: 80,
+            title: "T".into(),
+            author: None,
+            content: "救贖救贖希希力量力量".into(),
+        };
+
+        let prepared = prepare_chapter(&conn, &chapter, &mut HashMap::new()).unwrap();
+
+        assert_eq!(
+            prepared
+                .definitions
+                .iter()
+                .map(|definition| definition.content.word.as_str())
+                .collect::<Vec<_>>(),
+            vec!["救贖", "希", "量"]
+        );
+        assert_eq!(
+            prepared
+                .segments
+                .iter()
+                .map(|segment| segment.text.as_str())
+                .collect::<String>(),
+            chapter.content
+        );
+        assert_eq!(
+            prepared
+                .segments
+                .iter()
+                .filter(|segment| segment.definition_id.is_some())
+                .count(),
+            3
+        );
     }
 
     #[test]
