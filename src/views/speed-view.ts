@@ -22,7 +22,7 @@ export async function loadSpeedView() {
   try {
     const [stats, data, passEstimates, shelves, autoMarkEnabled] = await Promise.all([
       speed.getSpeedStats(currentSpeedShelfId ?? undefined, firstReadsOnly),
-      speed.getSpeedData(currentSpeedShelfId ?? undefined, firstReadsOnly, 100),
+      speed.getSpeedData(currentSpeedShelfId ?? undefined, firstReadsOnly),
       speed.getReadPassEstimates(currentSpeedShelfId ?? undefined),
       library.getShelfTree(),
       library.isAutoMarkEnabled(),

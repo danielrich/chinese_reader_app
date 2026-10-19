@@ -30,7 +30,10 @@ const DB_PRAGMAS: &str =
     "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=30000;";
 const WRITE_WAIT_LOG_THRESHOLD: Duration = Duration::from_millis(250);
 
-fn cache_control_for_static_response(path: &str, content_type: Option<&str>) -> Option<&'static str> {
+fn cache_control_for_static_response(
+    path: &str,
+    content_type: Option<&str>,
+) -> Option<&'static str> {
     if path.starts_with("/api/") || path == "/health" {
         return None;
     }
@@ -51,7 +54,9 @@ async fn add_static_cache_headers(request: Request, next: Next) -> Response {
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok());
     if let Some(policy) = cache_control_for_static_response(&path, content_type) {
-        response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static(policy));
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static(policy));
     }
     response
 }
@@ -62,10 +67,80 @@ mod static_header_tests {
 
     #[test]
     fn assigns_release_safe_cache_policies() {
-        assert_eq!(cache_control_for_static_response("/sw.js", Some("text/javascript")), Some("no-cache"));
-        assert_eq!(cache_control_for_static_response("/index.html", Some("text/html; charset=utf-8")), Some("no-cache"));
-        assert_eq!(cache_control_for_static_response("/assets/main-abc123.js", Some("text/javascript")), Some("public, max-age=31536000, immutable"));
-        assert_eq!(cache_control_for_static_response("/api/texts/1", Some("application/json")), None);
+        assert_eq!(
+            cache_control_for_static_response("/sw.js", Some("text/javascript")),
+            Some("no-cache")
+        );
+        assert_eq!(
+            cache_control_for_static_response("/index.html", Some("text/html; charset=utf-8")),
+            Some("no-cache")
+        );
+        assert_eq!(
+            cache_control_for_static_response("/assets/main-abc123.js", Some("text/javascript")),
+            Some("public, max-age=31536000, immutable")
+        );
+        assert_eq!(
+            cache_control_for_static_response("/api/texts/1", Some("application/json")),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod epub_handler_tests {
+    use super::*;
+    use axum::response::IntoResponse;
+
+    fn test_pool() -> Db {
+        let conn = Connection::open_in_memory().unwrap();
+        dictionary::schema::init_database(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO shelves (id, name, sort_order) VALUES (1, 'Test Shelf', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO shelves (id, name, sort_order) VALUES (2, 'Empty', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO texts (id, shelf_id, title, content, character_count) VALUES (1, 1, 'Talk', '內容', 2)", []).unwrap();
+        DbPool::new(vec![conn])
+    }
+
+    async fn response_for(id: i64) -> Response {
+        match export_shelf_epub_handler(State(test_pool()), Path(id)).await {
+            Ok(response) => response.into_response(),
+            Err(error) => error.into_response(),
+        }
+    }
+
+    #[tokio::test]
+    async fn export_shelf_epub_returns_attachment_headers() {
+        let response = response_for(1).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/epub+zip"
+        );
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert!(response.headers()[header::CONTENT_DISPOSITION]
+            .to_str()
+            .unwrap()
+            .contains("filename*=UTF-8''"));
+        assert_eq!(
+            cache_control_for_static_response(
+                "/api/shelves/1/export.epub",
+                Some("application/epub+zip")
+            ),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn export_shelf_epub_maps_missing_and_empty_shelves() {
+        assert_eq!(response_for(99).await.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response_for(2).await.status(), StatusCode::BAD_REQUEST);
     }
 }
 
@@ -225,6 +300,10 @@ async fn main() {
         .route("/api/invoke/{command}", post(dispatch))
         .route("/api/texts/{id}", get(get_text_handler))
         .route(
+            "/api/shelves/{id}/export.epub",
+            get(export_shelf_epub_handler),
+        )
+        .route(
             "/api/texts/{id}/vocab-cache",
             get(get_text_vocab_cache_handler),
         )
@@ -304,6 +383,62 @@ async fn get_text_handler(
     .await
     .map_err(|e| ApiError::Internal(e.to_string()))??;
     Ok(Json(result))
+}
+
+async fn export_shelf_epub_handler(
+    State(db): State<Db>,
+    Path(id): Path<i64>,
+) -> Result<Response, AppError> {
+    let conn = db.acquire().await;
+    let exported = tokio::task::spawn_blocking(move || library::epub::export_shelf_epub(&conn, id))
+        .await
+        .map_err(|error| ApiError::Internal(error.to_string()))?
+        .map_err(|error| match error {
+            library::LibraryError::ShelfNotFound(_) => ApiError::NotFound(error.to_string()),
+            library::LibraryError::InvalidInput(_) => ApiError::BadRequest(error.to_string()),
+            _ => ApiError::Internal(error.to_string()),
+        })?;
+
+    let encoded = rfc5987_encode(&exported.filename);
+    let disposition = format!("attachment; filename=\"shelf.epub\"; filename*=UTF-8''{encoded}");
+    let headers = [
+        (
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/epub+zip"),
+        ),
+        (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        (
+            header::CONTENT_DISPOSITION,
+            HeaderValue::from_str(&disposition)
+                .map_err(|error| ApiError::Internal(error.to_string()))?,
+        ),
+    ];
+    Ok((headers, exported.bytes).into_response())
+}
+
+fn rfc5987_encode(value: &str) -> String {
+    value
+        .as_bytes()
+        .iter()
+        .map(|byte| match *byte {
+            b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'!'
+            | b'#'
+            | b'$'
+            | b'&'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'|'
+            | b'~' => (*byte as char).to_string(),
+            other => format!("%{other:02X}"),
+        })
+        .collect()
 }
 
 async fn get_text_vocab_cache_handler(

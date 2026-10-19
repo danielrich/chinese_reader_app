@@ -71,9 +71,9 @@ impl ReadingSession {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManualLogInput {
     pub text_ids: Vec<i64>,
-    pub finished_at: String,         // ISO 8601 datetime chosen by user
-    pub total_duration_seconds: i64, // total reading time for all texts
-    pub source: Option<String>,      // "physical_book" | "other_site" | "phone" | null
+    pub finished_at: String, // ISO 8601 datetime chosen by user
+    pub total_duration_seconds: Option<i64>, // total reading time for all texts
+    pub source: Option<String>, // "physical_book" | "other_site" | "phone" | null
 }
 
 /// A data point for speed graphs
@@ -389,6 +389,7 @@ pub fn get_speed_data(
         FROM reading_sessions rs
         JOIN texts t ON rs.text_id = t.id
         WHERE rs.is_complete = 1
+          AND rs.characters_per_minute IS NOT NULL
         "#,
     );
 
@@ -412,11 +413,14 @@ pub fn get_speed_data(
         ));
     }
 
-    query.push_str(" ORDER BY rs.finished_at ASC ");
+    // Select the newest window first so a limit does not permanently pin the
+    // speed page to the oldest sessions. Reverse below to preserve the
+    // chronological order expected by the graph.
+    query.push_str(" ORDER BY rs.finished_at DESC, rs.id DESC ");
     query.push_str(&limit_clause);
 
     let mut stmt = conn.prepare(&query)?;
-    let data_points = stmt
+    let mut data_points = stmt
         .query_map([], |row| {
             Ok(SpeedDataPoint {
                 session_id: row.get("session_id")?,
@@ -437,6 +441,8 @@ pub fn get_speed_data(
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    data_points.reverse();
 
     Ok(data_points)
 }
@@ -511,6 +517,7 @@ pub fn get_speed_stats(
             FROM reading_sessions rs
             JOIN texts t ON rs.text_id = t.id
             WHERE rs.is_complete = 1
+              AND rs.characters_per_minute IS NOT NULL
               AND (? = 0 OR rs.is_first_read = 1)
             {}
             ORDER BY rs.finished_at DESC
@@ -535,6 +542,7 @@ pub fn get_speed_stats(
                 SELECT rs.characters_per_minute
                 FROM reading_sessions rs
                 WHERE rs.is_complete = 1
+                  AND rs.characters_per_minute IS NOT NULL
                   AND (? = 0 OR rs.is_first_read = 1)
                 ORDER BY rs.finished_at DESC
                 LIMIT 5
@@ -691,7 +699,10 @@ pub fn log_offline_read(conn: &Connection, input: ManualLogInput) -> Result<Vec<
     if input.text_ids.is_empty() {
         return Err(LibraryError::InvalidInput("No texts specified".into()));
     }
-    if input.total_duration_seconds <= 0 {
+    if input
+        .total_duration_seconds
+        .is_some_and(|seconds| seconds <= 0)
+    {
         return Err(LibraryError::InvalidInput(
             "Duration must be positive".into(),
         ));
@@ -751,15 +762,19 @@ pub fn log_offline_read(conn: &Connection, input: ManualLogInput) -> Result<Vec<
             .get(&text_id)
             .ok_or_else(|| LibraryError::TextNotFound(text_id))?;
 
-        // Proportional duration
-        let duration_secs = (input.total_duration_seconds as f64
-            * (char_count as f64 / total_chars as f64))
-            .round() as i64;
-        let duration_secs = duration_secs.max(1); // at least 1 second
-
-        let started_at = finished_at - chrono::Duration::seconds(duration_secs);
-
-        let characters_per_minute = char_count as f64 / (duration_secs as f64 / 60.0);
+        let (started_at, duration_seconds, characters_per_minute) =
+            if let Some(total_seconds) = input.total_duration_seconds {
+                let seconds = (total_seconds as f64 * (char_count as f64 / total_chars as f64))
+                    .round() as i64;
+                let seconds = seconds.max(1);
+                (
+                    finished_at - chrono::Duration::seconds(seconds),
+                    Some(seconds),
+                    Some(char_count as f64 / (seconds as f64 / 60.0)),
+                )
+            } else {
+                (finished_at, None, None)
+            };
         let text_known_char_percentage =
             calculate_text_known_percentage(conn, text_id, "character")?;
         let text_known_word_percentage = calculate_text_known_percentage(conn, text_id, "word")?;
@@ -803,7 +818,7 @@ pub fn log_offline_read(conn: &Connection, input: ManualLogInput) -> Result<Vec<
                 known_characters_count,
                 known_words_count,
                 cumulative,
-                duration_secs,
+                duration_seconds,
                 characters_per_minute,
                 text_known_char_percentage,
                 text_known_word_percentage,
@@ -1034,6 +1049,7 @@ fn recent_average_for_read_number_scoped(
                 FROM reading_sessions rs
                 JOIN texts t ON rs.text_id = t.id
                 WHERE rs.is_complete = 1
+                  AND rs.characters_per_minute IS NOT NULL
                   AND (
                       SELECT COUNT(*)
                       FROM reading_sessions prior
@@ -1262,6 +1278,19 @@ mod tests {
         conn
     }
 
+    fn setup_manual_log_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_database(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO shelves (id, name, sort_order) VALUES (1, 'S', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO texts (id, shelf_id, title, content, character_count) VALUES (1, 1, 'A', 'x', 1000)", []).unwrap();
+        conn.execute("INSERT INTO texts (id, shelf_id, title, content, character_count) VALUES (2, 1, 'B', 'x', 2000)", []).unwrap();
+        conn
+    }
+
     #[test]
     fn test_start_reading_session() {
         let conn = setup_test_db();
@@ -1357,24 +1386,13 @@ mod tests {
 
     #[test]
     fn test_log_offline_read_proportional_duration() {
-        use crate::dictionary::schema::init_database;
-        let conn = Connection::open_in_memory().unwrap();
-        init_database(&conn).unwrap();
-
-        conn.execute(
-            "INSERT INTO shelves (id, name, sort_order) VALUES (1, 'S', 0)",
-            [],
-        )
-        .unwrap();
-        // Text A: 1000 chars, Text B: 2000 chars → total 3000
-        conn.execute("INSERT INTO texts (id, shelf_id, title, content, character_count) VALUES (1, 1, 'A', 'x', 1000)", []).unwrap();
-        conn.execute("INSERT INTO texts (id, shelf_id, title, content, character_count) VALUES (2, 1, 'B', 'x', 2000)", []).unwrap();
+        let conn = setup_manual_log_db();
 
         let finished_at = "2026-04-25T21:00:00Z".to_string();
         let input = ManualLogInput {
             text_ids: vec![1, 2],
             finished_at: finished_at.clone(),
-            total_duration_seconds: 3000, // 50 minutes
+            total_duration_seconds: Some(3000), // 50 minutes
             source: Some("physical_book".to_string()),
         };
 
@@ -1394,6 +1412,65 @@ mod tests {
         // Text B (2000 chars / 3000 total) → 2000s duration
         let b = sessions.iter().find(|s| s.text_id == 2).unwrap();
         assert_eq!(b.duration_seconds, Some(2000));
+    }
+
+    #[test]
+    fn test_log_offline_read_without_duration_preserves_completion_metrics() {
+        let conn = setup_manual_log_db();
+        let finished_at = Local::now().to_rfc3339();
+        let sessions = log_offline_read(
+            &conn,
+            ManualLogInput {
+                text_ids: vec![1, 2],
+                finished_at: finished_at.clone(),
+                total_duration_seconds: None,
+                source: Some("physical_book".into()),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(sessions.len(), 2);
+        for session in &sessions {
+            assert!(session.is_complete);
+            assert!(session.is_manual_log);
+            assert_eq!(session.started_at, finished_at);
+            assert_eq!(session.duration_seconds, None);
+            assert_eq!(session.characters_per_minute, None);
+        }
+        assert_eq!(
+            sessions.iter().map(|s| s.character_count).sum::<i64>(),
+            3000
+        );
+        assert!(sessions.iter().all(|s| s.is_first_read));
+
+        let volumes = get_daily_reading_volume(&conn, 30).unwrap();
+        let volume = volumes.iter().find(|v| v.sessions_count == 2).unwrap();
+        assert_eq!(volume.characters_read, 3000);
+        assert_eq!(volume.reading_seconds, 0);
+        let streak = get_reading_streak(&conn).unwrap();
+        assert!(streak.read_today);
+        assert!(streak.current_streak >= 1);
+        assert!(get_speed_data(&conn, None, true, None).unwrap().is_empty());
+        assert_eq!(
+            get_speed_stats(&conn, None, true).unwrap().average_speed,
+            0.0
+        );
+        assert!(!get_read_pass_estimates(&conn, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_log_offline_read_rejects_supplied_zero_duration() {
+        let conn = setup_manual_log_db();
+        let result = log_offline_read(
+            &conn,
+            ManualLogInput {
+                text_ids: vec![1],
+                finished_at: "2026-10-13T18:00:00Z".into(),
+                total_duration_seconds: Some(0),
+                source: None,
+            },
+        );
+        assert!(matches!(result, Err(LibraryError::InvalidInput(_))));
     }
 
     #[test]
@@ -1419,7 +1496,7 @@ mod tests {
         let input = ManualLogInput {
             text_ids: vec![1],
             finished_at: "2026-04-25T21:00:00Z".to_string(),
-            total_duration_seconds: 600,
+            total_duration_seconds: Some(600),
             source: None,
         };
         let sessions = log_offline_read(&conn, input).unwrap();

@@ -109,6 +109,10 @@ self.addEventListener("fetch", (event) => {
   }
 
   if (url.pathname.startsWith("/api/")) {
+    if (/^\/api\/shelves\/\d+\/export\.epub$/.test(url.pathname)) {
+      event.respondWith(fetch(event.request));
+      return;
+    }
     if (url.pathname.startsWith("/api/texts/")) {
       event.respondWith(fetch(event.request));
       return;
