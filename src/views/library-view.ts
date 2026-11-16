@@ -1,6 +1,7 @@
 import * as dictionary from "../lib/dictionary";
 import * as library from "../lib/library";
 import * as speed from "../lib/speed";
+import { getSoftLineBreakOffsets } from "../lib/text-layout";
 import {
   type CacheMetadata,
   type OfflineTextBundleStatus,
@@ -116,6 +117,35 @@ export function setupLibraryView() {
   drawerToggle?.addEventListener("click", openShelfDrawer);
   drawerClose?.addEventListener("click", closeShelfDrawer);
   drawerBackdrop?.addEventListener("click", closeShelfDrawer);
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && document.getElementById("app")?.classList.contains("reading-focus")) {
+      setReadingFocus(false);
+      document.getElementById("reading-focus-btn")?.focus();
+    }
+  });
+  document.querySelectorAll(".nav-tab").forEach((tab) => {
+    tab.addEventListener("click", () => setReadingFocus(false));
+  });
+  window.matchMedia("(min-width: 701px)").addEventListener("change", () => setReadingFocus(false));
+}
+
+function setReadingFocus(enabled: boolean): void {
+  const app = document.getElementById("app");
+  const button = document.getElementById("reading-focus-btn");
+  const focused = enabled && window.matchMedia("(min-width: 701px)").matches && Boolean(button);
+  if (focused) {
+    document.querySelector<HTMLButtonElement>('.text-tab[data-tab="content"]')?.click();
+    document.getElementById("dict-sidebar")?.classList.remove("open");
+    closeShelfDrawer();
+  }
+  app?.classList.toggle("reading-focus", focused);
+  if (button) {
+    button.textContent = focused ? "Exit Focus" : "Focus mode";
+    button.setAttribute("aria-pressed", String(focused));
+    button.title = focused ? "Exit Focus (Escape)" : "Use the full window for reading";
+    if (focused) button.focus({ preventScroll: true });
+  }
 }
 
 function openShelfDrawer() {
@@ -233,6 +263,7 @@ async function selectShelf(shelfId: number) {
 }
 
 async function loadTextsInShelf(shelfId: number) {
+  setReadingFocus(false);
   const mainContainer = document.getElementById("library-main");
   if (!mainContainer) return;
 
@@ -684,6 +715,15 @@ async function loadTextView(textId: number) {
   const mainContainer = document.getElementById("library-main");
   if (!mainContainer) return;
 
+  setReadingFocus(false);
+  // A delayed shelf analysis must not replace the reader after opening a text.
+  if (pendingShelfAnalysisTimer !== null) {
+    window.clearTimeout(pendingShelfAnalysisTimer);
+    pendingShelfAnalysisTimer = null;
+  }
+  activeShelfAnalysisController?.abort();
+  activeShelfAnalysisController = null;
+
   if (sessionTimerInterval) {
     clearInterval(sessionTimerInterval);
     setSessionTimerInterval(null);
@@ -739,6 +779,10 @@ async function loadTextView(textId: number) {
             <button id="analyze-text-btn" class="btn-secondary">Analyze</button>
             <button id="delete-text-btn" class="btn-danger">Delete</button>
           </div>
+          <label id="original-line-breaks-control" class="text-layout-control" hidden title="Restore the book's fixed-width line breaks">
+            <input id="original-line-breaks" type="checkbox"> Original line breaks
+          </label>
+          <button id="reading-focus-btn" class="btn-secondary" type="button" aria-pressed="false" title="Use the full window for reading">Focus mode</button>
         </div>
 
         <div class="text-tabs">
@@ -858,6 +902,9 @@ async function loadTextView(textId: number) {
     document.getElementById("delete-text-btn")?.addEventListener("click", () => confirmDeleteText(textId));
 
     setupReadingControls(textId);
+    document.getElementById("reading-focus-btn")?.addEventListener("click", () => {
+      setReadingFocus(!document.getElementById("app")?.classList.contains("reading-focus"));
+    });
 
     document.getElementById("dict-sidebar-close")?.addEventListener("click", () => {
       const content = document.getElementById("dict-sidebar-content");
@@ -924,6 +971,7 @@ function setupReadingControls(textId: number) {
       setActiveSession(await speed.startReadingSession(textId, currentTextCharacterCount));
       updateReadingControlsUI();
       startSessionTimer();
+      setReadingFocus(true);
     } catch (error) {
       console.error("Failed to start reading session:", error);
       alert(`Failed to start reading: ${error}`);
@@ -958,6 +1006,7 @@ function setupReadingControls(textId: number) {
 }
 
 function updateReadingControlsUI() {
+  if (!activeSession) setReadingFocus(false);
   const container = document.getElementById("reading-controls");
   if (!container) return;
 
@@ -1001,6 +1050,7 @@ function updateReadingControlsUI() {
         setActiveSession(await speed.startReadingSession(curTextId, currentTextCharacterCount));
         updateReadingControlsUI();
         startSessionTimer();
+        setReadingFocus(true);
       } catch (error) {
         console.error("Failed to start reading session:", error);
         alert(`Failed to start reading: ${error}`);
@@ -1169,8 +1219,25 @@ async function loadInteractiveText(content: string, textId: number) {
   const renderSegments = (segments: library.TextSegment[]) => {
     setCurrentTextSegments(segments);
 
+    const source = segments.map(segment => segment.text).join("");
+    const detectedBreaks = getSoftLineBreakOffsets(source);
+    const originalBreaks = document.getElementById("original-line-breaks") as HTMLInputElement | null;
+    const layoutControl = document.getElementById("original-line-breaks-control");
+    if (layoutControl) layoutControl.hidden = detectedBreaks.size === 0;
+    const softBreaks = originalBreaks?.checked ? new Set<number>() : detectedBreaks;
+    if (originalBreaks) {
+      originalBreaks.onchange = () => {
+        const scrollTop = container.scrollTop;
+        renderSegments(segments);
+        container.scrollTop = scrollTop;
+      };
+    }
+
     let html = "";
+    let sourceOffset = 0;
     for (const segment of segments) {
+      let partOffset = sourceOffset;
+      sourceOffset += segment.text.length;
       if (segment.is_cjk) {
         let statusClass = "";
         if (segment.is_learning) {
@@ -1180,7 +1247,15 @@ async function loadInteractiveText(content: string, textId: number) {
         }
         html += `<span class="text-segment ${statusClass}" data-text="${escapeHtml(segment.text)}" data-type="${segment.segment_type}">${escapeHtml(segment.text)}</span>`;
       } else {
-        html += segment.text.replace(/\n/g, "<br>");
+        html += segment.text.split(/(\r\n|\r|\n)/).map((part) => {
+          const offset = partOffset;
+          partOffset += part.length;
+          if (!/^[\r\n]+$/.test(part)) return escapeHtml(part);
+          if (softBreaks.has(offset)) return "";
+          // Cached segmentation may split CRLF into two separate segments.
+          if (part === "\r" && source[offset + 1] === "\n") return "";
+          return "<br>";
+        }).join("");
       }
     }
 
@@ -1252,6 +1327,7 @@ async function lookupSelectedText(selectedText: string) {
   const sidebarContent = document.getElementById("dict-sidebar-content");
   if (!sidebarContent) return;
 
+  document.getElementById("dict-sidebar")?.classList.add("open");
   sidebarContent.innerHTML = '<p class="loading">Looking up...</p>';
 
   try {

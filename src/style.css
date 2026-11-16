@@ -1112,6 +1112,148 @@ h3 {
   max-width: 100%;
 }
 
+#reading-focus-btn {
+  display: none;
+}
+
+.text-layout-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.text-layout-control[hidden] {
+  display: none;
+}
+
+@media (min-width: 701px) {
+  /* Reading gets the available window width instead of two empty side columns. */
+  #app:has(#library-view.active .text-view):not(.reading-focus) {
+    max-width: none;
+    padding: 1rem;
+  }
+
+  #app:has(#library-view.active .text-view):not(.reading-focus) > .container {
+    padding: 0.5rem;
+  }
+
+  .library-layout:has(.text-view) > .shelf-sidebar {
+    width: clamp(200px, 18vw, 280px);
+    min-width: 200px;
+  }
+
+  .text-view-layout > #dict-sidebar:not(.open) {
+    display: none;
+  }
+
+  .text-view-layout > #dict-sidebar.open {
+    width: clamp(260px, 25vw, 350px);
+  }
+
+  #reading-focus-btn {
+    display: inline-flex;
+    flex-shrink: 0;
+    align-items: center;
+  }
+
+  #app.reading-focus {
+    max-width: none;
+    height: 100dvh;
+    padding: 0.75rem;
+    box-sizing: border-box;
+  }
+
+  #app.reading-focus > .container {
+    padding: 0;
+  }
+
+  .reading-focus > .container > h1,
+  .reading-focus > .container > .subtitle,
+  .reading-focus .nav-tabs,
+  .reading-focus #offline-status,
+  .reading-focus #shelf-sidebar,
+  .reading-focus .text-tabs,
+  .reading-focus .text-actions,
+  .reading-focus .text-author,
+  .reading-focus .text-title-group .cache-status-row,
+  .reading-focus #discard-reading-btn,
+  .reading-focus #log-offline-btn {
+    display: none;
+  }
+
+  .reading-focus > .container,
+  .reading-focus #library-view,
+  .reading-focus .library-layout,
+  .reading-focus .library-content,
+  .reading-focus #library-main {
+    height: 100%;
+    min-height: 0;
+  }
+
+  .reading-focus .text-view {
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .reading-focus .text-header {
+    flex-shrink: 0;
+    gap: 0.5rem;
+    margin-bottom: 0.75rem;
+  }
+
+  .reading-focus .text-title-group {
+    min-width: 0;
+  }
+
+  .reading-focus .text-title-group h2 {
+    font-size: 1.1rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .reading-focus .reading-controls {
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin: 0;
+  }
+
+  .reading-focus .text-view-layout {
+    flex: 1;
+    min-height: 0;
+    position: relative;
+  }
+
+  .reading-focus #text-content-tab {
+    height: 100%;
+  }
+
+  .reading-focus #text-content-interactive {
+    height: 100%;
+    max-height: none;
+    box-sizing: border-box;
+  }
+
+  /* Lookups float above the text so opening one preserves line wrapping. */
+  .reading-focus #dict-sidebar.open {
+    position: absolute;
+    top: 0;
+    right: 0;
+    max-width: calc(100% - 2rem);
+    max-height: 100%;
+    box-sizing: border-box;
+    z-index: 5;
+    background: var(--surface-panel);
+    color: var(--text-primary);
+    border-color: var(--border-control);
+    box-shadow: 0 4px 20px rgb(0 0 0 / 20%);
+  }
+}
+
 .text-header {
   display: flex;
   align-items: center;
