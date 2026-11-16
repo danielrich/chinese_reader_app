@@ -993,6 +993,11 @@ fn dispatch_sync(conn: &Connection, command: &str, body: &Value) -> Result<Value
             serialize(result)
         }
 
+        "get_goal_reading_data" => {
+            let shelf_ids: Vec<i64> = field(body, "shelf_ids")?;
+            serialize(library::goals::get_goal_reading_data(conn, &shelf_ids).map_err(db_err)?)
+        }
+
         // ── Speed tracking ─────────────────────────────────────────────────
         "start_reading_session" => {
             let text_id: i64 = field(body, "text_id")?;

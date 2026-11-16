@@ -57,6 +57,14 @@ Important frontend files:
 - `src/sw.ts` implements the service worker.
 - `src/views/*` contain view-level DOM rendering and event binding.
 
+The Goals tab stores versioned goal configuration through `user_settings`
+(`reading_goals_v1`). `library/goals.rs` supplies read-only facts for a recursive
+union of selected shelves, earliest completed sessions per text, and global
+reading experience/activity. `src/lib/goal-projection.ts` integrates constant
+or piecewise linear speed against lifetime characters entirely in the browser.
+Scenario edits do not write reading history or call the server; Save assumptions
+persists the selected plan. `views/goal-chart.ts` provides SVG and tabular views.
+
 The UI is mostly direct DOM string rendering rather than a component framework.
 Shared mutable state lives in `src/state.ts`.
 
