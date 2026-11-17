@@ -57,6 +57,11 @@ Important frontend files:
 - `src/sw.ts` implements the service worker.
 - `src/views/*` contain view-level DOM rendering and event binding.
 
+Library list/search summaries include `has_completed_read`, computed from any
+completed session. Read/Unread title badges merge locally pending completions;
+finishing a session also updates its owning shelf's navigation cache. Legacy
+cached summaries without the field show an unknown status until refreshed.
+
 The Goals tab stores versioned goal configuration through `user_settings`
 (`reading_goals_v1`). `library/goals.rs` supplies read-only facts for a recursive
 union of selected shelves, earliest completed sessions per text, and global

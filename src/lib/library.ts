@@ -78,6 +78,8 @@ export interface TextSummary {
   character_count: number;
   /** Whether analysis has been performed */
   has_analysis: boolean;
+  /** Completed first read; absent only in older cached summaries. */
+  has_completed_read?: boolean;
   /** Creation timestamp */
   created_at: string;
 }

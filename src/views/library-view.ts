@@ -9,6 +9,7 @@ import {
   deleteSession,
   saveNavCache,
   getNavCache,
+  listPendingSessions,
   getTextCache,
   saveTextSegments,
   getTextSegments,
@@ -274,6 +275,12 @@ async function loadTextsInShelf(shelfId: number) {
   activeShelfAnalysisController?.abort();
   activeShelfAnalysisController = null;
 
+  // Capture pending completions before requesting server facts. Sync may finish
+  // while the list request is in flight; those completions must remain visible.
+  const pendingReadIds = new Set((await listPendingSessions().catch(() => []))
+    .filter(session => session.finished_at !== null).map(session => session.text_id));
+  if (selectedShelfId !== shelfId) return;
+
   const renderLoadedShelf = async (
     texts: library.TextSummary[],
     listState: ShelfListState,
@@ -284,6 +291,9 @@ async function loadTextsInShelf(shelfId: number) {
     }
     activeShelfAnalysisController?.abort();
     activeShelfAnalysisController = null;
+
+    texts = texts.map(text => pendingReadIds.has(text.id) ? { ...text, has_completed_read: true } : text);
+    if (listState === "fresh" || pendingReadIds.size > 0) saveNavCache(textsCacheKey(shelfId), texts).catch(() => {});
 
     setCurrentShelfTexts(texts);
     const shelf = findShelfById(shelfTree, shelfId);
@@ -391,7 +401,6 @@ async function loadTextsInShelf(shelfId: number) {
   try {
     const texts = await library.listTextsInShelf(shelfId);
     if (previewTimer !== null) window.clearTimeout(previewTimer);
-    saveNavCache(textsCacheKey(shelfId), texts).catch(() => {});
     const shelfCount = getShelfAndDescendantIds(shelfTree, shelfId).size;
     markShelfNavCached(shelfId, texts.length, shelfCount).catch(() => {});
     await renderLoadedShelf(texts, "fresh");
@@ -467,7 +476,9 @@ function renderShelfContents(
       html += `
         <div class="text-item" data-text-id="${text.id}">
           <div class="text-info">
-            <h4 class="text-title">${escapeHtml(text.title)}</h4>
+            <div class="text-title-row"><h4 class="text-title">${escapeHtml(text.title)}</h4>
+              <span class="text-read-status ${text.has_completed_read === true ? "read" : ""}" title="${text.has_completed_read === true ? "At least one reading session has been completed" : text.has_completed_read === false ? "No completed reading session yet" : "Reading status not yet available in this cache; reconnect to refresh"}">${text.has_completed_read === true ? "Read" : text.has_completed_read === false ? "Unread" : "Status unknown"}</span>
+            </div>
             ${text.author ? `<p class="text-author">${escapeHtml(text.author)}</p>` : ""}
           </div>
           <div class="text-meta">
@@ -923,9 +934,23 @@ async function finishCurrentReadingSession(): Promise<void> {
   if (!activeSession) return;
 
   const textId = activeSession.text_id;
+  const finishingShelfTexts = currentShelfTexts;
+  const owningShelfId = finishingShelfTexts.find(text => text.id === textId)?.shelf_id;
 
   try {
     const finished = await speed.finishReadingSession(activeSession.local_id);
+    if (owningShelfId !== undefined) {
+      // The user can navigate while Finish waits for storage. Keep the update
+      // tied to the finished text's owner, never the newly selected shelf.
+      const key = textsCacheKey(owningShelfId);
+      const cached = await getNavCache<library.TextSummary[]>(key).catch(() => null);
+      const updatedCache = (cached ?? finishingShelfTexts).map(text => text.id === textId ? { ...text, has_completed_read: true } : text);
+      await saveNavCache(key, updatedCache).catch(() => {});
+    }
+    if (selectedShelfId === owningShelfId && currentShelfTexts.some(text => text.id === textId)) {
+      const updated = currentShelfTexts.map(text => text.id === textId ? { ...text, has_completed_read: true } : text);
+      setCurrentShelfTexts(updated);
+    }
     if (sessionTimerInterval) {
       clearInterval(sessionTimerInterval);
       setSessionTimerInterval(null);

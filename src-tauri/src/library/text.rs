@@ -282,7 +282,8 @@ pub fn search_texts(conn: &Connection, query: &str) -> Result<Vec<TextSummary>> 
     let pattern = format!("%{}%", query);
     let mut stmt = conn.prepare(
         "SELECT t.id, t.shelf_id, t.title, t.author, t.character_count, t.created_at,
-                EXISTS(SELECT 1 FROM text_analyses WHERE text_id = t.id) as has_analysis
+                EXISTS(SELECT 1 FROM text_analyses WHERE text_id = t.id) as has_analysis,
+                EXISTS(SELECT 1 FROM reading_sessions WHERE text_id = t.id AND is_complete = 1) as has_completed_read
          FROM texts t
          WHERE t.title LIKE ?1
          ORDER BY t.title
@@ -298,6 +299,7 @@ pub fn search_texts(conn: &Connection, query: &str) -> Result<Vec<TextSummary>> 
             character_count: row.get(4)?,
             created_at: row.get(5)?,
             has_analysis: row.get(6)?,
+            has_completed_read: row.get(7)?,
         })
     })?;
 
@@ -308,7 +310,8 @@ pub fn search_texts(conn: &Connection, query: &str) -> Result<Vec<TextSummary>> 
 pub fn list_texts_in_shelf(conn: &Connection, shelf_id: i64) -> Result<Vec<TextSummary>> {
     let mut stmt = conn.prepare(
         "SELECT t.id, t.shelf_id, t.title, t.author, t.character_count, t.created_at,
-                EXISTS(SELECT 1 FROM text_analyses WHERE text_id = t.id) as has_analysis
+                EXISTS(SELECT 1 FROM text_analyses WHERE text_id = t.id) as has_analysis,
+                EXISTS(SELECT 1 FROM reading_sessions WHERE text_id = t.id AND is_complete = 1) as has_completed_read
          FROM texts t
          WHERE t.shelf_id = ?
          ORDER BY t.sort_order, t.created_at DESC",
@@ -324,6 +327,7 @@ pub fn list_texts_in_shelf(conn: &Connection, shelf_id: i64) -> Result<Vec<TextS
                 character_count: row.get(4)?,
                 created_at: row.get(5)?,
                 has_analysis: row.get(6)?,
+                has_completed_read: row.get(7)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -573,6 +577,30 @@ mod tests {
 
         let texts = list_texts_in_shelf(&conn, shelf.id).unwrap();
         assert_eq!(texts.len(), 2);
+    }
+
+    #[test]
+    fn summaries_report_completed_reads_not_active_sessions_or_stale_first_flags() {
+        let conn = setup_test_db();
+        let shelf = create_shelf(&conn, "Reading badges", None, None).unwrap();
+        let read = create_text(&conn, shelf.id, "Badge read", "中文", None, "paste").unwrap();
+        let active = create_text(&conn, shelf.id, "Badge active", "中文", None, "paste").unwrap();
+        let unread = create_text(&conn, shelf.id, "Badge unread", "中文", None, "paste").unwrap();
+        // A completed manual/reread record is still evidence of a first completion.
+        conn.execute("INSERT INTO reading_sessions (text_id, started_at, finished_at, is_complete, is_first_read, is_manual_log, character_count) VALUES (?, '2026-11-17T10:00:00Z', '2026-11-17T10:10:00Z', 1, 0, 1, 2)", [read.id]).unwrap();
+        conn.execute("INSERT INTO reading_sessions (text_id, started_at, is_complete, is_first_read, character_count) VALUES (?, '2026-11-17T10:00:00Z', 0, 1, 2)", [active.id]).unwrap();
+        for summaries in [list_texts_in_shelf(&conn, shelf.id).unwrap(), search_texts(&conn, "Badge").unwrap()] {
+            let status = |id| {
+                let summary = summaries.iter().find(|text| text.id == id).unwrap();
+                serde_json::to_value(summary).unwrap().get("has_completed_read").and_then(|value| value.as_bool())
+            };
+            assert_eq!(status(read.id), Some(true));
+            assert_eq!(status(active.id), Some(false));
+            assert_eq!(status(unread.id), Some(false));
+        }
+        conn.execute("DELETE FROM reading_sessions WHERE text_id = ?", [read.id]).unwrap();
+        let summary = search_texts(&conn, "Badge read").unwrap().remove(0);
+        assert_eq!(serde_json::to_value(summary).unwrap()["has_completed_read"], false);
     }
 
     #[test]
