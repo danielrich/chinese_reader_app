@@ -64,6 +64,10 @@ reading experience/activity. `src/lib/goal-projection.ts` integrates constant
 or piecewise linear speed against lifetime characters entirely in the browser.
 Scenario edits do not write reading history or call the server; Save assumptions
 persists the selected plan. `views/goal-chart.ts` provides SVG and tabular views.
+`lib/goal-chart-data.ts` supplies shared daily lookups and full/three-month
+windows; `views/goal-chart-inspector.ts` updates local SVG cursors and readouts
+without a request or curve redraw. Long goals stack the near-term chart below
+the full chart, with an independently useful vertical scale.
 
 The UI is mostly direct DOM string rendering rather than a component framework.
 Shared mutable state lives in `src/state.ts`.

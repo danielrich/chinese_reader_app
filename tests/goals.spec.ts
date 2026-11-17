@@ -193,3 +193,108 @@ test("a changed saved scope cannot reuse the previous scope's cached totals", as
   await expect(page.locator("#goal-chart svg")).toBeHidden();
   await expect(page.getByLabel("Daily minutes", { exact: true })).toBeVisible();
 });
+
+test("long goals have a three-month chart below the full chart at the same size", async ({ page }) => {
+  await page.clock.setFixedTime(new Date("2026-11-16T18:00:00Z"));
+  await mockGoals(page, true);
+  await openGoals(page);
+  await expect(page.locator("#goal-chart-near svg")).toBeVisible();
+  const full = (await page.locator("#goal-chart").boundingBox())!;
+  const near = (await page.locator("#goal-chart-near").boundingBox())!;
+  expect(near.y).toBeGreaterThanOrEqual(full.y + full.height);
+  expect(near.width).toBeCloseTo(full.width, 0);
+  const fullPlot = (await page.locator("#goal-chart svg").boundingBox())!;
+  const nearPlot = (await page.locator("#goal-chart-near svg").boundingBox())!;
+  expect(nearPlot.width).toBeCloseTo(fullPlot.width, 0);
+  expect(nearPlot.height).toBeCloseTo(fullPlot.height, 0);
+  await expect(page.locator("#goal-chart-near [data-inspect-date]")).toHaveAttribute("min", "2026-11-16");
+  await expect(page.locator("#goal-chart-near [data-inspect-date]")).toHaveAttribute("max", "2027-02-16");
+});
+
+test("date inspection shows exact values, supports keyboard and drag, and does not redraw curves or make requests", async ({ page }) => {
+  await page.clock.setFixedTime(new Date("2026-11-16T18:00:00Z"));
+  const mock = await mockGoals(page, true);
+  await openGoals(page);
+  const chart = page.locator("#goal-chart");
+  const date = chart.locator("[data-inspect-date]");
+  await date.fill("2027-02-10");
+  await expect(chart.locator('[data-cursor-value="constant"]')).toHaveText("366,400");
+  await expect(chart.locator('[data-cursor-value="actual"]')).toHaveText("Not recorded");
+  const current = Number((await chart.locator('[data-cursor-value="constant"]').textContent())!.replaceAll(",", ""));
+  const growing = Number((await chart.locator('[data-cursor-value="growth"]').textContent())!.replaceAll(",", ""));
+  expect(growing).toBeGreaterThan(current);
+  const calls = mock.calls();
+  const path = await chart.locator(".goal-line.constant").elementHandle();
+  const hit = chart.locator(".goal-chart-hitarea");
+  await hit.focus();
+  await page.keyboard.press("ArrowRight");
+  await expect(date).toHaveValue("2027-02-11");
+  const box = (await hit.boundingBox())!;
+  await page.mouse.move(box.x + box.width * 0.3, box.y + box.height / 2);
+  await expect(chart.locator(".goal-chart-cursor")).toHaveAttribute("visibility", "visible");
+  await expect(chart.locator(".goal-cursor-line")).toHaveCSS("visibility", "visible");
+  await chart.screenshot({ path: test.info().outputPath("full-chart-cursor.png") });
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width + 30, box.y + box.height / 2, { steps: 5 });
+  await page.mouse.up();
+  await expect(date).toHaveValue("2035-07-23");
+  expect(await path!.evaluate(element => element.isConnected)).toBe(true);
+  expect(mock.calls()).toBe(calls);
+});
+
+test("near-term inspection survives scenario edits and supports touch dragging", async ({ page }) => {
+  await page.clock.setFixedTime(new Date("2026-11-16T18:00:00Z"));
+  await page.setViewportSize({ width: 390, height: 844 });
+  const mock = await mockGoals(page, true);
+  await openGoals(page);
+  const chart = page.locator("#goal-chart-near");
+  await chart.locator("[data-inspect-date]").fill("2027-02-10");
+  await expect(chart.locator('[data-cursor-value="constant"]')).toHaveText("366,400");
+  const calls = mock.calls();
+  await page.getByLabel("Daily minutes", { exact: true }).fill("60");
+  await expect(chart.locator("[data-inspect-date]")).toHaveValue("2027-02-10");
+  await expect(chart.locator('[data-cursor-value="constant"]')).toHaveText("731,800");
+  await chart.screenshot({ path: test.info().outputPath("near-chart-cursor.png") });
+  const hit = chart.locator(".goal-chart-hitarea");
+  await hit.scrollIntoViewIfNeeded();
+  const box = (await hit.boundingBox())!;
+  await hit.dispatchEvent("pointerdown", { pointerId: 1, pointerType: "touch", clientX: box.x + 30, clientY: box.y + 50 });
+  await hit.dispatchEvent("pointermove", { pointerId: 1, pointerType: "touch", clientX: box.x + 150, clientY: box.y + 50 });
+  await hit.dispatchEvent("pointerup", { pointerId: 1, pointerType: "touch", clientX: box.x + 150, clientY: box.y + 50 });
+  await expect(chart.locator("[data-inspect-date]")).not.toHaveValue("2027-02-10");
+  expect(mock.calls()).toBe(calls);
+});
+
+test("explicit date selection takes priority over queued pointer movement", async ({ page }) => {
+  await page.clock.setFixedTime(new Date("2026-11-16T18:00:00Z"));
+  await mockGoals(page, true);
+  await openGoals(page);
+  await expect(page.locator("#goal-chart [data-inspect-date]")).toBeVisible();
+  await page.locator("#goal-chart").evaluate(root => {
+    const hit = root.querySelector(".goal-chart-hitarea")!;
+    const rect = hit.getBoundingClientRect();
+    hit.dispatchEvent(new PointerEvent("pointermove", { pointerType: "mouse", clientX: rect.x + rect.width / 2, clientY: rect.y + rect.height / 2 }));
+    const input = root.querySelector<HTMLInputElement>("[data-inspect-date]")!;
+    input.value = "2027-02-10";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  await expect(page.locator("#goal-chart [data-inspect-date]")).toHaveValue("2027-02-10");
+});
+
+test("full chart preserves the exact completion corners when curves are sampled", async ({ page }) => {
+  await page.clock.setFixedTime(new Date("2026-11-16T18:00:00Z"));
+  await mockGoals(page, true);
+  await openGoals(page);
+  await expect(page.locator("#goal-chart svg")).toBeVisible();
+  const date = page.locator("#goal-chart [data-inspect-date]");
+  const start = Date.parse((await date.getAttribute("min"))! + "T00:00:00Z");
+  const end = Date.parse((await date.getAttribute("max"))! + "T00:00:00Z");
+  for (const key of ["constant", "growth"]) {
+    const finish = await page.locator(`#goal-forecast-${key}`).evaluate(element => element.firstChild!.textContent!);
+    const x = 78 + (Date.parse(finish + " UTC") - start) / (end - start) * 890;
+    const d = (await page.locator(`#goal-chart .goal-line.${key}`).getAttribute("d"))!;
+    const points = [...d.matchAll(/[ML]([\d.]+),([\d.]+)/g)].map(match => [Number(match[1]), Number(match[2])]);
+    expect(points.some(([px, py]) => Math.abs(px - x) < 0.02 && Math.abs(py - 35) < 0.02)).toBe(true);
+  }
+});

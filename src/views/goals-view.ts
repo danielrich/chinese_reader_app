@@ -3,6 +3,8 @@ import { getGoalReadingData, loadGoals, saveGoals, validateAssumptions, validate
 import { dayNumber, goalProgress, localDate, projectReading, type ReadingProjection } from "../lib/goal-projection";
 import { escapeHtml, uuid } from "../utils";
 import { formatGoalCount, formatGoalDate, renderGoalChart } from "./goal-chart";
+import { createGoalChartModel, needsNearTermChart } from "../lib/goal-chart-data";
+import { attachGoalChartInspector } from "./goal-chart-inspector";
 
 let goals: Goal[] = [];
 let shelves: library.ShelfTree[] = [];
@@ -13,6 +15,7 @@ let message = "";
 let syncWarning = "";
 const drafts = new Map<string, GoalAssumptions>();
 const facts = new Map<string, GoalReadingData>();
+const inspectedDates = new Map<string, { full?: string; near?: string }>();
 let pendingSave: Promise<void> | null = null;
 const clone = <T>(value: T): T => structuredClone(value);
 const attribute = (value: string): string => escapeHtml(value).replace(/"/g, "&quot;").replace(/'/g, "&#39;");
@@ -266,7 +269,7 @@ async function deleteGoal(): Promise<void> {
   const version = requestVersion;
   try {
     const next = goals.filter(g => g.id !== goal.id);
-    await persistGoals(next); drafts.delete(goal.id); facts.delete(goal.id);
+    await persistGoals(next); drafts.delete(goal.id); facts.delete(goal.id); inspectedDates.delete(goal.id);
     if (version !== requestVersion) return;
     selectedId = next[0]?.id ?? null; editing = next.length ? null : defaultGoal();
     message = "Goal deleted."; renderShell(); if (next.length) await refreshFacts();
@@ -302,6 +305,8 @@ function renderResults(): void {
   const inputs = { remaining: progress.remaining, experience: data.lifetime_characters, cpm: progress.cpm, dailyMinutes: assumptions.dailyMinutes, todayMinutes: progress.todayMinutes, today: progress.today };
   const constant = projectReading({ ...inputs, milestones: [] });
   const growth = projectReading({ ...inputs, milestones: assumptions.milestones });
+  const fullChart = createGoalChartModel(goal, progress, constant, growth, "full");
+  const nearChart = needsNearTermChart(goal, progress, constant, growth) ? createGoalChartModel(goal, progress, constant, growth, "near") : null;
   const difference = progress.completed - progress.expected;
   const complete = progress.remaining === 0;
   const status = complete ? "Goal complete" : difference >= -1 ? "On track with deadline pace" : "Behind deadline pace";
@@ -313,5 +318,10 @@ function renderResults(): void {
     <p class="goal-note">${complete ? "Every text in the current goal scope has a completed first read." : `${formatGoalCount(Math.abs(difference))} characters ${difference >= 0 ? "ahead of" : "behind"} the required pace through yesterday. Goal started ${formatGoalDate(goal.startDate)}.`}</p>
     <div class="goal-forecast-grid"><div><p class="goal-eyebrow">At current speed · ${progress.cpm?.toFixed(1) ?? "unknown"} CPM</p><strong id="goal-forecast-constant">${forecastDescription(constant, goal.deadline)}</strong></div><div><p class="goal-eyebrow">With your speed changes</p><strong id="goal-forecast-growth">${forecastDescription(growth, goal.deadline)}</strong></div></div>
     <p class="goal-note">${formatGoalCount(data.lifetime_characters)} lifetime characters of experience. These forecasts assume ${assumptions.dailyMinutes} minutes/day on unread goal material, with ${Math.max(0, assumptions.dailyMinutes - progress.todayMinutes).toFixed(1)} minutes left in today's budget. Speed improvement is an assumption, not a measured trend.</p>
-    </div><section id="goal-chart" class="goal-panel"><h3>Your path to ${formatGoalDate(goal.deadline)}</h3>${renderGoalChart(goal, progress, constant, growth)}</section>`;
+    </div><section id="goal-chart" class="goal-panel"><h3>Your path to ${formatGoalDate(goal.deadline)}</h3>${renderGoalChart(fullChart, "goal-full", "Full timeline")}</section>
+    ${nearChart ? `<section id="goal-chart-near" class="goal-panel"><h3>The next three months</h3><p class="goal-note">${formatGoalDate(nearChart.start)} – ${formatGoalDate(nearChart.end)} · vertical scale zoomed to this period</p>${renderGoalChart(nearChart, "goal-near", "Next three months")}</section>` : ""}`;
+  const dates = inspectedDates.get(goal.id) ?? {};
+  inspectedDates.set(goal.id, dates);
+  attachGoalChartInspector(document.getElementById("goal-chart")!, fullChart, { selectedDate: dates.full, onDateChange: date => { dates.full = date; } });
+  if (nearChart) attachGoalChartInspector(document.getElementById("goal-chart-near")!, nearChart, { selectedDate: dates.near, onDateChange: date => { dates.near = date; } });
 }
