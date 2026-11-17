@@ -307,15 +307,15 @@ function renderResults(): void {
   const growth = projectReading({ ...inputs, milestones: assumptions.milestones });
   const fullChart = createGoalChartModel(goal, progress, constant, growth, "full");
   const nearChart = needsNearTermChart(goal, progress, constant, growth) ? createGoalChartModel(goal, progress, constant, growth, "near") : null;
-  const difference = progress.completed - progress.expected;
+  const difference = progress.completed - Math.round(progress.expected);
   const complete = progress.remaining === 0;
-  const status = complete ? "Goal complete" : difference >= -1 ? "On track with deadline pace" : "Behind deadline pace";
+  const status = complete ? "Goal complete" : difference >= 0 ? "On track with deadline pace" : "Behind deadline pace";
   const percent = progress.total ? progress.completed / progress.total * 100 : 0;
   target.innerHTML = `<div class="goal-overview">
-    <div class="goal-progress-summary"><div><span class="goal-status ${complete || difference >= -1 ? "on-track" : "behind"}">${status}</span><p class="goal-progress-number">${formatGoalCount(progress.completed)} <span>of ${formatGoalCount(progress.total)} characters</span></p><p class="goal-note">${percent.toFixed(2)}% complete · ${formatGoalCount(progress.remaining)} remaining</p></div>
+    <div class="goal-progress-summary"><div><span class="goal-status ${complete || difference >= 0 ? "on-track" : "behind"}">${status}</span><p class="goal-progress-number">${formatGoalCount(progress.completed)} <span>of ${formatGoalCount(progress.total)} characters</span></p><p class="goal-note">${percent.toFixed(2)}% complete · ${formatGoalCount(progress.remaining)} remaining</p></div>
       <div class="goal-habit"><strong>${progress.todayMinutes.toFixed(1)} <span>/ ${assumptions.dailyMinutes} min</span></strong><span>Today's Chinese reading · all shelves</span></div></div>
     <progress value="${progress.completed}" max="${Math.max(1, progress.total)}" aria-label="Goal first-read progress"></progress>
-    <p class="goal-note">${complete ? "Every text in the current goal scope has a completed first read." : `${formatGoalCount(Math.abs(difference))} characters ${difference >= 0 ? "ahead of" : "behind"} the required pace through yesterday. Goal started ${formatGoalDate(goal.startDate)}.`}</p>
+    <p class="goal-note">${complete ? "Every text in the current goal scope has a completed first read." : `${formatGoalCount(Math.abs(difference))} characters ${difference >= 0 ? "ahead of" : "behind"} the required pace for today. Goal started ${formatGoalDate(goal.startDate)}.`}</p>
     <div class="goal-forecast-grid"><div><p class="goal-eyebrow">At current speed · ${progress.cpm?.toFixed(1) ?? "unknown"} CPM</p><strong id="goal-forecast-constant">${forecastDescription(constant, goal.deadline)}</strong></div><div><p class="goal-eyebrow">With your speed changes</p><strong id="goal-forecast-growth">${forecastDescription(growth, goal.deadline)}</strong></div></div>
     <p class="goal-note">${formatGoalCount(data.lifetime_characters)} lifetime characters of experience. These forecasts assume ${assumptions.dailyMinutes} minutes/day on unread goal material, with ${Math.max(0, assumptions.dailyMinutes - progress.todayMinutes).toFixed(1)} minutes left in today's budget. Speed improvement is an assumption, not a measured trend.</p>
     </div><section id="goal-chart" class="goal-panel"><h3>Your path to ${formatGoalDate(goal.deadline)}</h3>${renderGoalChart(fullChart, "goal-full", "Full timeline")}</section>

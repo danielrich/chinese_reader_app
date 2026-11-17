@@ -64,3 +64,16 @@ test("persisted goals require an explicit timezone and reject malformed mileston
   expect(validateGoal(missingZone)).toBeTruthy();
   expect(validateGoal({ ...goal, assumptions: { ...goal.assumptions, milestones: [null] } } as unknown as Goal)).toBeTruthy();
 });
+
+test("deadline pace starts at recorded starting progress and reaches the target on the inclusive deadline", () => {
+  const facts: GoalReadingData = { texts: [
+    { id: 1, character_count: 1000, first_completed_at: "2026-10-30T12:00:00Z" },
+    { id: 2, character_count: 9000, first_completed_at: null },
+  ], activity: [], lifetime_characters: 1000, recent_speeds: [100], missing_shelf_ids: [] };
+  const plan = { ...goal, startDate: "2026-11-16", deadline: "2026-11-21" };
+  expect(goalProgress(plan, facts, new Date("2026-11-16T18:00:00Z")).expected).toBe(1000);
+  expect(goalProgress(plan, facts, new Date("2026-11-17T18:00:00Z")).expected).toBe(2800);
+  expect(goalProgress(plan, facts, new Date("2026-11-21T18:00:00Z")).expected).toBe(10000);
+  expect(goalProgress(plan, facts, new Date("2026-11-22T18:00:00Z")).expected).toBe(10000);
+  expect(goalProgress({ ...plan, deadline: plan.startDate }, facts, new Date("2026-11-16T18:00:00Z")).expected).toBe(10000);
+});

@@ -27,7 +27,7 @@ test("selected-day values use daily facts and projections, with no future actual
   // 87 reading days at 3,000 characters/day, plus 1,000 already read.
   expect(values.constant).toBeCloseTo(262000);
   expect(values.growth!).toBeGreaterThan(values.constant!);
-  expect(values.required).toBeCloseTo(1000 + 999000 * 87 / 366);
+  expect(values.required).toBeCloseTo(1000 + 999000 * 86 / 365);
   expect(model.valuesAt(progress.today).actual).toBe(1000);
 });
 
@@ -54,4 +54,23 @@ test("completed projections plateau and unavailable speeds stay unavailable", ()
   expect(model.series.find(series => series.key === "constant")!.points.at(-1)!.date).toBe(model.end);
   const zero = projectReading({ ...inputs, dailyMinutes: 0, milestones: [] });
   expect(createGoalChartModel(goal, progress, zero, zero, "near").valuesAt("2027-02-10").constant).toBe(progress.completed);
+});
+
+test("today's summary and both charts use the same pace instead of differing by a day", () => {
+  const shortGoal = { ...goal, deadline: "2026-11-21" };
+  const reading: GoalReadingData = { ...data, texts: [
+    { id: 1, character_count: 1000, first_completed_at: "2026-11-15T15:00:00Z" },
+    { id: 2, character_count: 2766, first_completed_at: "2026-11-17T15:00:00Z" },
+    { id: 3, character_count: 6234, first_completed_at: null },
+  ] };
+  const status = goalProgress(shortGoal, reading, new Date("2026-11-17T18:00:00Z"));
+  // Previously this was reported as 1,266 ahead, while the chart target was 4,000.
+  expect(status.completed).toBeGreaterThan(status.expected);
+  const forecast = projectReading({ ...inputs, remaining: status.remaining, today: status.today, milestones: [] });
+  for (const range of ["full", "near"] as const) {
+    const chart = createGoalChartModel(shortGoal, status, forecast, forecast, range);
+    expect(chart.valuesAt(status.today).required).toBe(status.expected);
+    expect(chart.valuesAt(shortGoal.startDate).required).toBe(status.baseline);
+    expect(chart.valuesAt(shortGoal.deadline).required).toBe(status.total);
+  }
 });

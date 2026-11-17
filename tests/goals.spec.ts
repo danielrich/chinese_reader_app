@@ -37,6 +37,26 @@ async function openGoals(page: Page) {
   await page.getByRole("button", { name: "Goals", exact: true }).click();
 }
 
+test("summary and today's chart cursor agree on deadline pace", async ({ page }) => {
+  await page.clock.setFixedTime(new Date("2026-11-17T18:00:00Z"));
+  const mock = await mockGoals(page, true);
+  const saved = JSON.parse(mock.settings()!);
+  Object.assign(saved.goals[0], { startDate: "2026-11-16", deadline: "2026-11-21" });
+  await page.route("**/api/invoke/get_setting", route => route.fulfill({ json: JSON.stringify(saved) }));
+  await page.route("**/api/invoke/get_goal_reading_data", route => route.fulfill({ json: {
+    texts: [
+      { id: 1, character_count: 1000, first_completed_at: "2026-11-15T15:00:00Z" },
+      { id: 2, character_count: 2766, first_completed_at: "2026-11-17T15:00:00Z" },
+      { id: 3, character_count: 6234, first_completed_at: null },
+    ], activity: [], lifetime_characters: 3766, recent_speeds: [100], missing_shelf_ids: [],
+  } }));
+  await openGoals(page);
+  await expect(page.locator(".goal-overview")).toContainText("966 characters ahead of the required pace for today");
+  await expect(page.locator(".goal-status")).toHaveText("On track with deadline pace");
+  await expect(page.locator('#goal-chart [data-cursor-value="actual"]')).toHaveText("3,766");
+  await expect(page.locator('#goal-chart [data-cursor-value="required"]')).toHaveText("2,800");
+});
+
 test("creates a goal with multiple shelves and persists it across reload", async ({ page }) => {
   const mock = await mockGoals(page);
   await openGoals(page);

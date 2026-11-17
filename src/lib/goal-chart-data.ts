@@ -1,5 +1,5 @@
 import type { Goal } from "./goals";
-import { dayNumber, type goalProgress, type ReadingPoint, type ReadingProjection } from "./goal-projection";
+import { dayNumber, requiredGoalProgress, type goalProgress, type ReadingPoint, type ReadingProjection } from "./goal-projection";
 
 export type ChartSeriesKey = "actual" | "constant" | "growth" | "required";
 export type ChartValues = Record<ChartSeriesKey, number | null>;
@@ -58,7 +58,7 @@ export function createGoalChartModel(goal: Goal, progress: Progress, constant: R
     constant: projected(constant, date),
     growth: projected(growth, date),
     // End-of-day pace; the cursor, rendered line and table share this calculation.
-    required: date < goal.startDate ? null : baseline + (total - baseline) * Math.min(1, Math.max(0, (dayNumber(date) - dayNumber(goal.startDate) + 1) / Math.max(1, dayNumber(goal.deadline) - dayNumber(goal.startDate) + 1))),
+    required: date < goal.startDate ? null : requiredGoalProgress(goal, total, baseline, date),
   });
   const series: GoalChartSeries[] = [
     { key: "actual", label: "Actual first reads", points: history, step: true },

@@ -27,6 +27,14 @@ export function addDays(date: string, days: number): string {
   return new Date((dayNumber(date) + days) * DAY_MS).toISOString().slice(0, 10);
 }
 
+/** Starting progress already includes reads on the start date (day zero). */
+export function requiredGoalProgress(goal: Pick<Goal, "startDate" | "deadline">, total: number, baseline: number, date: string): number {
+  const day = dayNumber(date), start = dayNumber(goal.startDate), deadline = dayNumber(goal.deadline);
+  if (day >= deadline) return total;
+  const fraction = Math.max(0, (day - start) / Math.max(1, deadline - start));
+  return baseline + (total - baseline) * fraction;
+}
+
 /** Integrates dx/dt = speed(x) exactly on each linear experience segment. */
 export function projectReading(input: ProjectionInput): ReadingProjection {
   const invalid = validateAssumptions({ dailyMinutes: input.dailyMinutes, startingCpm: input.cpm, milestones: input.milestones });
@@ -93,7 +101,5 @@ export function goalProgress(goal: Goal, data: GoalReadingData, now = new Date()
   }, 0);
   const speeds = data.recent_speeds.filter(speed => Number.isFinite(speed) && speed > 0);
   const cpm = goal.assumptions.startingCpm ?? (speeds.length ? speeds.reduce((a, b) => a + b, 0) / speeds.length : null);
-  // Compare against the schedule through yesterday, allowing today's reading day.
-  const fraction = Math.min(1, Math.max(0, (dayNumber(today) - dayNumber(goal.startDate)) / Math.max(1, dayNumber(goal.deadline) - dayNumber(goal.startDate) + 1)));
-  return { today, total, completed, remaining: Math.max(0, total - completed), baseline, history, todayMinutes, cpm, expected: baseline + (total - baseline) * fraction };
+  return { today, total, completed, remaining: Math.max(0, total - completed), baseline, history, todayMinutes, cpm, expected: requiredGoalProgress(goal, total, baseline, today) };
 }
