@@ -26,6 +26,7 @@ More detail:
 - [Engineering notes and concerns](docs/engineering-notes.md)
 - [AppArmor/bubblewrap sandbox note](docs/operations/apparmor-bwrap-sandbox.md)
 - [Systemd service operations](docs/operations/systemd-service.md)
+- [Tailscale HTTPS and Android PWA setup](docs/operations/tailscale.md)
 - [Cross-device design spec](docs/superpowers/specs/2026-04-25-cross-device-reader-design.md)
 
 ## Features
@@ -148,6 +149,16 @@ For frontend-only changes, `npm run build` updates the served `dist/` directory;
 restart `chinese-reader` afterward so the daemon is explicitly running against
 the current build. See [systemd service operations](docs/operations/systemd-service.md)
 for the day-to-day deploy checklist.
+
+## Tailscale Access
+
+For private remote access and Android PWA installation, follow the
+[Tailscale HTTPS setup guide](docs/operations/tailscale.md). It covers setup,
+reboot persistence, certificate checks, and Chrome troubleshooting.
+
+The documented setup uses Tailscale Serve on port `9443` because the existing
+LAN HTTPS service occupies IPv4 port `443`. Use the full Tailscale hostname
+and include `:9443` when opening or installing the app.
 
 ## Database Migrations
 
