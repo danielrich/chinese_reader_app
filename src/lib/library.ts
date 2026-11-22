@@ -78,6 +78,8 @@ export interface TextSummary {
   character_count: number;
   /** Whether analysis has been performed */
   has_analysis: boolean;
+  /** Completed first read; absent only in older cached summaries. */
+  has_completed_read?: boolean;
   /** Creation timestamp */
   created_at: string;
 }
@@ -474,10 +476,10 @@ export async function getTextVocabCache(textId: number, options?: RequestOptions
 }
 
 /**
- * List texts in a shelf
+ * List texts in a shelf, optionally including child subtrees in shelf order.
  */
-export async function listTextsInShelf(shelfId: number): Promise<TextSummary[]> {
-  return invoke<TextSummary[]>("list_texts_in_shelf", { shelfId });
+export async function listTextsInShelf(shelfId: number, includeDescendants = false): Promise<TextSummary[]> {
+  return invoke<TextSummary[]>("list_texts_in_shelf", { shelfId, includeDescendants });
 }
 
 /**

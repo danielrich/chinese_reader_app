@@ -116,3 +116,45 @@ uv run python qidian_study_import.py \
 - `install-service.sh` installs the Linux systemd service.
 - `sync-db-to-linux.sh` copies a database to a Linux host for older one-way sync
   workflows.
+
+## Repair Mixed Chapter Levels
+
+`repair_chapter_structure.py` moves each book's direct texts into individual
+chapter shelves alongside the already-split chapters. It preserves existing
+text IDs, titles, content, section boundaries, timestamps, and reading sessions.
+It does **not** split or merge content or change future import behavior.
+Use Python 3; no packages are required. Select book shelves explicitly, rather
+than an author/series shelf. Each `--shelf-id` selects one level, not a subtree.
+
+Preview first (read-only):
+
+```bash
+python3 scripts/repair_chapter_structure.py \
+  --db-path /path/to/dictionary.db --shelf-id 208
+```
+
+After checking the chapter sequence against the source book, repeat with
+`--apply`. A timestamped SQLite backup is created in the database's `backups/`
+folder before any changes; override with `--backup-dir /path/to/backups`.
+All selected books are repaired in one transaction. Rerunning an already
+organized book makes no changes. Refresh the app online afterward so shelf
+navigation caches pick up the new structure.
+
+Original imported `sort_order` values determine the chapter sequence, including
+interludes and front matter. Ambiguous positions, duplicate titles, unexpected
+child shelves, and nested collections are rejected instead of guessed. If
+positions are ambiguous, supply `--source-orders source-orders.json` with the
+complete ordered title list verified against the EPUB for each affected book:
+
+```json
+{"208": ["楔子", "序曲.殺戮", "1、受颶風祝福"]}
+```
+
+The example shows the format only; the actual list must include **every**
+existing chapter title for that book exactly once.
+
+Run maintenance tests:
+
+```bash
+python3 -m unittest discover -s scripts -p 'test_*.py'
+```

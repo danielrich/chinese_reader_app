@@ -127,12 +127,16 @@ Watch points:
 
 ## Security Posture Is Local-Network Trust
 
-The server binds to `0.0.0.0` and CORS allows any origin. The design spec says
-there is no authentication and this is intended for a trusted home network.
+The server intentionally binds to `0.0.0.0` without user authentication for
+trusted LAN and tailnet clients. The API disables CORS and rejects Origin
+headers outside `CHINESE_READER_ALLOWED_ORIGINS`, along with cross-site Fetch
+Metadata. Both LAN and Tailscale browser URLs must be configured explicitly.
 
-That is coherent for a personal LAN tool, but important to preserve as an
-explicit deployment assumption. If exposed beyond a trusted LAN, add
-authentication, tighter CORS, CSRF protection for write routes, and TLS.
+Origin validation protects the browser request boundary, not arbitrary clients
+with direct network access. Keep firewall and tailnet policies restrictive; add
+authentication before allowing untrusted clients. The systemd installer runs
+the service under a dedicated account with constrained filesystem access; see
+[service security](operations/systemd-service.md#service-security).
 
 ## Documentation Drift
 

@@ -282,7 +282,8 @@ pub fn search_texts(conn: &Connection, query: &str) -> Result<Vec<TextSummary>> 
     let pattern = format!("%{}%", query);
     let mut stmt = conn.prepare(
         "SELECT t.id, t.shelf_id, t.title, t.author, t.character_count, t.created_at,
-                EXISTS(SELECT 1 FROM text_analyses WHERE text_id = t.id) as has_analysis
+                EXISTS(SELECT 1 FROM text_analyses WHERE text_id = t.id) as has_analysis,
+                EXISTS(SELECT 1 FROM reading_sessions WHERE text_id = t.id AND is_complete = 1) as has_completed_read
          FROM texts t
          WHERE t.title LIKE ?1
          ORDER BY t.title
@@ -298,6 +299,7 @@ pub fn search_texts(conn: &Connection, query: &str) -> Result<Vec<TextSummary>> 
             character_count: row.get(4)?,
             created_at: row.get(5)?,
             has_analysis: row.get(6)?,
+            has_completed_read: row.get(7)?,
         })
     })?;
 
@@ -306,13 +308,37 @@ pub fn search_texts(conn: &Connection, query: &str) -> Result<Vec<TextSummary>> 
 
 /// List texts in a shelf (summaries only, without full content)
 pub fn list_texts_in_shelf(conn: &Connection, shelf_id: i64) -> Result<Vec<TextSummary>> {
-    let mut stmt = conn.prepare(
-        "SELECT t.id, t.shelf_id, t.title, t.author, t.character_count, t.created_at,
-                EXISTS(SELECT 1 FROM text_analyses WHERE text_id = t.id) as has_analysis
-         FROM texts t
-         WHERE t.shelf_id = ?
-         ORDER BY t.sort_order, t.created_at DESC",
-    )?;
+    list_shelf_texts(conn, shelf_id, false)
+}
+
+/// List a shelf's texts, then child subtrees in sidebar order, without content.
+pub fn list_texts_in_shelf_with_descendants(conn: &Connection, shelf_id: i64) -> Result<Vec<TextSummary>> {
+    list_shelf_texts(conn, shelf_id, true)
+}
+
+fn list_shelf_texts(conn: &Connection, shelf_id: i64, recursive: bool) -> Result<Vec<TextSummary>> {
+    let scope = if recursive {
+        "WITH RECURSIVE ordered_shelves AS (
+            SELECT id, parent_id,
+                   ROW_NUMBER() OVER (PARTITION BY parent_id ORDER BY sort_order, name, id) AS sibling_order
+            FROM shelves
+         ), scope(id, path) AS (
+            SELECT id, '' FROM shelves WHERE id = ?
+            UNION ALL
+            SELECT s.id, scope.path || printf('%020d/', s.sibling_order)
+            FROM ordered_shelves s JOIN scope ON s.parent_id = scope.id
+         )"
+    } else {
+        "WITH scope(id, path) AS (SELECT ?, '')"
+    };
+    let mut stmt = conn.prepare(&format!(
+        "{scope}
+         SELECT t.id, t.shelf_id, t.title, t.author, t.character_count, t.created_at,
+                EXISTS(SELECT 1 FROM text_analyses WHERE text_id = t.id) as has_analysis,
+                EXISTS(SELECT 1 FROM reading_sessions WHERE text_id = t.id AND is_complete = 1) as has_completed_read
+         FROM texts t JOIN scope ON t.shelf_id = scope.id
+         ORDER BY scope.path, t.sort_order, t.created_at DESC, t.id"
+    ))?;
 
     let texts = stmt
         .query_map([shelf_id], |row| {
@@ -324,6 +350,7 @@ pub fn list_texts_in_shelf(conn: &Connection, shelf_id: i64) -> Result<Vec<TextS
                 character_count: row.get(4)?,
                 created_at: row.get(5)?,
                 has_analysis: row.get(6)?,
+                has_completed_read: row.get(7)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -564,6 +591,31 @@ mod tests {
     }
 
     #[test]
+    fn test_recursive_shelf_list_preserves_hierarchy_and_read_status() {
+        let conn = setup_test_db();
+        conn.execute_batch("INSERT INTO shelves (id,name,parent_id,sort_order) VALUES
+            (1,'Book',NULL,0), (2,'Chapter 10',1,10), (3,'Chapter 2',1,2),
+            (4,'Nested',3,0), (5,'Other book',NULL,0),
+            (6,'First',1,-1), (7,'A tie',1,2), (8,'Empty',1,3);
+            INSERT INTO texts (id,shelf_id,title,content,sort_order) VALUES
+            (1,1,'Intro','文',0), (2,2,'Ten','文',0),
+            (3,3,'Two section 2','文',1), (4,3,'Two section 1','文',0),
+            (5,4,'Nested text','文',0), (6,5,'Unrelated','文',0),
+            (7,6,'First text','文',0), (8,7,'Tie text','文',0);
+            INSERT INTO reading_sessions (text_id,started_at,character_count,is_complete)
+            VALUES (4,'2026-11-20',1,1);").unwrap();
+        let direct = list_texts_in_shelf(&conn, 1).unwrap();
+        assert_eq!(direct.iter().map(|t| t.id).collect::<Vec<_>>(), vec![1]);
+        let texts = list_texts_in_shelf_with_descendants(&conn, 1).unwrap();
+        // Shelf ties follow name, like the sidebar; sections follow text order.
+        assert_eq!(texts.iter().map(|t| t.id).collect::<Vec<_>>(), vec![1,7,8,4,3,5,2]);
+        assert!(texts.iter().find(|t| t.id == 4).unwrap().has_completed_read);
+        assert_eq!(texts.iter().find(|t| t.id == 4).unwrap().shelf_id, 3);
+        assert!(list_texts_in_shelf_with_descendants(&conn, 8).unwrap().is_empty());
+        assert!(list_texts_in_shelf_with_descendants(&conn, 999).unwrap().is_empty());
+    }
+
+    #[test]
     fn test_list_texts_in_shelf() {
         let conn = setup_test_db();
 
@@ -573,6 +625,30 @@ mod tests {
 
         let texts = list_texts_in_shelf(&conn, shelf.id).unwrap();
         assert_eq!(texts.len(), 2);
+    }
+
+    #[test]
+    fn summaries_report_completed_reads_not_active_sessions_or_stale_first_flags() {
+        let conn = setup_test_db();
+        let shelf = create_shelf(&conn, "Reading badges", None, None).unwrap();
+        let read = create_text(&conn, shelf.id, "Badge read", "中文", None, "paste").unwrap();
+        let active = create_text(&conn, shelf.id, "Badge active", "中文", None, "paste").unwrap();
+        let unread = create_text(&conn, shelf.id, "Badge unread", "中文", None, "paste").unwrap();
+        // A completed manual/reread record is still evidence of a first completion.
+        conn.execute("INSERT INTO reading_sessions (text_id, started_at, finished_at, is_complete, is_first_read, is_manual_log, character_count) VALUES (?, '2026-11-17T10:00:00Z', '2026-11-17T10:10:00Z', 1, 0, 1, 2)", [read.id]).unwrap();
+        conn.execute("INSERT INTO reading_sessions (text_id, started_at, is_complete, is_first_read, character_count) VALUES (?, '2026-11-17T10:00:00Z', 0, 1, 2)", [active.id]).unwrap();
+        for summaries in [list_texts_in_shelf(&conn, shelf.id).unwrap(), search_texts(&conn, "Badge").unwrap()] {
+            let status = |id| {
+                let summary = summaries.iter().find(|text| text.id == id).unwrap();
+                serde_json::to_value(summary).unwrap().get("has_completed_read").and_then(|value| value.as_bool())
+            };
+            assert_eq!(status(read.id), Some(true));
+            assert_eq!(status(active.id), Some(false));
+            assert_eq!(status(unread.id), Some(false));
+        }
+        conn.execute("DELETE FROM reading_sessions WHERE text_id = ?", [read.id]).unwrap();
+        let summary = search_texts(&conn, "Badge read").unwrap().remove(0);
+        assert_eq!(serde_json::to_value(summary).unwrap()["has_completed_read"], false);
     }
 
     #[test]

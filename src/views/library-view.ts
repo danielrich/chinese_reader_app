@@ -1,6 +1,8 @@
 import * as dictionary from "../lib/dictionary";
 import * as library from "../lib/library";
 import * as speed from "../lib/speed";
+import { setReaderDictionaryOpen } from "../lib/reader-layout";
+import { getSoftLineBreakOffsets } from "../lib/text-layout";
 import {
   type CacheMetadata,
   type OfflineTextBundleStatus,
@@ -8,6 +10,7 @@ import {
   deleteSession,
   saveNavCache,
   getNavCache,
+  listPendingSessions,
   getTextCache,
   saveTextSegments,
   getTextSegments,
@@ -59,7 +62,8 @@ type ShelfListState = "loading" | "cached" | "fresh" | "offline";
 type AnalysisState = "loading" | "cached" | "fresh" | "offline" | "unavailable";
 
 function textsCacheKey(shelfId: number): string {
-  return `texts_in_shelf_${shelfId}`;
+  const hasChildren = Boolean(findShelfById(shelfTree, shelfId)?.children.length);
+  return hasChildren ? `texts_in_shelf_tree_v1_${shelfId}` : `texts_in_shelf_${shelfId}`;
 }
 
 function shelfAnalysisCacheKey(shelfId: number): string {
@@ -116,6 +120,35 @@ export function setupLibraryView() {
   drawerToggle?.addEventListener("click", openShelfDrawer);
   drawerClose?.addEventListener("click", closeShelfDrawer);
   drawerBackdrop?.addEventListener("click", closeShelfDrawer);
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && document.getElementById("app")?.classList.contains("reading-focus")) {
+      setReadingFocus(false);
+      document.getElementById("reading-focus-btn")?.focus();
+    }
+  });
+  document.querySelectorAll(".nav-tab").forEach((tab) => {
+    tab.addEventListener("click", () => setReadingFocus(false));
+  });
+  window.matchMedia("(min-width: 701px)").addEventListener("change", () => setReadingFocus(false));
+}
+
+function setReadingFocus(enabled: boolean): void {
+  const app = document.getElementById("app");
+  const button = document.getElementById("reading-focus-btn");
+  const focused = enabled && Boolean(button);
+  if (focused) {
+    document.querySelector<HTMLButtonElement>('.text-tab[data-tab="content"]')?.click();
+    setReaderDictionaryOpen(false);
+    closeShelfDrawer();
+  }
+  app?.classList.toggle("reading-focus", focused);
+  if (button) {
+    button.textContent = focused ? "Exit Focus" : "Focus mode";
+    button.setAttribute("aria-pressed", String(focused));
+    button.title = focused ? "Exit Focus (Escape)" : "Use the full window for reading";
+    if (focused) button.focus({ preventScroll: true });
+  }
 }
 
 function openShelfDrawer() {
@@ -198,7 +231,7 @@ function renderShelfNodes(nodes: library.ShelfTree[], depth: number): string {
         : `${node.text_count} ${textWord}`;
 
       return `
-        <div class="shelf-node ${collapsedClass}" data-depth="${depth}">
+        <div class="shelf-node ${collapsedClass}" data-depth="${depth}" style="--depth: ${depth}">
           <div class="shelf-item ${isSelected ? "selected" : ""}" data-shelf-id="${node.shelf.id}" title="${escapeHtml(node.shelf.name)}">
             ${hasChildren ? '<span class="shelf-toggle">▶</span>' : '<span class="shelf-toggle-placeholder"></span>'}
             <span class="shelf-name">${escapeHtml(node.shelf.name)}</span>
@@ -233,6 +266,7 @@ async function selectShelf(shelfId: number) {
 }
 
 async function loadTextsInShelf(shelfId: number) {
+  setReadingFocus(false);
   const mainContainer = document.getElementById("library-main");
   if (!mainContainer) return;
 
@@ -242,6 +276,12 @@ async function loadTextsInShelf(shelfId: number) {
   }
   activeShelfAnalysisController?.abort();
   activeShelfAnalysisController = null;
+
+  // Capture pending completions before requesting server facts. Sync may finish
+  // while the list request is in flight; those completions must remain visible.
+  const pendingReadIds = new Set((await listPendingSessions().catch(() => []))
+    .filter(session => session.finished_at !== null).map(session => session.text_id));
+  if (selectedShelfId !== shelfId) return;
 
   const renderLoadedShelf = async (
     texts: library.TextSummary[],
@@ -253,6 +293,9 @@ async function loadTextsInShelf(shelfId: number) {
     }
     activeShelfAnalysisController?.abort();
     activeShelfAnalysisController = null;
+
+    texts = texts.map(text => pendingReadIds.has(text.id) ? { ...text, has_completed_read: true } : text);
+    if (listState === "fresh" || pendingReadIds.size > 0) saveNavCache(textsCacheKey(shelfId), texts).catch(() => {});
 
     setCurrentShelfTexts(texts);
     const shelf = findShelfById(shelfTree, shelfId);
@@ -358,9 +401,8 @@ async function loadTextsInShelf(shelfId: number) {
   }
 
   try {
-    const texts = await library.listTextsInShelf(shelfId);
+    const texts = await library.listTextsInShelf(shelfId, true);
     if (previewTimer !== null) window.clearTimeout(previewTimer);
-    saveNavCache(textsCacheKey(shelfId), texts).catch(() => {});
     const shelfCount = getShelfAndDescendantIds(shelfTree, shelfId).size;
     markShelfNavCached(shelfId, texts.length, shelfCount).catch(() => {});
     await renderLoadedShelf(texts, "fresh");
@@ -436,7 +478,9 @@ function renderShelfContents(
       html += `
         <div class="text-item" data-text-id="${text.id}">
           <div class="text-info">
-            <h4 class="text-title">${escapeHtml(text.title)}</h4>
+            <div class="text-title-row"><h4 class="text-title">${escapeHtml(text.title)}</h4>
+              <span class="text-read-status ${text.has_completed_read === true ? "read" : ""}" title="${text.has_completed_read === true ? "At least one reading session has been completed" : text.has_completed_read === false ? "No completed reading session yet" : "Reading status not yet available in this cache; reconnect to refresh"}">${text.has_completed_read === true ? "Read" : text.has_completed_read === false ? "Unread" : "Status unknown"}</span>
+            </div>
             ${text.author ? `<p class="text-author">${escapeHtml(text.author)}</p>` : ""}
           </div>
           <div class="text-meta">
@@ -684,6 +728,15 @@ async function loadTextView(textId: number) {
   const mainContainer = document.getElementById("library-main");
   if (!mainContainer) return;
 
+  setReadingFocus(false);
+  // A delayed shelf analysis must not replace the reader after opening a text.
+  if (pendingShelfAnalysisTimer !== null) {
+    window.clearTimeout(pendingShelfAnalysisTimer);
+    pendingShelfAnalysisTimer = null;
+  }
+  activeShelfAnalysisController?.abort();
+  activeShelfAnalysisController = null;
+
   if (sessionTimerInterval) {
     clearInterval(sessionTimerInterval);
     setSessionTimerInterval(null);
@@ -739,6 +792,10 @@ async function loadTextView(textId: number) {
             <button id="analyze-text-btn" class="btn-secondary">Analyze</button>
             <button id="delete-text-btn" class="btn-danger">Delete</button>
           </div>
+          <label id="original-line-breaks-control" class="text-layout-control" hidden title="Restore the book's fixed-width line breaks">
+            <input id="original-line-breaks" type="checkbox"> Original line breaks
+          </label>
+          <button id="reading-focus-btn" class="btn-secondary" type="button" aria-pressed="false" title="Use the full window for reading">Focus mode</button>
         </div>
 
         <div class="text-tabs">
@@ -858,13 +915,16 @@ async function loadTextView(textId: number) {
     document.getElementById("delete-text-btn")?.addEventListener("click", () => confirmDeleteText(textId));
 
     setupReadingControls(textId);
+    document.getElementById("reading-focus-btn")?.addEventListener("click", () => {
+      setReadingFocus(!document.getElementById("app")?.classList.contains("reading-focus"));
+    });
 
     document.getElementById("dict-sidebar-close")?.addEventListener("click", () => {
       const content = document.getElementById("dict-sidebar-content");
       if (content) {
         content.innerHTML = '<p class="dict-sidebar-empty">Click on a word or character to look it up</p>';
       }
-      document.getElementById("dict-sidebar")?.classList.remove("open");
+      setReaderDictionaryOpen(false);
       document.querySelectorAll(".text-segment.selected").forEach(el => el.classList.remove("selected"));
     });
   } catch (error) {
@@ -876,9 +936,29 @@ async function finishCurrentReadingSession(): Promise<void> {
   if (!activeSession) return;
 
   const textId = activeSession.text_id;
+  const finishingShelfTexts = currentShelfTexts;
+  const owningShelfId = finishingShelfTexts.find(text => text.id === textId)?.shelf_id;
+  const finishingViewShelfId = selectedShelfId;
+  // Capture paths and keys before Finish awaits storage; navigation can change.
+  const cacheTargets = owningShelfId === undefined ? [] :
+    [...new Set([owningShelfId, ...library.getShelfPath(shelfTree, owningShelfId).map(shelf => shelf.id)])]
+      .map(id => ({ id, key: textsCacheKey(id) }));
 
   try {
     const finished = await speed.finishReadingSession(activeSession.local_id);
+    for (const { id, key } of cacheTargets) {
+      const cached = await getNavCache<library.TextSummary[]>(key).catch(() => null);
+      // A chapter cache must never inherit the other chapters in a book view.
+      const fallback = id === owningShelfId ? finishingShelfTexts.filter(text => text.shelf_id === id)
+        : id === finishingViewShelfId ? finishingShelfTexts : null;
+      if (!cached && !fallback) continue;
+      const updatedCache = (cached ?? fallback!).map(text => text.id === textId ? { ...text, has_completed_read: true } : text);
+      await saveNavCache(key, updatedCache).catch(() => {});
+    }
+    if (selectedShelfId === finishingViewShelfId && currentShelfTexts.some(text => text.id === textId)) {
+      const updated = currentShelfTexts.map(text => text.id === textId ? { ...text, has_completed_read: true } : text);
+      setCurrentShelfTexts(updated);
+    }
     if (sessionTimerInterval) {
       clearInterval(sessionTimerInterval);
       setSessionTimerInterval(null);
@@ -924,6 +1004,7 @@ function setupReadingControls(textId: number) {
       setActiveSession(await speed.startReadingSession(textId, currentTextCharacterCount));
       updateReadingControlsUI();
       startSessionTimer();
+      setReadingFocus(true);
     } catch (error) {
       console.error("Failed to start reading session:", error);
       alert(`Failed to start reading: ${error}`);
@@ -958,6 +1039,7 @@ function setupReadingControls(textId: number) {
 }
 
 function updateReadingControlsUI() {
+  if (!activeSession) setReadingFocus(false);
   const container = document.getElementById("reading-controls");
   if (!container) return;
 
@@ -1001,6 +1083,7 @@ function updateReadingControlsUI() {
         setActiveSession(await speed.startReadingSession(curTextId, currentTextCharacterCount));
         updateReadingControlsUI();
         startSessionTimer();
+        setReadingFocus(true);
       } catch (error) {
         console.error("Failed to start reading session:", error);
         alert(`Failed to start reading: ${error}`);
@@ -1169,8 +1252,25 @@ async function loadInteractiveText(content: string, textId: number) {
   const renderSegments = (segments: library.TextSegment[]) => {
     setCurrentTextSegments(segments);
 
+    const source = segments.map(segment => segment.text).join("");
+    const detectedBreaks = getSoftLineBreakOffsets(source);
+    const originalBreaks = document.getElementById("original-line-breaks") as HTMLInputElement | null;
+    const layoutControl = document.getElementById("original-line-breaks-control");
+    if (layoutControl) layoutControl.hidden = detectedBreaks.size === 0;
+    const softBreaks = originalBreaks?.checked ? new Set<number>() : detectedBreaks;
+    if (originalBreaks) {
+      originalBreaks.onchange = () => {
+        const scrollTop = container.scrollTop;
+        renderSegments(segments);
+        container.scrollTop = scrollTop;
+      };
+    }
+
     let html = "";
+    let sourceOffset = 0;
     for (const segment of segments) {
+      let partOffset = sourceOffset;
+      sourceOffset += segment.text.length;
       if (segment.is_cjk) {
         let statusClass = "";
         if (segment.is_learning) {
@@ -1180,7 +1280,15 @@ async function loadInteractiveText(content: string, textId: number) {
         }
         html += `<span class="text-segment ${statusClass}" data-text="${escapeHtml(segment.text)}" data-type="${segment.segment_type}">${escapeHtml(segment.text)}</span>`;
       } else {
-        html += segment.text.replace(/\n/g, "<br>");
+        html += segment.text.split(/(\r\n|\r|\n)/).map((part) => {
+          const offset = partOffset;
+          partOffset += part.length;
+          if (!/^[\r\n]+$/.test(part)) return escapeHtml(part);
+          if (softBreaks.has(offset)) return "";
+          // Cached segmentation may split CRLF into two separate segments.
+          if (part === "\r" && source[offset + 1] === "\n") return "";
+          return "<br>";
+        }).join("");
       }
     }
 
@@ -1252,6 +1360,7 @@ async function lookupSelectedText(selectedText: string) {
   const sidebarContent = document.getElementById("dict-sidebar-content");
   if (!sidebarContent) return;
 
+  setReaderDictionaryOpen(true);
   sidebarContent.innerHTML = '<p class="loading">Looking up...</p>';
 
   try {
@@ -1551,7 +1660,7 @@ async function lookupInSidebar(term: string, termType: "character" | "word") {
   const sidebarContent = document.getElementById("dict-sidebar-content");
   if (!sidebarContent) return;
 
-  document.getElementById("dict-sidebar")?.classList.add("open");
+  setReaderDictionaryOpen(true);
   sidebarContent.innerHTML = '<p class="loading">Looking up...</p>';
 
   try {
@@ -2567,7 +2676,7 @@ async function splitLargeTextsInShelf(shelfId: number) {
   }
 }
 
-async function cacheShelfForOffline(shelfId: number, directTexts: library.TextSummary[], btn: HTMLButtonElement) {
+async function cacheShelfForOffline(shelfId: number, displayedTexts: library.TextSummary[], btn: HTMLButtonElement) {
   if (!shelfTree) return;
 
   offlineDownloadErrors.delete(shelfId);
@@ -2579,18 +2688,18 @@ async function cacheShelfForOffline(shelfId: number, directTexts: library.TextSu
 
     const shelfIds = [...getShelfAndDescendantIds(shelfTree, shelfId)];
     const textMap = new Map<number, library.TextSummary>();
-    for (const text of directTexts) {
+    for (const text of displayedTexts) {
       textMap.set(text.id, text);
     }
 
     btn.textContent = `Caching shelves 1/${shelfIds.length}...`;
-    saveNavCache(textsCacheKey(shelfId), directTexts).catch(() => {});
-    markShelfNavCached(shelfId, directTexts.length, shelfIds.length).catch(() => {});
+    saveNavCache(textsCacheKey(shelfId), displayedTexts).catch(() => {});
+    markShelfNavCached(shelfId, displayedTexts.length, shelfIds.length).catch(() => {});
 
     for (let index = 0; index < shelfIds.length; index += 1) {
       const currentShelfId = shelfIds[index];
       if (currentShelfId !== shelfId) {
-        const shelfTexts = await library.listTextsInShelf(currentShelfId);
+        const shelfTexts = await library.listTextsInShelf(currentShelfId, true);
         saveNavCache(textsCacheKey(currentShelfId), shelfTexts).catch(() => {});
         markShelfNavCached(
           currentShelfId,

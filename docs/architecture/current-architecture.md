@@ -57,6 +57,23 @@ Important frontend files:
 - `src/sw.ts` implements the service worker.
 - `src/views/*` contain view-level DOM rendering and event binding.
 
+Library list/search summaries include `has_completed_read`, computed from any
+completed session. Read/Unread title badges merge locally pending completions;
+finishing a session also updates its owning shelf's navigation cache. Legacy
+cached summaries without the field show an unknown status until refreshed.
+
+The Goals tab stores versioned goal configuration through `user_settings`
+(`reading_goals_v1`). `library/goals.rs` supplies read-only facts for a recursive
+union of selected shelves, earliest completed sessions per text, and global
+reading experience/activity. `src/lib/goal-projection.ts` integrates constant
+or piecewise linear speed against lifetime characters entirely in the browser.
+Scenario edits do not write reading history or call the server; Save assumptions
+persists the selected plan. `views/goal-chart.ts` provides SVG and tabular views.
+`lib/goal-chart-data.ts` supplies shared daily lookups and full/three-month
+windows; `views/goal-chart-inspector.ts` updates local SVG cursors and readouts
+without a request or curve redraw. Long goals stack the near-term chart below
+the full chart, with an independently useful vertical scale.
+
 The UI is mostly direct DOM string rendering rather than a component framework.
 Shared mutable state lives in `src/state.ts`.
 
