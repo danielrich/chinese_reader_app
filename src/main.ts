@@ -1,4 +1,5 @@
 import "./style.css";
+import "./reader-layout.css";
 import { setupDictionaryView, loadStats } from "./views/dictionary-view";
 import { setupLibraryView, loadShelfTree } from "./views/library-view";
 import { loadSpeedView } from "./views/speed-view";

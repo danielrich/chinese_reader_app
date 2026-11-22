@@ -103,12 +103,12 @@ test("finishing and discarding restore layout and allow another focused session"
   await expect(page.locator("#shelf-sidebar")).toBeVisible();
 });
 
-test("mobile keeps its navigation and dictionary drawer", async ({ page }) => {
+test("mobile focuses reading and gives the dictionary its own space", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
   await openReader(page);
   await page.locator("#start-reading-btn").click();
-  await expect(page.locator(".nav-tabs")).toBeVisible();
-  await expect(page.locator("#shelf-drawer-toggle")).toBeVisible();
+  await expect(page.locator(".nav-tabs")).toBeHidden();
+  await expect(page.getByRole("button", { name: "Exit Focus", exact: true })).toBeVisible();
   await page.locator(".text-segment").first().click();
   await expect(page.locator("#dict-sidebar")).toHaveClass(/open/);
   await page.screenshot({ path: test.info().outputPath("mobile-reader.png"), animations: "disabled" });
@@ -156,3 +156,29 @@ test("ordinary paragraphs and verse retain their intentional line breaks", async
   const second = await page.locator('.text-segment[data-text="疑"]').boundingBox();
   expect(second!.y).toBeGreaterThan(first!.y);
 });
+
+for (const width of [390, 800, 1440]) {
+  test(`lookup stays separate and preserves the selected word at ${width}px`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 844 });
+    await openReader(page);
+    await page.locator("#start-reading-btn").click();
+    const reader = page.locator("#text-content-interactive");
+    const word = page.locator(".text-segment").nth(80);
+    await word.scrollIntoViewIfNeeded();
+    await word.click();
+    await expect(page.locator("#dict-sidebar")).toBeVisible();
+    const area = (await reader.boundingBox())!;
+    const panel = (await page.locator("#dict-sidebar").boundingBox())!;
+    const selected = (await word.boundingBox())!;
+    expect(area.x + area.width <= panel.x + 1 || area.y + area.height <= panel.y + 1).toBeTruthy();
+    expect(panel.y + panel.height).toBeLessThanOrEqual(845);
+    if (width < 701) expect(area.height).toBeGreaterThan(panel.height);
+    expect(selected.y).toBeGreaterThanOrEqual(area.y);
+    expect(selected.y + selected.height).toBeLessThanOrEqual(area.y + area.height);
+    await page.screenshot({ path: test.info().outputPath(`reader-${width}.png`) });
+    await page.locator("#dict-sidebar-close").click();
+    await expect(page.locator("#dict-sidebar")).toBeHidden();
+    const restored = (await word.boundingBox())!;
+    expect(Math.abs(restored.y - selected.y)).toBeLessThan(45);
+  });
+}

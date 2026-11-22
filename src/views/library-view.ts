@@ -1,6 +1,7 @@
 import * as dictionary from "../lib/dictionary";
 import * as library from "../lib/library";
 import * as speed from "../lib/speed";
+import { setReaderDictionaryOpen } from "../lib/reader-layout";
 import { getSoftLineBreakOffsets } from "../lib/text-layout";
 import {
   type CacheMetadata,
@@ -135,10 +136,10 @@ export function setupLibraryView() {
 function setReadingFocus(enabled: boolean): void {
   const app = document.getElementById("app");
   const button = document.getElementById("reading-focus-btn");
-  const focused = enabled && window.matchMedia("(min-width: 701px)").matches && Boolean(button);
+  const focused = enabled && Boolean(button);
   if (focused) {
     document.querySelector<HTMLButtonElement>('.text-tab[data-tab="content"]')?.click();
-    document.getElementById("dict-sidebar")?.classList.remove("open");
+    setReaderDictionaryOpen(false);
     closeShelfDrawer();
   }
   app?.classList.toggle("reading-focus", focused);
@@ -923,7 +924,7 @@ async function loadTextView(textId: number) {
       if (content) {
         content.innerHTML = '<p class="dict-sidebar-empty">Click on a word or character to look it up</p>';
       }
-      document.getElementById("dict-sidebar")?.classList.remove("open");
+      setReaderDictionaryOpen(false);
       document.querySelectorAll(".text-segment.selected").forEach(el => el.classList.remove("selected"));
     });
   } catch (error) {
@@ -1359,7 +1360,7 @@ async function lookupSelectedText(selectedText: string) {
   const sidebarContent = document.getElementById("dict-sidebar-content");
   if (!sidebarContent) return;
 
-  document.getElementById("dict-sidebar")?.classList.add("open");
+  setReaderDictionaryOpen(true);
   sidebarContent.innerHTML = '<p class="loading">Looking up...</p>';
 
   try {
@@ -1659,7 +1660,7 @@ async function lookupInSidebar(term: string, termType: "character" | "word") {
   const sidebarContent = document.getElementById("dict-sidebar-content");
   if (!sidebarContent) return;
 
-  document.getElementById("dict-sidebar")?.classList.add("open");
+  setReaderDictionaryOpen(true);
   sidebarContent.innerHTML = '<p class="loading">Looking up...</p>';
 
   try {
