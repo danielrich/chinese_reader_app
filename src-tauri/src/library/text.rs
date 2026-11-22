@@ -308,14 +308,37 @@ pub fn search_texts(conn: &Connection, query: &str) -> Result<Vec<TextSummary>> 
 
 /// List texts in a shelf (summaries only, without full content)
 pub fn list_texts_in_shelf(conn: &Connection, shelf_id: i64) -> Result<Vec<TextSummary>> {
-    let mut stmt = conn.prepare(
-        "SELECT t.id, t.shelf_id, t.title, t.author, t.character_count, t.created_at,
+    list_shelf_texts(conn, shelf_id, false)
+}
+
+/// List a shelf's texts, then child subtrees in sidebar order, without content.
+pub fn list_texts_in_shelf_with_descendants(conn: &Connection, shelf_id: i64) -> Result<Vec<TextSummary>> {
+    list_shelf_texts(conn, shelf_id, true)
+}
+
+fn list_shelf_texts(conn: &Connection, shelf_id: i64, recursive: bool) -> Result<Vec<TextSummary>> {
+    let scope = if recursive {
+        "WITH RECURSIVE ordered_shelves AS (
+            SELECT id, parent_id,
+                   ROW_NUMBER() OVER (PARTITION BY parent_id ORDER BY sort_order, name, id) AS sibling_order
+            FROM shelves
+         ), scope(id, path) AS (
+            SELECT id, '' FROM shelves WHERE id = ?
+            UNION ALL
+            SELECT s.id, scope.path || printf('%020d/', s.sibling_order)
+            FROM ordered_shelves s JOIN scope ON s.parent_id = scope.id
+         )"
+    } else {
+        "WITH scope(id, path) AS (SELECT ?, '')"
+    };
+    let mut stmt = conn.prepare(&format!(
+        "{scope}
+         SELECT t.id, t.shelf_id, t.title, t.author, t.character_count, t.created_at,
                 EXISTS(SELECT 1 FROM text_analyses WHERE text_id = t.id) as has_analysis,
                 EXISTS(SELECT 1 FROM reading_sessions WHERE text_id = t.id AND is_complete = 1) as has_completed_read
-         FROM texts t
-         WHERE t.shelf_id = ?
-         ORDER BY t.sort_order, t.created_at DESC",
-    )?;
+         FROM texts t JOIN scope ON t.shelf_id = scope.id
+         ORDER BY scope.path, t.sort_order, t.created_at DESC, t.id"
+    ))?;
 
     let texts = stmt
         .query_map([shelf_id], |row| {
@@ -565,6 +588,31 @@ mod tests {
 
         let retrieved = get_text(&conn, text.id).unwrap().unwrap();
         assert_eq!(retrieved.content, "这是一个测试文本。");
+    }
+
+    #[test]
+    fn test_recursive_shelf_list_preserves_hierarchy_and_read_status() {
+        let conn = setup_test_db();
+        conn.execute_batch("INSERT INTO shelves (id,name,parent_id,sort_order) VALUES
+            (1,'Book',NULL,0), (2,'Chapter 10',1,10), (3,'Chapter 2',1,2),
+            (4,'Nested',3,0), (5,'Other book',NULL,0),
+            (6,'First',1,-1), (7,'A tie',1,2), (8,'Empty',1,3);
+            INSERT INTO texts (id,shelf_id,title,content,sort_order) VALUES
+            (1,1,'Intro','文',0), (2,2,'Ten','文',0),
+            (3,3,'Two section 2','文',1), (4,3,'Two section 1','文',0),
+            (5,4,'Nested text','文',0), (6,5,'Unrelated','文',0),
+            (7,6,'First text','文',0), (8,7,'Tie text','文',0);
+            INSERT INTO reading_sessions (text_id,started_at,character_count,is_complete)
+            VALUES (4,'2026-11-20',1,1);").unwrap();
+        let direct = list_texts_in_shelf(&conn, 1).unwrap();
+        assert_eq!(direct.iter().map(|t| t.id).collect::<Vec<_>>(), vec![1]);
+        let texts = list_texts_in_shelf_with_descendants(&conn, 1).unwrap();
+        // Shelf ties follow name, like the sidebar; sections follow text order.
+        assert_eq!(texts.iter().map(|t| t.id).collect::<Vec<_>>(), vec![1,7,8,4,3,5,2]);
+        assert!(texts.iter().find(|t| t.id == 4).unwrap().has_completed_read);
+        assert_eq!(texts.iter().find(|t| t.id == 4).unwrap().shelf_id, 3);
+        assert!(list_texts_in_shelf_with_descendants(&conn, 8).unwrap().is_empty());
+        assert!(list_texts_in_shelf_with_descendants(&conn, 999).unwrap().is_empty());
     }
 
     #[test]

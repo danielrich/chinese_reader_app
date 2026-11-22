@@ -476,10 +476,10 @@ export async function getTextVocabCache(textId: number, options?: RequestOptions
 }
 
 /**
- * List texts in a shelf
+ * List texts in a shelf, optionally including child subtrees in shelf order.
  */
-export async function listTextsInShelf(shelfId: number): Promise<TextSummary[]> {
-  return invoke<TextSummary[]>("list_texts_in_shelf", { shelfId });
+export async function listTextsInShelf(shelfId: number, includeDescendants = false): Promise<TextSummary[]> {
+  return invoke<TextSummary[]>("list_texts_in_shelf", { shelfId, includeDescendants });
 }
 
 /**

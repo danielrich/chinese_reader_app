@@ -61,7 +61,8 @@ type ShelfListState = "loading" | "cached" | "fresh" | "offline";
 type AnalysisState = "loading" | "cached" | "fresh" | "offline" | "unavailable";
 
 function textsCacheKey(shelfId: number): string {
-  return `texts_in_shelf_${shelfId}`;
+  const hasChildren = Boolean(findShelfById(shelfTree, shelfId)?.children.length);
+  return hasChildren ? `texts_in_shelf_tree_v1_${shelfId}` : `texts_in_shelf_${shelfId}`;
 }
 
 function shelfAnalysisCacheKey(shelfId: number): string {
@@ -229,7 +230,7 @@ function renderShelfNodes(nodes: library.ShelfTree[], depth: number): string {
         : `${node.text_count} ${textWord}`;
 
       return `
-        <div class="shelf-node ${collapsedClass}" data-depth="${depth}">
+        <div class="shelf-node ${collapsedClass}" data-depth="${depth}" style="--depth: ${depth}">
           <div class="shelf-item ${isSelected ? "selected" : ""}" data-shelf-id="${node.shelf.id}" title="${escapeHtml(node.shelf.name)}">
             ${hasChildren ? '<span class="shelf-toggle">▶</span>' : '<span class="shelf-toggle-placeholder"></span>'}
             <span class="shelf-name">${escapeHtml(node.shelf.name)}</span>
@@ -399,7 +400,7 @@ async function loadTextsInShelf(shelfId: number) {
   }
 
   try {
-    const texts = await library.listTextsInShelf(shelfId);
+    const texts = await library.listTextsInShelf(shelfId, true);
     if (previewTimer !== null) window.clearTimeout(previewTimer);
     const shelfCount = getShelfAndDescendantIds(shelfTree, shelfId).size;
     markShelfNavCached(shelfId, texts.length, shelfCount).catch(() => {});
@@ -936,18 +937,24 @@ async function finishCurrentReadingSession(): Promise<void> {
   const textId = activeSession.text_id;
   const finishingShelfTexts = currentShelfTexts;
   const owningShelfId = finishingShelfTexts.find(text => text.id === textId)?.shelf_id;
+  const finishingViewShelfId = selectedShelfId;
+  // Capture paths and keys before Finish awaits storage; navigation can change.
+  const cacheTargets = owningShelfId === undefined ? [] :
+    [...new Set([owningShelfId, ...library.getShelfPath(shelfTree, owningShelfId).map(shelf => shelf.id)])]
+      .map(id => ({ id, key: textsCacheKey(id) }));
 
   try {
     const finished = await speed.finishReadingSession(activeSession.local_id);
-    if (owningShelfId !== undefined) {
-      // The user can navigate while Finish waits for storage. Keep the update
-      // tied to the finished text's owner, never the newly selected shelf.
-      const key = textsCacheKey(owningShelfId);
+    for (const { id, key } of cacheTargets) {
       const cached = await getNavCache<library.TextSummary[]>(key).catch(() => null);
-      const updatedCache = (cached ?? finishingShelfTexts).map(text => text.id === textId ? { ...text, has_completed_read: true } : text);
+      // A chapter cache must never inherit the other chapters in a book view.
+      const fallback = id === owningShelfId ? finishingShelfTexts.filter(text => text.shelf_id === id)
+        : id === finishingViewShelfId ? finishingShelfTexts : null;
+      if (!cached && !fallback) continue;
+      const updatedCache = (cached ?? fallback!).map(text => text.id === textId ? { ...text, has_completed_read: true } : text);
       await saveNavCache(key, updatedCache).catch(() => {});
     }
-    if (selectedShelfId === owningShelfId && currentShelfTexts.some(text => text.id === textId)) {
+    if (selectedShelfId === finishingViewShelfId && currentShelfTexts.some(text => text.id === textId)) {
       const updated = currentShelfTexts.map(text => text.id === textId ? { ...text, has_completed_read: true } : text);
       setCurrentShelfTexts(updated);
     }
@@ -2668,7 +2675,7 @@ async function splitLargeTextsInShelf(shelfId: number) {
   }
 }
 
-async function cacheShelfForOffline(shelfId: number, directTexts: library.TextSummary[], btn: HTMLButtonElement) {
+async function cacheShelfForOffline(shelfId: number, displayedTexts: library.TextSummary[], btn: HTMLButtonElement) {
   if (!shelfTree) return;
 
   offlineDownloadErrors.delete(shelfId);
@@ -2680,18 +2687,18 @@ async function cacheShelfForOffline(shelfId: number, directTexts: library.TextSu
 
     const shelfIds = [...getShelfAndDescendantIds(shelfTree, shelfId)];
     const textMap = new Map<number, library.TextSummary>();
-    for (const text of directTexts) {
+    for (const text of displayedTexts) {
       textMap.set(text.id, text);
     }
 
     btn.textContent = `Caching shelves 1/${shelfIds.length}...`;
-    saveNavCache(textsCacheKey(shelfId), directTexts).catch(() => {});
-    markShelfNavCached(shelfId, directTexts.length, shelfIds.length).catch(() => {});
+    saveNavCache(textsCacheKey(shelfId), displayedTexts).catch(() => {});
+    markShelfNavCached(shelfId, displayedTexts.length, shelfIds.length).catch(() => {});
 
     for (let index = 0; index < shelfIds.length; index += 1) {
       const currentShelfId = shelfIds[index];
       if (currentShelfId !== shelfId) {
-        const shelfTexts = await library.listTextsInShelf(currentShelfId);
+        const shelfTexts = await library.listTextsInShelf(currentShelfId, true);
         saveNavCache(textsCacheKey(currentShelfId), shelfTexts).catch(() => {});
         markShelfNavCached(
           currentShelfId,

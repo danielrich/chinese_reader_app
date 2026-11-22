@@ -481,19 +481,14 @@ h3 {
   overflow-y: auto;
 }
 
-.shelf-node {
-  margin-left: calc(var(--depth, 0) * 1rem);
-}
-
-.shelf-node[data-depth="1"] { --depth: 1; }
-.shelf-node[data-depth="2"] { --depth: 2; }
-.shelf-node[data-depth="3"] { --depth: 3; }
-
 .shelf-item {
   display: flex;
   align-items: center;
   gap: 0.5rem;
   padding: 0.5rem;
+  /* Indent only the row so nested nodes do not compound their margins.
+     Use smaller steps past depth 3 and cap indentation for very deep trees. */
+  padding-left: calc(0.5rem + min(var(--depth, 0), 3) * 1rem + clamp(0rem, (var(--depth, 0) - 3) * 0.5rem, 2.5rem));
   border-radius: 4px;
   cursor: pointer;
   transition: background 0.2s;
@@ -509,6 +504,7 @@ h3 {
 }
 
 .shelf-toggle {
+  flex-shrink: 0;
   font-size: 0.7rem;
   width: 1rem;
   text-align: center;
@@ -528,6 +524,7 @@ h3 {
 }
 
 .shelf-toggle-placeholder {
+  flex-shrink: 0;
   width: 1rem;
 }
 
@@ -572,13 +569,6 @@ h3 {
   padding: 0.4rem 1rem 0.2rem;
   letter-spacing: 0.02em;
 }
-
-/* Reduce indent step past depth 3 to leave more room for deep names */
-.shelf-node[data-depth="4"] { --depth: 3.5; }
-.shelf-node[data-depth="5"] { --depth: 4; }
-.shelf-node[data-depth="6"] { --depth: 4.5; }
-.shelf-node[data-depth="7"] { --depth: 5; }
-.shelf-node[data-depth="8"] { --depth: 5.5; }
 
 /* Mobile drawer trigger + backdrop (hidden on desktop) */
 .shelf-drawer-toggle {

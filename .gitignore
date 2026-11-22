@@ -35,3 +35,7 @@ dist-ssr
 scripts/playwright-qidian-profile/
 scripts/playright-qidian-profile/
 scripts/study_texts/
+
+# Generated browser test output
+/test-results/
+/playwright-report/
