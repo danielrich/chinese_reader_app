@@ -4,25 +4,28 @@
 //! so the app can be accessed from any browser on the local network.
 //!
 //! Usage:
-//!   cargo run --bin server -- [--db-path <path>] [--port <port>] [--dist <path>] [--cert <pem>] [--key <pem>]
+//!   cargo run --bin server -- [--db-path <path>] [--port <port>] [--dist <path>] [--cert <pem>] [--key <pem>] [--run-analysis-maintenance]
 //!
 //! HTTPS example (generate certs with mkcert first):
 //!   ./server --cert chasmfiend.local.pem --key chasmfiend.local-key.pem
 
 use axum::{
+    body::Body,
     extract::{Path, Request, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use chinese_reader_lib::{dictionary, library};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, Local, NaiveDate, TimeZone, Utc};
 use rusqlite::Connection;
 use serde_json::Value;
 use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tower_http::compression::CompressionLayer;
 use tower_http::services::{ServeDir, ServeFile};
 
 #[path = "server/request_security.rs"]
@@ -30,7 +33,214 @@ mod request_security;
 
 const DB_PRAGMAS: &str =
     "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=30000;";
-const WRITE_WAIT_LOG_THRESHOLD: Duration = Duration::from_millis(250);
+const SLOW_REQUEST_THRESHOLD: Duration = Duration::from_millis(250);
+
+#[derive(Default)]
+struct RequestTimings {
+    pool_wait: Duration,
+    write_wait: Duration,
+    blocking: Duration,
+    serialization: Duration,
+    total: Duration,
+}
+
+fn slow_request_log(command: &str, timings: &RequestTimings) -> Option<String> {
+    (timings.total > SLOW_REQUEST_THRESHOLD).then(|| {
+        format!(
+            "slow_request command={} pool_wait_ms={} write_wait_ms={} blocking_ms={} serialization_ms={} total_ms={}",
+            command,
+            timings.pool_wait.as_millis(),
+            timings.write_wait.as_millis(),
+            timings.blocking.as_millis(),
+            timings.serialization.as_millis(),
+            timings.total.as_millis()
+        )
+    })
+}
+
+fn finalize_timed_request<T>(
+    command: &str,
+    total_started: Instant,
+    mut timings: RequestTimings,
+    result: Result<T, ApiError>,
+) -> (Result<T, ApiError>, Option<String>) {
+    timings.total = total_started.elapsed();
+    let line = slow_request_log(command, &timings);
+    (result, line)
+}
+
+fn emit_finalized_request<T>(
+    command: &str,
+    total_started: Instant,
+    timings: RequestTimings,
+    result: Result<T, ApiError>,
+) -> Result<T, ApiError> {
+    let (result, line) = finalize_timed_request(command, total_started, timings, result);
+    if let Some(line) = line {
+        eprintln!("{line}");
+    }
+    result
+}
+
+// These timings cover handler work through JSON byte serialization and response
+// construction. Streaming gzip is applied later by Tower middleware and is not
+// included in handler timing.
+
+fn weak_etag_matches(if_none_match: Option<&HeaderValue>, etag: &str) -> bool {
+    let Some(value) = if_none_match.and_then(|value| value.to_str().ok()) else {
+        return false;
+    };
+    let target = etag.strip_prefix("W/").unwrap_or(etag);
+    value.split(',').map(str::trim).any(|candidate| {
+        candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == target
+    })
+}
+
+fn text_vocab_version(conn: &Connection, text_id: i64) -> Result<String, ApiError> {
+    let version: (String, Option<i64>, Option<String>) = conn
+        .query_row(
+            "SELECT texts.updated_at, text_analyses.id, text_analyses.analyzed_at
+             FROM texts LEFT JOIN text_analyses ON text_analyses.text_id = texts.id
+             WHERE texts.id = ?1",
+            [text_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => not_found(format!("Text {text_id} not found")),
+            other => db_err(other),
+        })?;
+    Ok(format!(
+        "{text_id}\0{}\0{}\0{}",
+        version.0,
+        version.1.unwrap_or_default(),
+        version.2.unwrap_or_default()
+    ))
+}
+
+fn text_vocab_etag(version: &str, representation: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in version.as_bytes().iter().chain(representation) {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("W/\"text-vocab-{hash:016x}\"")
+}
+
+fn serialize_json_bytes_with<F>(serializer: F) -> Result<(Vec<u8>, Duration), ApiError>
+where
+    F: FnOnce() -> serde_json::Result<Vec<u8>>,
+{
+    let started = Instant::now();
+    let bytes = serializer().map_err(|error| ApiError::Internal(error.to_string()))?;
+    Ok((bytes, started.elapsed()))
+}
+
+fn json_response(bytes: Vec<u8>) -> Result<Response, ApiError> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(bytes))
+        .map_err(|error| ApiError::Internal(error.to_string()))
+}
+
+fn local_maintenance_cutoff(date: NaiveDate) -> DateTime<Local> {
+    Local
+        .with_ymd_and_hms(date.year(), date.month(), date.day(), 0, 5, 0)
+        .single()
+        .expect("00:05 must be an unambiguous local time")
+}
+
+/// Select the scheduler cutoff, retaining a five-minute post-cutoff grace window.
+fn next_maintenance_cutoff(now: DateTime<Local>) -> DateTime<Local> {
+    let today = local_maintenance_cutoff(now.date_naive());
+    if now < today || now < today + ChronoDuration::minutes(5) {
+        today
+    } else {
+        local_maintenance_cutoff(
+            now.date_naive()
+                .succ_opt()
+                .expect("next maintenance date must exist"),
+        )
+    }
+}
+
+fn most_recent_maintenance_cutoff(now: DateTime<Local>) -> DateTime<Local> {
+    let today = local_maintenance_cutoff(now.date_naive());
+    if now >= today {
+        today
+    } else {
+        local_maintenance_cutoff(
+            now.date_naive()
+                .pred_opt()
+                .expect("previous maintenance date must exist"),
+        )
+    }
+}
+
+fn scheduled_cutoff_after_last_run(
+    now: DateTime<Local>,
+    last_run: DateTime<Local>,
+) -> DateTime<Local> {
+    let latest_due = most_recent_maintenance_cutoff(now);
+    if latest_due > last_run {
+        return latest_due;
+    }
+
+    let candidate = next_maintenance_cutoff(now);
+    if candidate > now {
+        candidate
+    } else {
+        local_maintenance_cutoff(
+            now.date_naive()
+                .succ_opt()
+                .expect("next maintenance date must exist"),
+        )
+    }
+}
+
+async fn execute_scheduled_maintenance(db_path: std::path::PathBuf, cutoff: DateTime<Local>) {
+    let cutoff_utc = cutoff.with_timezone(&Utc);
+    let started = Instant::now();
+    match tokio::task::spawn_blocking(move || {
+        library::maintenance::run_due_analysis_maintenance(&db_path, cutoff_utc)
+    })
+    .await
+    {
+        Ok(report) => eprintln!(
+            "analysis_maintenance cutoff={} duration_ms={} claimed={} succeeded={} failed={} final_dirty={} fatal_error={:?}",
+            report.cutoff,
+            started.elapsed().as_millis(),
+            report.claimed,
+            report.succeeded,
+            report.failed,
+            report.still_dirty,
+            report.fatal_error
+        ),
+        Err(error) => eprintln!(
+            "analysis_maintenance cutoff={} duration_ms={} success=false worker_error={}",
+            cutoff,
+            started.elapsed().as_millis(),
+            error
+        ),
+    }
+}
+
+fn spawn_analysis_maintenance_scheduler(db_path: std::path::PathBuf) {
+    tokio::spawn(async move {
+        let startup_now = Local::now();
+        let mut last_cutoff = most_recent_maintenance_cutoff(startup_now);
+        execute_scheduled_maintenance(db_path.clone(), last_cutoff).await;
+
+        loop {
+            let now = Local::now();
+            let cutoff = scheduled_cutoff_after_last_run(now, last_cutoff);
+            let sleep_for = (cutoff - now).to_std().unwrap_or_default();
+            tokio::time::sleep(sleep_for).await;
+            execute_scheduled_maintenance(db_path.clone(), cutoff).await;
+            last_cutoff = cutoff;
+        }
+    });
+}
 
 fn cache_control_for_static_response(
     path: &str,
@@ -143,6 +353,53 @@ mod epub_handler_tests {
     async fn export_shelf_epub_maps_missing_and_empty_shelves() {
         assert_eq!(response_for(99).await.status(), StatusCode::NOT_FOUND);
         assert_eq!(response_for(2).await.status(), StatusCode::BAD_REQUEST);
+    }
+}
+
+#[cfg(test)]
+mod maintenance_schedule_tests {
+    use super::{next_maintenance_cutoff, scheduled_cutoff_after_last_run};
+    use chrono::{Local, TimeZone};
+
+    fn local(hour: u32, minute: u32, second: u32) -> chrono::DateTime<Local> {
+        Local
+            .with_ymd_and_hms(2026, 8, 20, hour, minute, second)
+            .single()
+            .unwrap()
+    }
+
+    #[test]
+    fn next_maintenance_cutoff_honors_grace_window_boundaries() {
+        assert_eq!(next_maintenance_cutoff(local(0, 4, 59)), local(0, 5, 0));
+        assert_eq!(next_maintenance_cutoff(local(0, 5, 0)), local(0, 5, 0));
+        assert_eq!(next_maintenance_cutoff(local(0, 9, 59)), local(0, 5, 0));
+        assert_eq!(
+            next_maintenance_cutoff(local(0, 10, 0)),
+            Local
+                .with_ymd_and_hms(2026, 8, 21, 0, 5, 0)
+                .single()
+                .unwrap()
+        );
+        assert_eq!(
+            next_maintenance_cutoff(local(23, 0, 0)),
+            Local
+                .with_ymd_and_hms(2026, 8, 21, 0, 5, 0)
+                .single()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn scheduler_runs_a_cutoff_crossed_during_startup_catch_up() {
+        let last_run = Local
+            .with_ymd_and_hms(2026, 8, 19, 0, 5, 0)
+            .single()
+            .unwrap();
+
+        assert_eq!(
+            scheduled_cutoff_after_last_run(local(0, 10, 0), last_run),
+            local(0, 5, 0)
+        );
     }
 }
 
@@ -264,6 +521,19 @@ async fn main() {
 
     println!("Database: {:?}", db_path);
 
+    if args.iter().any(|arg| arg == "--run-analysis-maintenance") {
+        let report = library::maintenance::run_due_analysis_maintenance(&db_path, Utc::now());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report)
+                .unwrap_or_else(|error| format!("failed to serialize report: {error}"))
+        );
+        if report.fatal_error.is_some() || report.failed > 0 {
+            std::process::exit(1);
+        }
+        return;
+    }
+
     // Run schema migrations on the first connection, then build an 8-connection
     // WAL-mode pool so reads can run in parallel without blocking each other.
     let first = dictionary::init_connection(&db_path).unwrap_or_else(|e| {
@@ -293,6 +563,7 @@ async fn main() {
     println!("Connection pool: {} connections", conns.len());
 
     let db: Db = DbPool::new(conns);
+    spawn_analysis_maintenance_scheduler(db_path.clone());
 
     let index_path = dist_dir.join("index.html");
     let serve_static = ServeDir::new(&dist_dir).not_found_service(ServeFile::new(&index_path));
@@ -307,12 +578,13 @@ async fn main() {
         )
         .route(
             "/api/texts/{id}/vocab-cache",
-            get(get_text_vocab_cache_handler),
+            get(get_text_vocab_cache_handler_with_headers),
         )
         .route("/api/sync/sessions", post(sync_sessions_handler))
         .fallback_service(serve_static)
         .with_state(db)
         .layer(middleware::from_fn(add_static_cache_headers))
+        .layer(CompressionLayer::new().gzip(true))
         .layer(middleware::from_fn_with_state(origin_policy, request_security::protect_api));
 
     let addr: std::net::SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
@@ -351,40 +623,81 @@ async fn dispatch(
     State(db): State<Db>,
     Path(command): Path<String>,
     Json(body): Json<Value>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Response, AppError> {
+    let total_started = Instant::now();
+    let mut timings = RequestTimings::default();
     let _write_permit = if is_write_command(&command) {
         let started = Instant::now();
         let permit = db.acquire_write_permit().await;
-        let waited = started.elapsed();
-        if waited >= WRITE_WAIT_LOG_THRESHOLD {
-            eprintln!("Write command '{command}' waited {waited:?} for the SQLite write lane");
-        }
+        timings.write_wait = started.elapsed();
         Some(permit)
     } else {
         None
     };
 
+    let pool_started = Instant::now();
     let conn = db.acquire().await;
-    let result = tokio::task::spawn_blocking(move || dispatch_sync(&conn, &command, &body))
-        .await
-        .map_err(|e| ApiError::Internal(e.to_string()))??;
-    Ok(Json(result))
+    timings.pool_wait = pool_started.elapsed();
+    let blocking_started = Instant::now();
+    let work_command = command.clone();
+    let result =
+        tokio::task::spawn_blocking(move || dispatch_sync(&conn, &work_command, &body)).await;
+    timings.blocking = blocking_started.elapsed();
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => Err(ApiError::Internal(error.to_string())),
+    };
+    let response = result.and_then(|value| {
+        let serialized = serialize_json_bytes_with(|| serde_json::to_vec(&value));
+        if let Ok((_, elapsed)) = &serialized {
+            timings.serialization = *elapsed;
+        }
+        serialized.and_then(|(bytes, _)| json_response(bytes))
+    });
+    Ok(emit_finalized_request(
+        &command,
+        total_started,
+        timings,
+        response,
+    )?)
 }
 
-async fn get_text_handler(
-    State(db): State<Db>,
-    Path(id): Path<i64>,
-) -> Result<Json<Value>, AppError> {
+async fn get_text_handler(State(db): State<Db>, Path(id): Path<i64>) -> Result<Response, AppError> {
+    let total_started = Instant::now();
+    let pool_started = Instant::now();
     let conn = db.acquire().await;
+    let pool_wait = pool_started.elapsed();
+    let blocking_started = Instant::now();
     let result = tokio::task::spawn_blocking(move || {
         let text = library::text::get_text(&conn, id)
             .map_err(db_err)?
             .ok_or_else(|| not_found(format!("Text {} not found", id)))?;
         serialize(text)
     })
-    .await
-    .map_err(|e| ApiError::Internal(e.to_string()))??;
-    Ok(Json(result))
+    .await;
+    let blocking = blocking_started.elapsed();
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => Err(ApiError::Internal(error.to_string())),
+    };
+    let mut timings = RequestTimings {
+        pool_wait,
+        blocking,
+        ..Default::default()
+    };
+    let response = result.and_then(|value| {
+        let serialized = serialize_json_bytes_with(|| serde_json::to_vec(&value));
+        if let Ok((_, elapsed)) = &serialized {
+            timings.serialization = *elapsed;
+        }
+        serialized.and_then(|(bytes, _)| json_response(bytes))
+    });
+    Ok(emit_finalized_request(
+        "get_text",
+        total_started,
+        timings,
+        response,
+    )?)
 }
 
 async fn export_shelf_epub_handler(
@@ -443,31 +756,307 @@ fn rfc5987_encode(value: &str) -> String {
         .collect()
 }
 
-async fn get_text_vocab_cache_handler(
+async fn get_text_vocab_cache_handler_with_headers(
     State(db): State<Db>,
     Path(id): Path<i64>,
-) -> Result<Json<Value>, AppError> {
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let total_started = Instant::now();
+    let pool_started = Instant::now();
     let conn = db.acquire().await;
-    let result = tokio::task::spawn_blocking(move || {
-        serialize(library::analysis::get_text_vocab_cache(&conn, id).map_err(db_err)?)
+    let pool_wait = pool_started.elapsed();
+    let blocking_started = Instant::now();
+    let result = tokio::task::spawn_blocking(move || -> Result<(String, Value), ApiError> {
+        let version = text_vocab_version(&conn, id)?;
+        let value = serialize(library::analysis::get_text_vocab_cache(&conn, id).map_err(db_err)?)?;
+        Ok((version, value))
     })
-    .await
-    .map_err(|e| ApiError::Internal(e.to_string()))??;
-    Ok(Json(result))
+    .await;
+    let blocking = blocking_started.elapsed();
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => Err(ApiError::Internal(error.to_string())),
+    };
+    let mut timings = RequestTimings {
+        pool_wait,
+        blocking,
+        ..Default::default()
+    };
+    let response = result.and_then(|(version, value)| {
+        let serialized = serialize_json_bytes_with(|| serde_json::to_vec(&value));
+        if let Ok((_, elapsed)) = &serialized {
+            timings.serialization = *elapsed;
+        }
+        let (bytes, _) = serialized?;
+        let etag = text_vocab_etag(&version, &bytes);
+        let mut response = if weak_etag_matches(headers.get(header::IF_NONE_MATCH), &etag) {
+            StatusCode::NOT_MODIFIED.into_response()
+        } else {
+            json_response(bytes)?
+        };
+        response.headers_mut().insert(
+            header::ETAG,
+            HeaderValue::from_str(&etag).map_err(|e| ApiError::Internal(e.to_string()))?,
+        );
+        Ok(response)
+    });
+    Ok(emit_finalized_request(
+        "get_text_vocab_cache",
+        total_started,
+        timings,
+        response,
+    )?)
+}
+
+#[cfg(test)]
+mod server_performance_tests {
+    use super::{
+        finalize_timed_request, get_text_vocab_cache_handler_with_headers,
+        serialize_json_bytes_with, slow_request_log, text_vocab_etag, text_vocab_version,
+        weak_etag_matches, ApiError, AppError, DbPool, RequestTimings,
+    };
+    use axum::{
+        body::{to_bytes, Body, HttpBody},
+        extract::{Path, State},
+        http::{header, HeaderMap, HeaderValue, Request, StatusCode},
+        response::IntoResponse,
+        routing::get,
+        Router,
+    };
+    use rusqlite::Connection;
+    use std::time::{Duration, Instant};
+    use tower::ServiceExt;
+    use tower_http::compression::CompressionLayer;
+
+    #[tokio::test]
+    async fn gzip_accept_encoding_compresses_json() {
+        let app = Router::new()
+            .route(
+                "/json",
+                get(|| async {
+                    axum::Json(serde_json::json!({ "data": "x".repeat(4096) })).into_response()
+                }),
+            )
+            .layer(CompressionLayer::new().gzip(true));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/json")
+                    .header(header::ACCEPT_ENCODING, "gzip")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.headers().get(header::CONTENT_ENCODING).unwrap(),
+            "gzip"
+        );
+        assert!(!to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn if_none_match_uses_weak_comparison() {
+        let etag = "\"text-vocab-7-abc\"";
+        assert!(weak_etag_matches(
+            Some(&HeaderValue::from_static("W/\"text-vocab-7-abc\"")),
+            etag
+        ));
+        assert!(weak_etag_matches(
+            Some(&HeaderValue::from_static(
+                "\"other\", W/\"text-vocab-7-abc\""
+            )),
+            etag
+        ));
+        assert!(!weak_etag_matches(
+            Some(&HeaderValue::from_static("\"other\"")),
+            etag
+        ));
+    }
+
+    #[test]
+    fn vocabulary_etag_is_quoted_and_tracks_text_analysis_and_representation() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE texts (id INTEGER PRIMARY KEY, updated_at TEXT NOT NULL); CREATE TABLE text_analyses (id INTEGER PRIMARY KEY, text_id INTEGER UNIQUE, analyzed_at TEXT); INSERT INTO texts VALUES (7, 'v1'); INSERT INTO text_analyses VALUES (1, 7, 'a1');").unwrap();
+        let first_version = text_vocab_version(&conn, 7).unwrap();
+        let first = text_vocab_etag(&first_version, br#"{"definition":"old"}"#);
+        assert!(first.starts_with("W/\"") && first.ends_with('"'));
+        conn.execute("UPDATE texts SET updated_at = 'v2' WHERE id = 7", [])
+            .unwrap();
+        let text_changed = text_vocab_etag(
+            &text_vocab_version(&conn, 7).unwrap(),
+            br#"{"definition":"old"}"#,
+        );
+        assert_ne!(first, text_changed);
+        conn.execute(
+            "UPDATE text_analyses SET id = 2, analyzed_at = 'a2' WHERE text_id = 7",
+            [],
+        )
+        .unwrap();
+        let analysis_changed = text_vocab_etag(
+            &text_vocab_version(&conn, 7).unwrap(),
+            br#"{"definition":"old"}"#,
+        );
+        assert_ne!(text_changed, analysis_changed);
+        assert_ne!(
+            analysis_changed,
+            text_vocab_etag(
+                &text_vocab_version(&conn, 7).unwrap(),
+                br#"{"definition":"new"}"#
+            )
+        );
+    }
+
+    #[test]
+    fn only_slow_samples_log_phase_timings_without_request_content() {
+        let fast = RequestTimings {
+            total: Duration::from_millis(250),
+            ..Default::default()
+        };
+        assert!(slow_request_log("dictionary_lookup", &fast).is_none());
+        let slow = RequestTimings {
+            pool_wait: Duration::from_millis(1),
+            write_wait: Duration::from_millis(2),
+            blocking: Duration::from_millis(248),
+            serialization: Duration::from_millis(3),
+            total: Duration::from_millis(251),
+        };
+        let line = slow_request_log("dictionary_lookup", &slow).unwrap();
+        assert_eq!(line, "slow_request command=dictionary_lookup pool_wait_ms=1 write_wait_ms=2 blocking_ms=248 serialization_ms=3 total_ms=251");
+        assert!(!line.contains("query") && !line.contains("content"));
+    }
+
+    #[test]
+    fn large_controlled_serialization_contributes_to_slow_threshold() {
+        let value = serde_json::json!({ "data": "x".repeat(1_000_000) });
+        let (_, serialization) = serialize_json_bytes_with(|| {
+            std::thread::sleep(Duration::from_millis(251));
+            serde_json::to_vec(&value)
+        })
+        .unwrap();
+        let timings = RequestTimings {
+            serialization,
+            total: serialization,
+            ..Default::default()
+        };
+        let line = slow_request_log("large_response", &timings).unwrap();
+        assert!(line.contains("serialization_ms="));
+        assert!(serialization > Duration::from_millis(250));
+    }
+
+    #[test]
+    fn slow_failed_request_logs_all_fields_and_preserves_error_status() {
+        let started = Instant::now();
+        std::thread::sleep(Duration::from_millis(251));
+        let timings = RequestTimings {
+            blocking: started.elapsed(),
+            ..Default::default()
+        };
+        let (result, line) = finalize_timed_request(
+            "get_text",
+            started,
+            timings,
+            Err::<(), ApiError>(ApiError::Internal("controlled failure".to_string())),
+        );
+        let line = line.expect("slow failed request must be logged");
+        assert!(line.contains("command=get_text"));
+        assert!(line.contains("pool_wait_ms=0"));
+        assert!(line.contains("write_wait_ms=0"));
+        assert!(line.contains("blocking_ms="));
+        assert!(line.contains("serialization_ms=0"));
+        assert!(line.contains("total_ms="));
+        let response = AppError::from(result.unwrap_err()).into_response();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn matching_vocab_etag_returns_304_with_no_body() {
+        let conn = Connection::open_in_memory().unwrap();
+        seed_vocab_schema(&conn);
+        let version = text_vocab_version(&conn, 7).unwrap();
+        let value = super::serialize(
+            chinese_reader_lib::library::analysis::get_text_vocab_cache(&conn, 7).unwrap(),
+        )
+        .unwrap();
+        let etag = text_vocab_etag(&version, &serde_json::to_vec(&value).unwrap());
+        let db = DbPool::new(vec![conn]);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_NONE_MATCH, HeaderValue::from_str(&etag).unwrap());
+        let response = get_text_vocab_cache_handler_with_headers(State(db), Path(7), headers)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(response.headers().get(header::ETAG).unwrap(), etag.as_str());
+        assert_eq!(response.body().size_hint().lower(), 0);
+    }
+
+    fn seed_vocab_schema(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE texts (id INTEGER PRIMARY KEY, updated_at TEXT NOT NULL);
+             CREATE TABLE text_analyses (id INTEGER PRIMARY KEY, text_id INTEGER UNIQUE, analyzed_at TEXT);
+             CREATE TABLE text_word_freq (text_id INTEGER, word TEXT);
+             CREATE TABLE text_character_freq (text_id INTEGER, character TEXT);
+             CREATE TABLE dictionary_entries (id INTEGER PRIMARY KEY, traditional TEXT, pinyin TEXT, source TEXT);
+             CREATE TABLE definitions (entry_id INTEGER, text TEXT, sort_order INTEGER);
+             INSERT INTO texts VALUES (7, 'v1');
+             INSERT INTO text_analyses VALUES (1, 7, 'a1');
+             INSERT INTO text_word_freq VALUES (7, '中國');
+             INSERT INTO dictionary_entries VALUES (10, '中國', 'zhong1 guo2', 'test');
+             INSERT INTO definitions VALUES (10, 'old definition', 0);",
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dictionary_definition_change_invalidates_old_vocab_etag() {
+        let conn = Connection::open_in_memory().unwrap();
+        seed_vocab_schema(&conn);
+        let db = DbPool::new(vec![conn]);
+        let first =
+            get_text_vocab_cache_handler_with_headers(State(db.clone()), Path(7), HeaderMap::new())
+                .await
+                .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let old_etag = first.headers().get(header::ETAG).unwrap().clone();
+        let old_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&old_body).contains("old definition"));
+
+        {
+            let conn = db.acquire().await;
+            conn.execute(
+                "UPDATE definitions SET text = 'new definition' WHERE entry_id = 10",
+                [],
+            )
+            .unwrap();
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_NONE_MATCH, old_etag.clone());
+        let second = get_text_vocab_cache_handler_with_headers(State(db), Path(7), headers)
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        assert_ne!(second.headers().get(header::ETAG).unwrap(), &old_etag);
+        let new_body = to_bytes(second.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&new_body).contains("new definition"));
+    }
 }
 
 async fn sync_sessions_handler(
     State(db): State<Db>,
     Json(body): Json<Value>,
-) -> Result<Json<Value>, AppError> {
+) -> Result<Response, AppError> {
+    let total_started = Instant::now();
     let started = Instant::now();
     let _write_permit = db.acquire_write_permit().await;
-    let waited = started.elapsed();
-    if waited >= WRITE_WAIT_LOG_THRESHOLD {
-        eprintln!("Session sync waited {waited:?} for the SQLite write lane");
-    }
+    let write_wait = started.elapsed();
 
+    let pool_started = Instant::now();
     let conn = db.acquire().await;
+    let pool_wait = pool_started.elapsed();
+    let blocking_started = Instant::now();
     let result = tokio::task::spawn_blocking(move || {
         let sessions: Vec<library::speed::UploadSession> = serde_json::from_value(
             body.get("sessions")
@@ -481,9 +1070,31 @@ async fn sync_sessions_handler(
         }
         serialize(serde_json::json!({ "session_ids": ids }))
     })
-    .await
-    .map_err(|e| ApiError::Internal(e.to_string()))??;
-    Ok(Json(result))
+    .await;
+    let blocking = blocking_started.elapsed();
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => Err(ApiError::Internal(error.to_string())),
+    };
+    let mut timings = RequestTimings {
+        pool_wait,
+        write_wait,
+        blocking,
+        ..Default::default()
+    };
+    let response = result.and_then(|value| {
+        let serialized = serialize_json_bytes_with(|| serde_json::to_vec(&value));
+        if let Ok((_, elapsed)) = &serialized {
+            timings.serialization = *elapsed;
+        }
+        serialized.and_then(|(bytes, _)| json_response(bytes))
+    });
+    Ok(emit_finalized_request(
+        "sync_sessions",
+        total_started,
+        timings,
+        response,
+    )?)
 }
 
 // ── Error types ──────────────────────────────────────────────────────────────
@@ -505,6 +1116,7 @@ impl From<ApiError> for AppError {
     }
 }
 
+#[derive(Debug)]
 struct AppError(String, StatusCode);
 
 impl IntoResponse for AppError {
@@ -535,7 +1147,6 @@ fn is_write_command(command: &str) -> bool {
             | "get_text_analysis"
             | "get_analysis_report"
             | "reanalyze_text"
-            | "get_shelf_analysis"
             | "get_prestudy_characters"
             | "get_prestudy_words"
             | "add_known_word"
@@ -772,7 +1383,6 @@ fn dispatch_sync(conn: &Connection, command: &str, body: &Value) -> Result<Value
             let id: i64 = field(body, "id")?;
             let new_parent_id: Option<i64> = opt_field(body, "new_parent_id");
             library::shelf::move_shelf(conn, id, new_parent_id).map_err(db_err)?;
-            let _ = library::analysis::invalidate_shelf_analysis_cache(conn);
             Ok(Value::Null)
         }
 
@@ -795,7 +1405,6 @@ fn dispatch_sync(conn: &Connection, command: &str, body: &Value) -> Result<Value
                 convert_to_traditional,
             )
             .map_err(db_err)?;
-            let _ = library::analysis::invalidate_shelf_analysis_cache(conn);
             serialize(serde_json::json!({
                 "text": result.text,
                 "section_shelf_id": result.section_shelf_id,
@@ -843,14 +1452,12 @@ fn dispatch_sync(conn: &Connection, command: &str, body: &Value) -> Result<Value
         "delete_text" => {
             let id: i64 = field(body, "id")?;
             library::text::delete_text(conn, id).map_err(db_err)?;
-            let _ = library::analysis::invalidate_shelf_analysis_cache(conn);
             Ok(Value::Null)
         }
 
         "migrate_large_texts" => {
             let shelf_id: Option<i64> = opt_field(body, "shelf_id");
             let result = library::text::migrate_large_texts(conn, shelf_id).map_err(db_err)?;
-            let _ = library::analysis::invalidate_shelf_analysis_cache(conn);
             serialize(result)
         }
 
@@ -881,13 +1488,15 @@ fn dispatch_sync(conn: &Connection, command: &str, body: &Value) -> Result<Value
         "reanalyze_text" => {
             let text_id: i64 = field(body, "text_id")?;
             let result = library::analysis::reanalyze_text(conn, text_id).map_err(db_err)?;
-            let _ = library::analysis::invalidate_shelf_analysis_cache(conn);
             serialize(result)
         }
 
         "get_shelf_analysis" => {
             let shelf_id: i64 = field(body, "shelf_id")?;
-            serialize(library::analysis::get_shelf_analysis(conn, shelf_id).map_err(db_err)?)
+            serialize(
+                library::analysis::get_shelf_analysis_status(conn, shelf_id, Utc::now())
+                    .map_err(db_err)?,
+            )
         }
 
         "segment_text" => {
@@ -956,7 +1565,6 @@ fn dispatch_sync(conn: &Connection, command: &str, body: &Value) -> Result<Value
                 proficiency,
             )
             .map_err(db_err)?;
-            let _ = library::analysis::invalidate_shelf_analysis_cache(conn);
             serialize(result)
         }
 
@@ -964,14 +1572,12 @@ fn dispatch_sync(conn: &Connection, command: &str, body: &Value) -> Result<Value
             let word: String = field(body, "word")?;
             let status: String = field(body, "status")?;
             library::known_words::update_word_status(conn, &word, &status).map_err(db_err)?;
-            let _ = library::analysis::invalidate_shelf_analysis_cache(conn);
             Ok(Value::Null)
         }
 
         "remove_known_word" => {
             let word: String = field(body, "word")?;
             library::known_words::remove_known_word(conn, &word).map_err(db_err)?;
-            let _ = library::analysis::invalidate_shelf_analysis_cache(conn);
             Ok(Value::Null)
         }
 
@@ -997,7 +1603,6 @@ fn dispatch_sync(conn: &Connection, command: &str, body: &Value) -> Result<Value
             let word_type: String = field(body, "word_type")?;
             let result = library::known_words::import_known_words(conn, &content, &word_type)
                 .map_err(db_err)?;
-            let _ = library::analysis::invalidate_shelf_analysis_cache(conn);
             serialize(result)
         }
 
@@ -1188,31 +1793,16 @@ fn dispatch_sync(conn: &Connection, command: &str, body: &Value) -> Result<Value
             let add_to_vocabulary: bool = field(body, "add_to_vocabulary")?;
             let status: Option<String> = opt_field(body, "status");
             let frequency: i64 = 10000;
-            conn.execute(
-                "INSERT OR IGNORE INTO user_segmentation_words (word, frequency) VALUES (?, ?)",
-                rusqlite::params![&word, frequency],
+            let word_type = if word.chars().count() == 1 {
+                "character"
+            } else {
+                "word"
+            };
+            let vocabulary = add_to_vocabulary.then_some((word_type, status.as_deref()));
+            let known_word = library::analysis::persist_custom_segmentation_word(
+                conn, &word, frequency, vocabulary,
             )
             .map_err(db_err)?;
-            library::analysis::add_segmentation_word(&word, Some(frequency));
-            let known_word = if add_to_vocabulary {
-                let word_type = if word.chars().count() == 1 {
-                    "character"
-                } else {
-                    "word"
-                };
-                Some(
-                    library::known_words::add_known_word(
-                        conn,
-                        &word,
-                        word_type,
-                        status.as_deref(),
-                        None,
-                    )
-                    .map_err(db_err)?,
-                )
-            } else {
-                None
-            };
             serialize(serde_json::json!({
                 "word": word,
                 "added_to_segmentation": true,
@@ -1294,32 +1884,16 @@ fn dispatch_sync(conn: &Connection, command: &str, body: &Value) -> Result<Value
             .map_err(db_err)?;
 
             let frequency: i64 = 10000;
-            conn.execute(
-                "INSERT OR IGNORE INTO user_segmentation_words (word, frequency) VALUES (?, ?)",
-                rusqlite::params![&word, frequency],
+            let word_type = if word.chars().count() == 1 {
+                "character"
+            } else {
+                "word"
+            };
+            let vocabulary = add_to_vocabulary.then_some((word_type, status.as_deref()));
+            let known_word = library::analysis::persist_custom_segmentation_word(
+                conn, &word, frequency, vocabulary,
             )
             .map_err(db_err)?;
-            library::analysis::add_segmentation_word(&word, Some(frequency));
-
-            let known_word = if add_to_vocabulary {
-                let word_type = if word.chars().count() == 1 {
-                    "character"
-                } else {
-                    "word"
-                };
-                Some(
-                    library::known_words::add_known_word(
-                        conn,
-                        &word,
-                        word_type,
-                        status.as_deref(),
-                        None,
-                    )
-                    .map_err(db_err)?,
-                )
-            } else {
-                None
-            };
 
             serialize(serde_json::json!({
                 "word": word,

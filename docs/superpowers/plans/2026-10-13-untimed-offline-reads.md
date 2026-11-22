@@ -264,4 +264,3 @@ Expected: all commands exit 0 with no ignored failure.
 Run: `git diff HEAD~2 --check && git diff HEAD~2 -- src-tauri/src/library/speed.rs src/lib/speed.ts src/views/library-view.ts tests/manual-offline-read.spec.ts`
 
 Confirm no schema migration, no fabricated zero metrics, and no unrelated changes.
-

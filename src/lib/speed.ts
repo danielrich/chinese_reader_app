@@ -10,6 +10,10 @@ import {
   saveSession,
   getSession,
   getInProgressSessionForText,
+  getCachedReadingHistory,
+  saveCachedReadingHistory,
+  invalidateCachedReadingHistory,
+  advanceReadingHistoryGeneration,
   type LocalSession,
 } from "./idb";
 import { uuid } from "../utils";
@@ -58,6 +62,8 @@ export interface ReadingSession {
   is_manual_log: boolean;
   /** Source identifier for manually logged sessions */
   source: string | null;
+  /** Client-generated identity for a locally completed session awaiting sync. */
+  client_local_id?: string;
 }
 
 /** A data point for speed correlation graphs */
@@ -252,6 +258,35 @@ export async function finishReadingSession(localId: string): Promise<LocalSessio
   };
   await saveSession(completed);
 
+  advanceReadingHistoryGeneration(completed.text_id);
+  const cachedHistory = await getCachedReadingHistory(completed.text_id).catch(() => null);
+  const pendingSession: ReadingSession = {
+    id: -Date.now(),
+    text_id: completed.text_id,
+    started_at: new Date(completed.started_at).toISOString(),
+    finished_at: new Date(completed.finished_at!).toISOString(),
+    character_count: completed.character_count ?? 0,
+    is_first_read: false,
+    is_complete: true,
+    known_characters_count: 0,
+    known_words_count: 0,
+    cumulative_characters_read: 0,
+    duration_seconds: completed.duration_seconds ?? null,
+    characters_per_minute: completed.characters_per_minute ?? null,
+    auto_marked_characters: 0,
+    auto_marked_words: 0,
+    text_known_char_percentage: null,
+    text_known_word_percentage: null,
+    created_at: new Date().toISOString(),
+    is_manual_log: false,
+    source: completed.source ?? "in_app",
+    client_local_id: completed.local_id,
+  };
+  await saveCachedReadingHistory(completed.text_id, [
+    pendingSession,
+    ...(cachedHistory?.sessions ?? []),
+  ]).catch(() => {});
+
   if ("serviceWorker" in navigator && "SyncManager" in window) {
     try {
       const reg = await navigator.serviceWorker.ready;
@@ -274,8 +309,9 @@ export async function discardReadingSession(sessionId: number): Promise<void> {
 /**
  * Delete a reading session (any session, complete or not)
  */
-export async function deleteReadingSession(sessionId: number): Promise<void> {
-  return invoke<void>("delete_reading_session", { sessionId });
+export async function deleteReadingSession(sessionId: number, textId?: number): Promise<void> {
+  await invoke<void>("delete_reading_session", { sessionId });
+  if (textId !== undefined) await invalidateCachedReadingHistory(textId).catch(() => {});
 }
 
 /**
@@ -303,9 +339,11 @@ export async function getActiveReadingSession(textId: number): Promise<ReadingSe
 /**
  * Get reading history for a text
  */
-export async function getTextReadingHistory(textId: number): Promise<ReadingSession[]> {
+export async function getTextReadingHistoryFresh(textId: number): Promise<ReadingSession[]> {
   return invoke<ReadingSession[]>("get_text_reading_history", { textId });
 }
+
+export const getTextReadingHistory = getTextReadingHistoryFresh;
 
 // =============================================================================
 // Analysis API
@@ -358,7 +396,9 @@ export async function getReadingStreak(): Promise<ReadingStreak> {
  * Log an offline reading session for one or more texts
  */
 export async function logOfflineRead(input: ManualLogInput): Promise<ReadingSession[]> {
-  return invoke<ReadingSession[]>("log_offline_read", { input });
+  const sessions = await invoke<ReadingSession[]>("log_offline_read", { input });
+  await Promise.all(input.text_ids.map((textId) => invalidateCachedReadingHistory(textId).catch(() => {})));
+  return sessions;
 }
 
 // =============================================================================

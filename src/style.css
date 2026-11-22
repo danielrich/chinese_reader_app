@@ -764,6 +764,18 @@ h3 {
   color: #888;
 }
 
+.shelf-analysis-status {
+  margin: 0.75rem 0;
+}
+
+.shelf-analysis-status.stale {
+  color: var(--color-warning, #8a5a00);
+}
+
+.shelf-analysis-status time {
+  margin-left: 0.25rem;
+}
+
 .shelf-analysis-summary::before {
   content: "▾ ";
   display: inline-block;

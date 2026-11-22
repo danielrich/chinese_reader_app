@@ -101,15 +101,39 @@ Risks:
 Recommendation: split `library-view.ts` into focused modules before adding more
 offline controls.
 
-## Analysis And Cache Invalidation Are Broad
+## Shelf Analysis Is Deferred And Durable
 
-Vocabulary and text changes often call `invalidate_shelf_analysis_cache(conn)`,
-which deletes all shelf aggregate caches. This is safe and simple, but expensive
-for a large library.
+Shelf analysis no longer runs during shelf navigation or deletes the last good
+cache when related data changes. Mutations atomically mark affected cached or
+requested shelf jobs dirty. Global vocabulary changes intentionally mark all
+existing analysis jobs; text-local changes mark the text's cached/requested
+shelf ancestors.
 
-There is already `invalidate_shelf_analysis_cache_for_shelf`, but many call
-sites use global invalidation. A future pass could invalidate only affected
-shelves and ancestors.
+The daemon processes jobs sequentially at 00:05 local time, catches up at
+startup, and preserves post-cutoff dirtiness for the next run. Computation uses
+a dedicated SQLite connection, while each result is published in a short
+transaction. A failed rebuild retains the previous cache and records its error.
+See `docs/operations/systemd-service.md` for status queries and manual operation.
+
+Operational caveat: a shelf that has never requested analysis has no job and is
+not proactively computed. Opening its analysis UI creates the durable request;
+the UI reports it pending until maintenance produces the first cache.
+
+## Performance Baseline And Release Checks
+
+Before the nightly-analysis performance release, measured symptoms included a
+full dictionary-table scan for mixed exact/pinyin lookup, recursive shelf-tree
+N+1 queries, automatic full vocabulary-cache fetches when opening a text, and
+on-demand shelf analysis taking many seconds for a large shelf. Reading-history
+SQL itself was generally fast, but every view waited on a fresh network result.
+
+The release separates indexed Han and pinyin lookup paths, bulk-loads the shelf
+tree, makes vocabulary caching explicit, serves only cached analysis status,
+and renders cached reading history before refreshing it. Deployment acceptance
+must capture repeated server-local and client-to-server timings for Han/pinyin
+lookup, shelf tree, text body, analysis status, compressed vocabulary cache,
+and reading history. It must also verify via browser networking that ordinary
+navigation triggers neither analysis nor vocabulary-cache requests.
 
 ## Concurrency Model Is Mostly Good, With Boundaries
 

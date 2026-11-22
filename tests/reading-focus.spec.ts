@@ -43,7 +43,7 @@ async function openReader(page: Page, title = "Reading Test", content?: string) 
     await page.locator("#shelf-drawer-toggle").click();
   }
   await page.locator('.shelf-item[data-shelf-id="1"]').click();
-  await expect(page.getByText("Shelf analysis is currently unavailable.")).toBeAttached();
+  await expect(page.locator('.text-item[data-text-id="1"]')).toBeVisible();
   await page.locator('.text-item[data-text-id="1"]').click();
   await expect(page.locator(".text-segment").first()).toBeVisible();
 }

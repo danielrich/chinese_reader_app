@@ -27,7 +27,7 @@ async function openShelf(page: Page) {
   await page.getByRole("button", { name: "Library", exact: true }).click();
   if (await page.locator("#shelf-drawer-toggle").isVisible()) await page.locator("#shelf-drawer-toggle").click();
   await page.locator('.shelf-item[data-shelf-id="1"]').click();
-  await expect(page.getByText("Shelf analysis is currently unavailable.")).toBeAttached();
+  await expect(page.locator('.text-item[data-text-id="1"]')).toBeVisible();
   return texts;
 }
 

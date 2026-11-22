@@ -110,6 +110,7 @@ CREATE TABLE IF NOT EXISTS dictionary_metadata (
 CREATE INDEX IF NOT EXISTS idx_entries_traditional ON dictionary_entries(traditional);
 CREATE INDEX IF NOT EXISTS idx_entries_simplified ON dictionary_entries(simplified);
 CREATE INDEX IF NOT EXISTS idx_entries_pinyin ON dictionary_entries(pinyin);
+CREATE INDEX IF NOT EXISTS idx_entries_pinyin_nocase ON dictionary_entries(pinyin COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS idx_entries_source ON dictionary_entries(source);
 CREATE INDEX IF NOT EXISTS idx_definitions_entry ON definitions(entry_id);
 CREATE INDEX IF NOT EXISTS idx_examples_entry ON usage_examples(entry_id);
@@ -342,6 +343,27 @@ CREATE TABLE IF NOT EXISTS shelf_analyses_cache (
     cached_at TEXT DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (shelf_id) REFERENCES shelves(id) ON DELETE CASCADE
 );
+-- Durable state for deferred shelf-analysis maintenance
+CREATE TABLE IF NOT EXISTS analysis_maintenance (
+    task TEXT PRIMARY KEY,
+    dirty_at TEXT,
+    last_started_at TEXT,
+    last_completed_at TEXT,
+    last_error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS analysis_shelf_jobs (
+    shelf_id INTEGER PRIMARY KEY,
+    dirty_at TEXT,
+    requested_at TEXT NOT NULL,
+    last_completed_at TEXT,
+    last_error TEXT,
+    FOREIGN KEY (shelf_id) REFERENCES shelves(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_analysis_shelf_jobs_dirty_at
+ON analysis_shelf_jobs(dirty_at);
+
 "#;
 
 /// Initialize the database with the schema
@@ -350,6 +372,11 @@ pub fn init_database(conn: &Connection) -> Result<()> {
 
     // Run migrations for existing databases
     run_migrations(conn)?;
+
+    conn.execute(
+        "INSERT OR IGNORE INTO analysis_maintenance (task) VALUES ('shelf_analysis')",
+        [],
+    )?;
 
     // Set some initial metadata
     conn.execute(

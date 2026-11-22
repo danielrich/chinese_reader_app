@@ -3,6 +3,7 @@
 //! These models represent shelves, texts, and analysis results
 //! for organizing and analyzing Chinese reading materials.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// A shelf for organizing texts (can be hierarchical)
@@ -245,6 +246,41 @@ pub struct ShelfAnalysis {
     pub unknown_words: Vec<WordFrequency>,
     /// Known words (sorted by frequency)
     pub known_words: Vec<WordFrequency>,
+}
+
+/// Cached state returned by the shelf-analysis API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ShelfAnalysisStatus {
+    Ready {
+        analysis: ShelfAnalysis,
+        cached_at: String,
+        is_stale: bool,
+        last_error: Option<String>,
+    },
+    Pending {
+        requested_at: String,
+        last_error: Option<String>,
+    },
+}
+
+/// A shelf that failed during a maintenance run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaintenanceJobFailure {
+    pub shelf_id: i64,
+    pub error: String,
+}
+
+/// Summary of one fixed-cutoff shelf-analysis maintenance run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaintenanceRunReport {
+    pub cutoff: DateTime<Utc>,
+    pub claimed: usize,
+    pub succeeded: usize,
+    pub failed: usize,
+    pub failures: Vec<MaintenanceJobFailure>,
+    pub fatal_error: Option<String>,
+    pub still_dirty: bool,
 }
 
 /// A segment of text (word or punctuation) with known/unknown status

@@ -34,7 +34,7 @@ async function openText(page: Page) {
   await page.goto("/");
   await page.getByRole("button", { name: "Library" }).click();
   await page.locator('.shelf-item[data-shelf-id="1"]').click();
-  await expect(page.locator(".shelf-analysis")).toContainText("currently unavailable");
+  await expect(page.locator('.text-item[data-text-id="1"]')).toBeVisible();
   await page.evaluate(async (cachedText) => {
     const db = await new Promise<IDBDatabase>((resolve, reject) => {
       const request = indexedDB.open("chinese-reader", 5);
@@ -65,7 +65,7 @@ test("offline read defaults to an untimed log", async ({ page }) => {
   await expect(page.locator("#duration-hours")).toHaveValue("");
   await expect(page.locator("#duration-minutes")).toHaveValue("");
   await page.locator("#offline-save-btn").click();
-  expect(captured.input?.total_duration_seconds).toBeNull();
+  await expect.poll(() => captured.input?.total_duration_seconds).toBeNull();
 });
 
 test("offline read includes an explicitly entered duration", async ({ page }) => {
@@ -77,7 +77,7 @@ test("offline read includes an explicitly entered duration", async ({ page }) =>
   await page.locator("#duration-hours").fill("1");
   await page.locator("#duration-minutes").fill("5");
   await page.locator("#offline-save-btn").click();
-  expect(captured.input?.total_duration_seconds).toBe(3900);
+  await expect.poll(() => captured.input?.total_duration_seconds).toBe(3900);
 });
 
 test("untimed history omits duration and speed metrics", async ({ page }) => {

@@ -2,11 +2,13 @@
 //!
 //! Provides CRUD operations for texts stored in shelves.
 
-use rusqlite::{params, Connection};
+use chrono::Utc;
+use rusqlite::{params, Connection, Transaction};
 use std::fs;
 use std::path::Path;
 
 use super::error::{LibraryError, Result};
+use super::maintenance::{cached_or_requested_ancestor_ids, mark_analysis_dirty_in_transaction};
 use super::models::{Text, TextSummary};
 use super::shelf;
 
@@ -146,6 +148,31 @@ pub fn create_text_with_splitting(
     source_type: &str,
     convert_to_trad: bool,
 ) -> Result<CreateTextResult> {
+    let tx = conn.unchecked_transaction()?;
+    let result = create_text_with_splitting_in_transaction(
+        &tx,
+        shelf_id,
+        title,
+        content,
+        author,
+        source_type,
+        convert_to_trad,
+    )?;
+    let dirty_shelf_ids = cached_or_requested_ancestor_ids(&tx, &[shelf_id])?;
+    mark_analysis_dirty_in_transaction(&tx, &dirty_shelf_ids, Utc::now())?;
+    tx.commit()?;
+    Ok(result)
+}
+
+fn create_text_with_splitting_in_transaction(
+    conn: &Connection,
+    shelf_id: i64,
+    title: &str,
+    content: &str,
+    author: Option<&str>,
+    source_type: &str,
+    convert_to_trad: bool,
+) -> Result<CreateTextResult> {
     // Optionally convert to traditional first
     let final_content = if convert_to_trad {
         convert_to_traditional(content)
@@ -157,7 +184,8 @@ pub fn create_text_with_splitting(
 
     // If small enough, create normally
     if cjk_count <= MAX_SECTION_CHARS {
-        let text = create_text_internal(conn, shelf_id, title, &final_content, author, source_type)?;
+        let text =
+            create_text_internal(conn, shelf_id, title, &final_content, author, source_type)?;
         return Ok(CreateTextResult {
             text,
             section_shelf_id: None,
@@ -216,7 +244,14 @@ fn create_text_internal(
     conn.execute(
         "INSERT INTO texts (shelf_id, title, author, source_type, content, character_count)
          VALUES (?, ?, ?, ?, ?, ?)",
-        params![shelf_id, title, author, source_type, content, character_count],
+        params![
+            shelf_id,
+            title,
+            author,
+            source_type,
+            content,
+            character_count
+        ],
     )?;
 
     let id = conn.last_insert_rowid();
@@ -234,8 +269,9 @@ pub fn create_text_with_options(
     source_type: &str,
     convert_to_trad: bool,
 ) -> Result<Text> {
+    let tx = conn.unchecked_transaction()?;
     // Validate shelf exists
-    if shelf::get_shelf(conn, shelf_id)?.is_none() {
+    if shelf::get_shelf(&tx, shelf_id)?.is_none() {
         return Err(LibraryError::ShelfNotFound(shelf_id));
     }
 
@@ -246,7 +282,11 @@ pub fn create_text_with_options(
         content.to_string()
     };
 
-    create_text_internal(conn, shelf_id, title, &final_content, author, source_type)
+    let text = create_text_internal(&tx, shelf_id, title, &final_content, author, source_type)?;
+    let dirty_shelf_ids = cached_or_requested_ancestor_ids(&tx, &[shelf_id])?;
+    mark_analysis_dirty_in_transaction(&tx, &dirty_shelf_ids, Utc::now())?;
+    tx.commit()?;
+    Ok(text)
 }
 
 /// Get a text by ID
@@ -303,7 +343,8 @@ pub fn search_texts(conn: &Connection, query: &str) -> Result<Vec<TextSummary>> 
         })
     })?;
 
-    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
 }
 
 /// List texts in a shelf (summaries only, without full content)
@@ -389,12 +430,13 @@ pub fn update_text(
 
 /// Delete a text (cascades to analysis data)
 pub fn delete_text(conn: &Connection, id: i64) -> Result<()> {
-    // Check text exists
-    if get_text(conn, id)?.is_none() {
-        return Err(LibraryError::TextNotFound(id));
-    }
+    let tx = conn.unchecked_transaction()?;
+    let text = get_text(&tx, id)?.ok_or(LibraryError::TextNotFound(id))?;
+    let dirty_shelf_ids = cached_or_requested_ancestor_ids(&tx, &[text.shelf_id])?;
 
-    conn.execute("DELETE FROM texts WHERE id = ?", [id])?;
+    tx.execute("DELETE FROM texts WHERE id = ?", [id])?;
+    mark_analysis_dirty_in_transaction(&tx, &dirty_shelf_ids, Utc::now())?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -427,26 +469,40 @@ pub fn import_text_file_with_options(
         .and_then(|s| s.to_str())
         .unwrap_or("Untitled");
 
-    let result = create_text_with_splitting(conn, shelf_id, title, &content, None, "file", convert_to_trad)?;
+    let result = create_text_with_splitting(
+        conn,
+        shelf_id,
+        title,
+        &content,
+        None,
+        "file",
+        convert_to_trad,
+    )?;
     Ok(result.text)
 }
 
 /// Move a text to a different shelf
 pub fn move_text(conn: &Connection, text_id: i64, new_shelf_id: i64) -> Result<()> {
-    // Check text exists
-    if get_text(conn, text_id)?.is_none() {
-        return Err(LibraryError::TextNotFound(text_id));
-    }
+    let tx = conn.unchecked_transaction()?;
+    let text = get_text(&tx, text_id)?.ok_or(LibraryError::TextNotFound(text_id))?;
 
     // Check shelf exists
-    if shelf::get_shelf(conn, new_shelf_id)?.is_none() {
+    if shelf::get_shelf(&tx, new_shelf_id)?.is_none() {
         return Err(LibraryError::ShelfNotFound(new_shelf_id));
     }
 
-    conn.execute(
+    let mut dirty_shelf_ids = cached_or_requested_ancestor_ids(&tx, &[text.shelf_id])?;
+
+    tx.execute(
         "UPDATE texts SET shelf_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
         params![new_shelf_id, text_id],
     )?;
+
+    dirty_shelf_ids.extend(cached_or_requested_ancestor_ids(&tx, &[new_shelf_id])?);
+    dirty_shelf_ids.sort_unstable();
+    dirty_shelf_ids.dedup();
+    mark_analysis_dirty_in_transaction(&tx, &dirty_shelf_ids, Utc::now())?;
+    tx.commit()?;
 
     Ok(())
 }
@@ -461,7 +517,21 @@ pub struct MigrateLargeTextsResult {
 
 /// Migrate texts over MAX_SECTION_CHARS into shelves with sections
 /// If shelf_id is provided, only migrate texts in that shelf (and sub-shelves)
-pub fn migrate_large_texts(conn: &Connection, shelf_id: Option<i64>) -> Result<MigrateLargeTextsResult> {
+pub fn migrate_large_texts(
+    conn: &Connection,
+    shelf_id: Option<i64>,
+) -> Result<MigrateLargeTextsResult> {
+    let tx = conn.unchecked_transaction()?;
+    let result = migrate_large_texts_in_transaction(&tx, shelf_id)?;
+    tx.commit()?;
+    Ok(result)
+}
+
+fn migrate_large_texts_in_transaction(
+    tx: &Transaction<'_>,
+    shelf_id: Option<i64>,
+) -> Result<MigrateLargeTextsResult> {
+    let conn: &Connection = tx;
     // Build query based on whether we're filtering by shelf
     let query = if let Some(sid) = shelf_id {
         format!(
@@ -484,7 +554,8 @@ pub fn migrate_large_texts(conn: &Connection, shelf_id: Option<i64>) -> Result<M
         "SELECT id, shelf_id, title, author, content, source_type, sort_order
          FROM texts
          WHERE character_count > ?
-         ORDER BY shelf_id, sort_order, id".to_string()
+         ORDER BY shelf_id, sort_order, id"
+            .to_string()
     };
 
     let mut stmt = conn.prepare(&query)?;
@@ -504,8 +575,10 @@ pub fn migrate_large_texts(conn: &Connection, shelf_id: Option<i64>) -> Result<M
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     let mut result = MigrateLargeTextsResult::default();
+    let mut dirty_shelf_ids = Vec::new();
 
     for (text_id, shelf_id, title, author, content, source_type, sort_order) in large_texts {
+        dirty_shelf_ids.extend(cached_or_requested_ancestor_ids(conn, &[shelf_id])?);
         // Split the content
         let sections = split_text_content(&content, MAX_SECTION_CHARS);
 
@@ -551,6 +624,10 @@ pub fn migrate_large_texts(conn: &Connection, shelf_id: Option<i64>) -> Result<M
 
         result.texts_migrated += 1;
     }
+
+    dirty_shelf_ids.sort_unstable();
+    dirty_shelf_ids.dedup();
+    mark_analysis_dirty_in_transaction(tx, &dirty_shelf_ids, Utc::now())?;
 
     Ok(result)
 }
@@ -673,7 +750,11 @@ mod tests {
     fn test_search_texts_by_title() {
         let conn = Connection::open_in_memory().unwrap();
         init_database(&conn).unwrap();
-        conn.execute("INSERT INTO shelves (id, name, sort_order) VALUES (1, 'S', 0)", []).unwrap();
+        conn.execute(
+            "INSERT INTO shelves (id, name, sort_order) VALUES (1, 'S', 0)",
+            [],
+        )
+        .unwrap();
         conn.execute("INSERT INTO texts (shelf_id, title, content, character_count) VALUES (1, '復活節講話', 'x', 50)", []).unwrap();
         conn.execute("INSERT INTO texts (shelf_id, title, content, character_count) VALUES (1, '信心與希望', 'x', 60)", []).unwrap();
 

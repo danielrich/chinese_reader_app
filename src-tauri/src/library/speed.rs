@@ -6,10 +6,11 @@
 //! - Correlating speed with vocabulary knowledge
 
 use chrono::{DateTime, Duration, Local, NaiveDate, Utc};
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row, Transaction};
 use serde::{Deserialize, Serialize};
 
 use super::error::{LibraryError, Result};
+use super::maintenance::{cached_or_requested_ancestor_ids, mark_analysis_dirty_in_transaction};
 
 // =============================================================================
 // Models
@@ -147,6 +148,30 @@ impl Default for SpeedStats {
 // Core Functions
 // =============================================================================
 
+fn cached_or_requested_text_ancestor_ids(conn: &Connection, text_ids: &[i64]) -> Result<Vec<i64>> {
+    if text_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let placeholders = text_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT DISTINCT shelf_id FROM texts WHERE id IN ({placeholders}) ORDER BY shelf_id"
+    );
+    let shelf_ids = {
+        let mut statement = conn.prepare(&sql)?;
+        let shelf_ids = statement
+            .query_map(params_from_iter(text_ids.iter()), |row| row.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        shelf_ids
+    };
+    cached_or_requested_ancestor_ids(conn, &shelf_ids)
+}
+
+fn mark_text_analysis_dirty_in_transaction(tx: &Transaction<'_>, text_ids: &[i64]) -> Result<()> {
+    let shelf_ids = cached_or_requested_text_ancestor_ids(tx, text_ids)?;
+    mark_analysis_dirty_in_transaction(tx, &shelf_ids, Utc::now())
+}
+
 /// Start a new reading session for a text
 pub fn start_reading_session(conn: &Connection, text_id: i64) -> Result<ReadingSession> {
     // Check text exists and get character count
@@ -234,8 +259,9 @@ pub fn start_reading_session(conn: &Connection, text_id: i64) -> Result<ReadingS
 
 /// Finish an active reading session
 pub fn finish_reading_session(conn: &Connection, session_id: i64) -> Result<ReadingSession> {
+    let tx = conn.unchecked_transaction()?;
     // Get the session
-    let session = get_session_by_id(conn, session_id)?;
+    let session = get_session_by_id(&tx, session_id)?;
 
     // Verify not already complete
     if session.is_complete {
@@ -256,7 +282,7 @@ pub fn finish_reading_session(conn: &Connection, session_id: i64) -> Result<Read
     };
 
     // Update the session
-    conn.execute(
+    tx.execute(
         r#"
         UPDATE reading_sessions
         SET finished_at = ?,
@@ -272,9 +298,12 @@ pub fn finish_reading_session(conn: &Connection, session_id: i64) -> Result<Read
             session_id,
         ],
     )?;
+    mark_text_analysis_dirty_in_transaction(&tx, &[session.text_id])?;
 
     // Return the updated session
-    get_session_by_id(conn, session_id)
+    let session = get_session_by_id(&tx, session_id)?;
+    tx.commit()?;
+    Ok(session)
 }
 
 /// Discard (delete) an incomplete reading session
@@ -296,10 +325,14 @@ pub fn discard_reading_session(conn: &Connection, session_id: i64) -> Result<()>
 
 /// Delete a reading session (any session, complete or not)
 pub fn delete_reading_session(conn: &Connection, session_id: i64) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
     // Verify session exists
-    get_session_by_id(conn, session_id)?;
+    let session = get_session_by_id(&tx, session_id)?;
+    let dirty_shelf_ids = cached_or_requested_text_ancestor_ids(&tx, &[session.text_id])?;
 
-    conn.execute("DELETE FROM reading_sessions WHERE id = ?", [session_id])?;
+    tx.execute("DELETE FROM reading_sessions WHERE id = ?", [session_id])?;
+    mark_analysis_dirty_in_transaction(&tx, &dirty_shelf_ids, Utc::now())?;
+    tx.commit()?;
 
     Ok(())
 }
@@ -696,6 +729,17 @@ pub fn get_read_pass_estimates(
 /// Create completed reading sessions for texts read offline.
 /// Duration is split proportionally by character count so all texts get the same CPM.
 pub fn log_offline_read(conn: &Connection, input: ManualLogInput) -> Result<Vec<ReadingSession>> {
+    let tx = conn.unchecked_transaction()?;
+    let sessions = log_offline_read_in_transaction(&tx, input)?;
+    tx.commit()?;
+    Ok(sessions)
+}
+
+fn log_offline_read_in_transaction(
+    tx: &Transaction<'_>,
+    input: ManualLogInput,
+) -> Result<Vec<ReadingSession>> {
+    let conn: &Connection = tx;
     if input.text_ids.is_empty() {
         return Err(LibraryError::InvalidInput("No texts specified".into()));
     }
@@ -830,10 +874,12 @@ pub fn log_offline_read(conn: &Connection, input: ManualLogInput) -> Result<Vec<
     }
 
     // Return all created sessions
-    session_ids
+    let sessions = session_ids
         .iter()
         .map(|&id| get_session_by_id(conn, id))
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    mark_text_analysis_dirty_in_transaction(tx, &input.text_ids)?;
+    Ok(sessions)
 }
 
 // =============================================================================
@@ -853,6 +899,14 @@ pub struct UploadSession {
 /// All snapshot fields (known counts, CPM, etc.) are computed server-side
 /// at upload time — close enough for a short offline window.
 pub fn upload_completed_session(conn: &Connection, s: &UploadSession) -> Result<i64> {
+    let tx = conn.unchecked_transaction()?;
+    let session_id = upload_completed_session_in_transaction(&tx, s)?;
+    tx.commit()?;
+    Ok(session_id)
+}
+
+fn upload_completed_session_in_transaction(tx: &Transaction<'_>, s: &UploadSession) -> Result<i64> {
+    let conn: &Connection = tx;
     // Idempotent: return existing server ID if already uploaded
     let existing: Option<i64> = conn
         .query_row(
@@ -943,7 +997,9 @@ pub fn upload_completed_session(conn: &Connection, s: &UploadSession) -> Result<
         ],
     )?;
 
-    Ok(conn.last_insert_rowid())
+    let session_id = conn.last_insert_rowid();
+    mark_text_analysis_dirty_in_transaction(tx, &[s.text_id])?;
+    Ok(session_id)
 }
 
 // =============================================================================
