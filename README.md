@@ -134,8 +134,13 @@ Build and install the systemd service:
 ```bash
 cd src-tauri && cargo build --release && cd ..
 npm run build
-sudo bash scripts/install-service.sh
+sudo bash scripts/install-service.sh --origins 'https://chasmfiend.local,https://reader.your-tailnet.ts.net:9443'
 ```
+
+Replace the example Tailscale hostname with the actual Serve hostname. The
+installer uses a dedicated non-root account and saves the allowed browser
+origins; subsequent installs can omit `--origins`. See
+[service security](docs/operations/systemd-service.md#service-security).
 
 Manage the service:
 

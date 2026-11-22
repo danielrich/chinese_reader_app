@@ -6,6 +6,7 @@ import { loadStatsView } from "./views/stats-view";
 import { loadPrestudyView } from "./views/prestudy-view";
 import { loadLearningView } from "./views/learning-view";
 import { initializeOfflineStatus } from "./lib/offline-status";
+import { loadGoalsView } from "./views/goals-view";
 
 // Global Error Handler
 function showError(message: string): void {
@@ -108,6 +109,7 @@ async function initApp() {
         <button class="nav-tab" data-view="library">Library</button>
         <button class="nav-tab" data-view="learning">Learning</button>
         <button class="nav-tab" data-view="speed">Speed</button>
+        <button class="nav-tab" data-view="goals">Goals</button>
         <button class="nav-tab" data-view="stats">Stats</button>
         <button class="nav-tab" data-view="prestudy">Pre-Study</button>
         <button id="refresh-app-btn" class="nav-tab nav-tab-action" type="button" title="Refresh the app UI without clearing offline texts">
@@ -183,6 +185,10 @@ async function initApp() {
 
       <div id="stats-view" class="view">
         <div id="stats-main"></div>
+      </div>
+
+      <div id="goals-view" class="view">
+        <div id="goals-main"></div>
       </div>
 
       <div id="prestudy-view" class="view">
@@ -263,7 +269,7 @@ function setupNavigation() {
 
   tabs.forEach((tab) => {
     tab.addEventListener("click", () => {
-      const view = (tab as HTMLElement).dataset.view as "dictionary" | "library" | "learning" | "speed" | "stats" | "prestudy";
+      const view = (tab as HTMLElement).dataset.view as "dictionary" | "library" | "learning" | "speed" | "stats" | "prestudy" | "goals";
 
       // Update active tab
       tabs.forEach((t) => t.classList.remove("active"));
@@ -281,6 +287,8 @@ function setupNavigation() {
         loadSpeedView();
       } else if (view === "stats") {
         loadStatsView();
+      } else if (view === "goals") {
+        void loadGoalsView();
       } else if (view === "prestudy") {
         loadPrestudyView();
       }

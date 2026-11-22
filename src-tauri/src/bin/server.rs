@@ -23,8 +23,10 @@ use serde_json::Value;
 use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::{ServeDir, ServeFile};
+
+#[path = "server/request_security.rs"]
+mod request_security;
 
 const DB_PRAGMAS: &str =
     "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=30000;";
@@ -207,6 +209,11 @@ type Db = Arc<DbPool>;
 async fn main() {
     let args: Vec<String> = env::args().collect();
 
+    let origin_policy = Arc::new(request_security::OriginPolicy::from_env().unwrap_or_else(|error| {
+        eprintln!("Invalid CHINESE_READER_ALLOWED_ORIGINS: {error}");
+        std::process::exit(1);
+    }));
+
     let db_path = if let Some(idx) = args.iter().position(|a| a == "--db-path") {
         args.get(idx + 1)
             .cloned()
@@ -287,11 +294,6 @@ async fn main() {
 
     let db: Db = DbPool::new(conns);
 
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
-
     let index_path = dist_dir.join("index.html");
     let serve_static = ServeDir::new(&dist_dir).not_found_service(ServeFile::new(&index_path));
 
@@ -311,7 +313,7 @@ async fn main() {
         .fallback_service(serve_static)
         .with_state(db)
         .layer(middleware::from_fn(add_static_cache_headers))
-        .layer(cors);
+        .layer(middleware::from_fn_with_state(origin_policy, request_security::protect_api));
 
     let addr: std::net::SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
 
@@ -811,7 +813,13 @@ fn dispatch_sync(conn: &Connection, command: &str, body: &Value) -> Result<Value
 
         "list_texts_in_shelf" => {
             let shelf_id: i64 = field(body, "shelf_id")?;
-            serialize(library::text::list_texts_in_shelf(conn, shelf_id).map_err(db_err)?)
+            let include_descendants: bool = opt_field(body, "include_descendants").unwrap_or(false);
+            let texts = if include_descendants {
+                library::text::list_texts_in_shelf_with_descendants(conn, shelf_id)
+            } else {
+                library::text::list_texts_in_shelf(conn, shelf_id)
+            };
+            serialize(texts.map_err(db_err)?)
         }
 
         "search_texts" => {
@@ -991,6 +999,11 @@ fn dispatch_sync(conn: &Connection, command: &str, body: &Value) -> Result<Value
                 .map_err(db_err)?;
             let _ = library::analysis::invalidate_shelf_analysis_cache(conn);
             serialize(result)
+        }
+
+        "get_goal_reading_data" => {
+            let shelf_ids: Vec<i64> = field(body, "shelf_ids")?;
+            serialize(library::goals::get_goal_reading_data(conn, &shelf_ids).map_err(db_err)?)
         }
 
         // ── Speed tracking ─────────────────────────────────────────────────

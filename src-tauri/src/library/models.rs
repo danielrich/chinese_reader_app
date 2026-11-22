@@ -75,6 +75,9 @@ pub struct TextSummary {
     pub character_count: i64,
     /// Whether analysis has been performed
     pub has_analysis: bool,
+    /// At least one completed session exists, regardless of first-read flags.
+    #[serde(default)]
+    pub has_completed_read: bool,
     /// Creation timestamp
     pub created_at: String,
 }

@@ -10,6 +10,7 @@
 pub mod analysis;
 pub mod error;
 pub mod epub;
+pub mod goals;
 pub mod known_words;
 pub mod learning;
 pub mod models;

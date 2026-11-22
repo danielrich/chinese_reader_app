@@ -105,7 +105,14 @@ fi
 
 if [[ "$RESTART_SERVICE" -eq 1 ]] && command -v systemctl >/dev/null 2>&1; then
   if [[ "$SERVICE_WAS_ACTIVE" -eq 1 ]]; then
-    sudo systemctl start "$SERVICE_NAME"
+    if [[ "$SERVICE_NAME" == chinese-reader ]] &&
+       systemctl show --property=ExecStart --value "$SERVICE_NAME" | grep -q '/opt/chinese-reader/server'; then
+      # The hardened unit runs a root-owned installed copy, not target/release.
+      # Install the matching backend before it sees the newly migrated schema.
+      sudo bash "$ROOT_DIR/scripts/install-service.sh"
+    else
+      sudo systemctl start "$SERVICE_NAME"
+    fi
   else
     echo "Service was not active before migration; leaving it stopped."
   fi
